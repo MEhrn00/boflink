@@ -41,7 +41,7 @@ default-features = false
 features = ["std", "color", "help", "suggestions", "usage", "derive"]
 
 [dependencies.object]
-version = "0.36.7"
+version = "0.37.0"
 default-features = false
 features = ["archive", "coff", "write", "read"]
 

@@ -20,7 +20,7 @@ thiserror = "2.0.12"
 typed-arena = "2.0.2"
 
 [dependencies.object]
-version = "0.36.7"
+version = "0.37.0"
 default-features = false
 features = ["coff", "archive", "write", "read"]
 
