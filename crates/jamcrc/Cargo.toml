@@ -11,3 +11,6 @@ publish = false
 
 [dependencies]
 crc32fast = "1.4.2"
+
+[lints.rust]
+unsafe_code = "forbid"
