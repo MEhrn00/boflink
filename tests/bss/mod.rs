@@ -1,6 +1,9 @@
 use crate::{link_yaml, setup_linker};
 use boflink::linker::LinkerTargetArch;
-use object::{Object, ObjectSection, ObjectSymbol, coff::CoffFile};
+use object::{
+    Object, ObjectSection, ObjectSymbol,
+    coff::{CoffFile, ImageSymbol},
+};
 
 #[test]
 fn resized() {
@@ -25,7 +28,7 @@ fn common_symbols() {
     let linked = link_yaml!("commons.yaml", LinkerTargetArch::Amd64);
     let coff: CoffFile = CoffFile::parse(linked.as_slice()).expect("Could not parse linked COFF");
 
-    const TEST_SYMBOLS: [(&str, u32); 2] = [("common_symbol", 0), ("other_common", 8)];
+    const TEST_SYMBOLS: [(&str, u32); 2] = [("other_common", 0), ("common_symbol", 8)];
 
     for (symbol_name, symbol_value) in TEST_SYMBOLS {
         let symbol = coff
@@ -93,4 +96,54 @@ fn merged_bss_data() {
         32,
         ".data section should have 32 bytes of initialized data"
     );
+}
+
+#[test]
+fn commons_sorted() {
+    let linker =
+        setup_linker!("commons_sorted.yaml", LinkerTargetArch::Amd64).link_graph_path("graph.dot");
+
+    let linked = linker.build().link().expect("Could not link files");
+
+    let parsed: CoffFile = CoffFile::parse(linked.as_slice()).expect("Could not parse linked COFF");
+
+    let mut symbols = parsed
+        .symbols()
+        .filter(|symbol| symbol.is_global())
+        .map(|symbol| {
+            (
+                symbol.name().expect("Could not parse symbol name"),
+                symbol.coff_symbol().value(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    // Sort the symbols by virtual address
+    symbols.sort_by_key(|(_, address)| *address);
+
+    // This is the order the symbols should be laid out. Largest should be at
+    // the beginning of the section with smallest at the end.
+    let expected_order: [&str; 8] = [
+        "very_large",
+        "large",
+        "medium",
+        "larger_than_small",
+        "small",
+        "smaller",
+        "smallerer",
+        "smallest",
+    ];
+
+    assert_eq!(
+        expected_order.len(),
+        symbols.len(),
+        "The length of the expected symbol order list should match the number of symbols. Test is not setup correctly."
+    );
+
+    for ((found, _), expected) in symbols.iter().zip(expected_order.iter()) {
+        assert_eq!(
+            found, expected,
+            "Symbols are not in the correct order: {symbols:#?}"
+        );
+    }
 }

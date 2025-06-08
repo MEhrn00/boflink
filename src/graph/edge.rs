@@ -128,9 +128,14 @@ where
     /// # Note
     /// This does not deallocate the edges since they are handled by the arena.
     pub(super) fn clear(&self) {
-        self.head.set(None);
-        self.tail.set(None);
-        self.size.set(0);
+        // Remove the next edge links in each edge.
+        while let Some(edge) = self.pop_front() {
+            edge.next_node().take();
+        }
+
+        // Post-condition asserting that pop_front() removed all of the edges
+        // correctly
+        debug_assert!(self.is_empty());
     }
 }
 

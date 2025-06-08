@@ -4,7 +4,8 @@ header:
   Characteristics: [ IMAGE_FILE_RELOCS_STRIPPED ]
 sections: []
 symbols:
-  # This symbol should cause a .bss section to be created
+  # This symbol should cause a .bss section to be created.
+  # Since this symbol is smaller than the other common symbol, it should be placed after.
   - Name: common_symbol
     Value: 4
     SectionNumber: 0
@@ -18,7 +19,8 @@ header:
   Characteristics: [ IMAGE_FILE_RELOCS_STRIPPED ]
 sections: []
 symbols:
-  # This symbol should cause a .bss section to be created
+  # This symbol should cause a .bss section to be created.
+  # Since this symbol is the largest, it should be placed at the beginng of the section.
   - Name: other_common
     Value:           8
     SectionNumber:   0

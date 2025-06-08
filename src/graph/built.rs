@@ -227,8 +227,9 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
         })
         .collect::<Vec<_>>();
 
-        // Sort the symbols by size.
-        common_symbols.sort_by_key(|(_, value)| *value);
+        // Sort the symbols by descending size. Larger symbols should be
+        // allocated at the beginning to minimize padding.
+        common_symbols.sort_by_key(|(_, value)| std::cmp::Reverse(*value));
 
         let align = common_section
             .characteristics()
