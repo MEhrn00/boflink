@@ -7,7 +7,7 @@ members = [
 
 [package]
 name = "boflink"
-version = "0.1.1"
+version = "0.1.2-dev"
 authors = ["Matt Ehrnschwender <matthewe2020@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
