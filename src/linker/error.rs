@@ -1,8 +1,8 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, ops::Not, path::PathBuf};
 
 use crate::{
     api::ApiSymbolError,
-    graph::{LinkGraphAddError, LinkGraphLinkError},
+    graph::{LinkGraphAddError, LinkGraphLinkError, SymbolError, node::SymbolNode},
     libsearch::LibsearchError,
     linkobject::archive::{ArchiveParseError, LinkArchiveParseError, MemberParseErrorKind},
 };
@@ -158,12 +158,189 @@ impl From<LibsearchError> for DrectveLibsearchError {
 
 #[derive(Debug, thiserror::Error)]
 #[error("{}", display_vec(.0))]
-pub struct LinkerSymbolErrors(pub(super) Vec<String>);
+pub struct LinkerSymbolErrors(pub(super) Vec<LinkerSymbolError>);
 
 impl LinkerSymbolErrors {
-    pub fn errors(&self) -> &[String] {
+    pub fn errors(&self) -> &[LinkerSymbolError] {
         &self.0
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{kind}: {demangled}{}",
+    .kind.context_is_empty().not().then(|| format!("\n{}", .kind.display_context())).unwrap_or_default()
+)]
+pub struct LinkerSymbolError {
+    pub name: String,
+    pub demangled: String,
+    pub kind: LinkerSymbolErrorKind,
+}
+
+impl From<SymbolError<'_, '_>> for LinkerSymbolError {
+    fn from(value: SymbolError<'_, '_>) -> Self {
+        match value {
+            SymbolError::Duplicate(duplicate_error) => {
+                let symbol = duplicate_error.symbol();
+
+                Self {
+                    name: symbol.name().to_string(),
+                    demangled: symbol.name().demangle().to_string(),
+                    kind: LinkerSymbolErrorKind::Duplicate(SymbolDefinitionsContext::new(symbol)),
+                }
+            }
+            SymbolError::Undefined(undefined_error) => {
+                let symbol = undefined_error.symbol();
+
+                Self {
+                    name: symbol.name().to_string(),
+                    demangled: symbol.name().demangle().to_string(),
+                    kind: LinkerSymbolErrorKind::Undefined(SymbolReferencesContext::new(symbol)),
+                }
+            }
+            SymbolError::MultiplyDefined(multiply_defined_error) => {
+                let symbol = multiply_defined_error.symbol();
+
+                Self {
+                    name: symbol.name().to_string(),
+                    demangled: symbol.name().demangle().to_string(),
+                    kind: LinkerSymbolErrorKind::MultiplyDefined(SymbolDefinitionsContext::new(
+                        symbol,
+                    )),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LinkerSymbolErrorKind {
+    #[error("duplicate symbol")]
+    Duplicate(SymbolDefinitionsContext),
+
+    #[error("undefined symbol")]
+    Undefined(SymbolReferencesContext),
+
+    #[error("multiply defined symbol")]
+    MultiplyDefined(SymbolDefinitionsContext),
+}
+
+impl LinkerSymbolErrorKind {
+    pub fn display_context(&self) -> &dyn std::fmt::Display {
+        match self {
+            LinkerSymbolErrorKind::Duplicate(ctx) => ctx as &dyn std::fmt::Display,
+            LinkerSymbolErrorKind::Undefined(ctx) => ctx as &dyn std::fmt::Display,
+            LinkerSymbolErrorKind::MultiplyDefined(ctx) => ctx as &dyn std::fmt::Display,
+        }
+    }
+
+    pub fn context_is_empty(&self) -> bool {
+        match self {
+            LinkerSymbolErrorKind::Duplicate(ctx) => ctx.definitions.is_empty(),
+            LinkerSymbolErrorKind::Undefined(ctx) => ctx.references.is_empty(),
+            LinkerSymbolErrorKind::MultiplyDefined(ctx) => ctx.definitions.is_empty(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{}{}",
+    display_vec(.definitions),
+    .remaining.ne(&0).then(|| format!("\n>>> defined {remaining} more times"))
+        .unwrap_or_default()
+)]
+pub struct SymbolDefinitionsContext {
+    pub definitions: Vec<SymbolDefinition>,
+    pub remaining: usize,
+}
+
+impl SymbolDefinitionsContext {
+    pub fn new(symbol: &SymbolNode<'_, '_>) -> SymbolDefinitionsContext {
+        let mut definition_iter = symbol.definitions().iter();
+        let mut definitions = Vec::with_capacity(5);
+
+        for definition in definition_iter.by_ref().take(5) {
+            definitions.push(SymbolDefinition {
+                coff_path: definition.target().coff().to_string(),
+            });
+        }
+
+        let remaining = definition_iter.count();
+        Self {
+            definitions,
+            remaining,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(">>> defined at {coff_path}")]
+pub struct SymbolDefinition {
+    pub coff_path: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{}{}",
+    display_vec(.references),
+    .remaining.ne(&0).then(|| format!("\n>>> referenced {remaining} more times"))
+        .unwrap_or_default()
+)]
+pub struct SymbolReferencesContext {
+    pub references: Vec<SymbolReference>,
+    pub remaining: usize,
+}
+
+impl SymbolReferencesContext {
+    pub fn new(symbol: &SymbolNode<'_, '_>) -> SymbolReferencesContext {
+        let mut reference_iter = symbol.references().iter();
+        let mut references = Vec::with_capacity(5);
+
+        for reference in reference_iter.by_ref().take(5) {
+            let section = reference.source();
+            let coff = section.coff();
+
+            let symbol_defs =
+                BTreeMap::from_iter(section.definitions().iter().filter_map(|definition| {
+                    let ref_symbol = definition.source();
+                    if ref_symbol.is_section_symbol() || ref_symbol.is_label() {
+                        None
+                    } else {
+                        Some((definition.weight().address(), ref_symbol.name()))
+                    }
+                }));
+
+            if let Some(reference_symbol) = symbol_defs
+                .range(0..=reference.weight().address())
+                .next_back()
+            {
+                references.push(SymbolReference {
+                    coff_path: coff.to_string(),
+                    reference: reference_symbol.1.demangle().to_string(),
+                });
+            } else {
+                references.push(SymbolReference {
+                    coff_path: coff.to_string(),
+                    reference: format!("{}+{:#x}", section.name(), reference.weight().address()),
+                });
+            }
+        }
+
+        let remaining = reference_iter.count();
+
+        SymbolReferencesContext {
+            references,
+            remaining,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(">>> referenced by {coff_path}:({reference})")]
+pub struct SymbolReference {
+    pub coff_path: String,
+    pub reference: String,
 }
 
 struct DisplayVec<'a, T: std::fmt::Display>(&'a Vec<T>);

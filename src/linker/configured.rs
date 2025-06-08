@@ -455,7 +455,7 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
             Ok(graph) => graph,
             Err(e) => {
                 return Err(LinkError::Symbol(LinkerSymbolErrors(
-                    e.into_iter().map(|v| v.to_string()).collect(),
+                    e.into_iter().map(|v| v.into()).collect(),
                 )));
             }
         };

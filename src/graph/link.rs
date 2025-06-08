@@ -1,6 +1,6 @@
 use std::{
     cell::OnceCell,
-    collections::{BTreeMap, HashMap, LinkedList, hash_map},
+    collections::{HashMap, LinkedList, hash_map},
     hash::{DefaultHasher, Hasher},
     path::Path,
     sync::LazyLock,
@@ -89,110 +89,33 @@ pub enum LinkGraphAddError {
     Object(#[from] object::read::Error),
 }
 
-#[derive(Debug, thiserror::Error)]
 pub enum SymbolError<'arena, 'data> {
-    #[error("{0}")]
     Duplicate(DuplicateSymbolError<'arena, 'data>),
-
-    #[error("{0}")]
     Undefined(UndefinedSymbolError<'arena, 'data>),
-
-    #[error("{0}")]
     MultiplyDefined(MultiplyDefinedSymbolError<'arena, 'data>),
 }
 
-#[derive(Debug, thiserror::Error)]
 pub struct DuplicateSymbolError<'arena, 'data>(&'arena SymbolNode<'arena, 'data>);
 
-impl std::fmt::Display for DuplicateSymbolError<'_, '_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "duplicate symbol: {}", self.0.name().demangle())?;
-
-        let mut definition_iter = self.0.definitions().iter();
-
-        for definition in definition_iter.by_ref().take(5) {
-            write!(f, "\n>>> defined at {}", definition.target().coff())?;
-        }
-
-        let remaining = definition_iter.count();
-        if remaining > 0 {
-            write!(f, "\n>>> defined {remaining} more times")?;
-        }
-
-        Ok(())
+impl<'arena, 'data> DuplicateSymbolError<'arena, 'data> {
+    pub fn symbol(&self) -> &'arena SymbolNode<'arena, 'data> {
+        self.0
     }
 }
 
-#[derive(Debug, thiserror::Error)]
 pub struct UndefinedSymbolError<'arena, 'data>(&'arena SymbolNode<'arena, 'data>);
 
-impl std::fmt::Display for UndefinedSymbolError<'_, '_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "undefined symbol: {}", self.0.name().demangle())?;
-
-        let mut reference_iter = self.0.references().iter();
-
-        for reference in reference_iter.by_ref().take(5) {
-            let section = reference.source();
-            let coff = section.coff();
-
-            let symbol_defs =
-                BTreeMap::from_iter(section.definitions().iter().filter_map(|definition| {
-                    let ref_symbol = definition.source();
-                    if ref_symbol.is_section_symbol() || ref_symbol.is_label() {
-                        None
-                    } else {
-                        Some((definition.weight().address(), ref_symbol.name()))
-                    }
-                }));
-
-            if let Some(reference_symbol) = symbol_defs
-                .range(0..=reference.weight().address())
-                .next_back()
-            {
-                write!(
-                    f,
-                    "\n>>> referenced by {coff}:({})",
-                    reference_symbol.1.demangle()
-                )?;
-            } else {
-                write!(
-                    f,
-                    "\n>>> referenced by {coff}:({}+{:#x})",
-                    section.name(),
-                    reference.weight().address()
-                )?;
-            }
-        }
-
-        let remaining = reference_iter.count();
-        if remaining > 0 {
-            write!(f, "\n>>> referenced {remaining} more times")?;
-        }
-
-        Ok(())
+impl<'arena, 'data> UndefinedSymbolError<'arena, 'data> {
+    pub fn symbol(&self) -> &'arena SymbolNode<'arena, 'data> {
+        self.0
     }
 }
 
-#[derive(Debug, thiserror::Error)]
 pub struct MultiplyDefinedSymbolError<'arena, 'data>(&'arena SymbolNode<'arena, 'data>);
 
-impl std::fmt::Display for MultiplyDefinedSymbolError<'_, '_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "multiply defined symbol: {}", self.0.name().demangle())?;
-
-        let mut definition_iter = self.0.definitions().iter();
-
-        for definition in definition_iter.by_ref().take(5) {
-            write!(f, "\n>>> defined at {}", definition.target().coff())?;
-        }
-
-        let remaining = definition_iter.count();
-        if remaining > 0 {
-            write!(f, "\n>>> defined {remaining} more times")?;
-        }
-
-        Ok(())
+impl<'arena, 'data> MultiplyDefinedSymbolError<'arena, 'data> {
+    pub fn symbol(&self) -> &'arena SymbolNode<'arena, 'data> {
+        self.0
     }
 }
 
