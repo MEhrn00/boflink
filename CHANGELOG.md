@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Github dependabot.yml configuration file for tracking dependency updates [`d649273`](https://github.com/MEhrn00/boflink/commit/d6492734b6f8df84f0cffebf69ac1522632ce658).
+- Enable dependency graph in Github https://github.com/MEhrn00/boflink/network/dependencies.
+
+### Changed
+
+- Update object crate to 0.37.0 (#4).
+
 ## [0.1.0] - 2025-05-30
 
 - Initial release
