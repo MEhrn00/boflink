@@ -485,7 +485,7 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                     if let SectionNodeData::Initialized(data) = graph_section.data() {
                         let mut h = jamcrc::Hasher::new_with_initial(!0);
                         h.update(data);
-                        checksum = !h.finalize();
+                        checksum = h.finalize();
                     }
                 }
 
