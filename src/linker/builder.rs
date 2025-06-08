@@ -74,6 +74,12 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
         self
     }
 
+    /// Set the name of the entrypoint symbol.
+    pub fn entrypoint(mut self, name: impl Into<String>) -> Self {
+        self.entrypoint = Some(name.into());
+        self
+    }
+
     /// Custom BOF API to use instead of the Beacon API.
     pub fn custom_api(mut self, api: impl Into<String>) -> Self {
         self.custom_api = Some(api.into());

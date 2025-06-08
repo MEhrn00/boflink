@@ -81,7 +81,9 @@ fn run_linker(args: &mut CliArgs) -> anyhow::Result<()> {
         }
     }
 
-    let linker = LinkerBuilder::new().library_searcher(library_searcher);
+    let linker = LinkerBuilder::new()
+        .library_searcher(library_searcher)
+        .entrypoint(std::mem::take(&mut args.entry));
 
     let linker = if let Some(target_arch) = args.machine.take() {
         linker.architecture(target_arch.into())
