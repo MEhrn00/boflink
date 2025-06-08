@@ -36,6 +36,12 @@ pub struct LinkerBuilder<L: LibraryFind + 'static> {
 
     /// Output path for dumping the link graph.
     pub(super) link_graph_output: Option<PathBuf>,
+
+    /// Perform GC sections.
+    pub(super) gc_sections: bool,
+
+    /// Keep the specified symbols during GC sections.
+    pub(super) gc_keep_symbols: IndexSet<String>,
 }
 
 impl<L: LibraryFind + 'static> LinkerBuilder<L> {
@@ -50,6 +56,8 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
             merge_bss: false,
             library_searcher: None,
             link_graph_output: None,
+            gc_sections: false,
+            gc_keep_symbols: Default::default(),
         }
     }
 
@@ -92,6 +100,12 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
         self
     }
 
+    /// Enable GC sections.
+    pub fn gc_sections(mut self, val: bool) -> Self {
+        self.gc_sections = val;
+        self
+    }
+
     /// Add an input file to the linker.
     pub fn add_input(mut self, input: PathedItem<PathBuf, Vec<u8>>) -> Self {
         self.inputs.push(input);
@@ -116,6 +130,22 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
     /// Add a set of link libraries to the linker.
     pub fn add_libraries<S: Into<String>, I: IntoIterator<Item = S>>(mut self, names: I) -> Self {
         self.libraries.extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// Add the specified symbol to keep during GC sections.
+    pub fn add_gc_keep_symbol(mut self, symbol: impl Into<String>) -> Self {
+        self.gc_keep_symbols.insert(symbol.into());
+        self
+    }
+
+    /// Adds the list of symbols to keep during GC sections.
+    pub fn add_gc_keep_symbols<S: Into<String>, I: IntoIterator<Item = S>>(
+        mut self,
+        symbols: I,
+    ) -> Self {
+        self.gc_keep_symbols
+            .extend(symbols.into_iter().map(Into::into));
         self
     }
 

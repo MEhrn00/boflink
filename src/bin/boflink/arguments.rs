@@ -66,6 +66,17 @@ pub struct CliArgs {
     #[arg(long)]
     pub merge_bss: bool,
 
+    /// Enable garbage collection of unused sections
+    #[arg(long)]
+    pub gc_sections: bool,
+
+    /// Ensure that the specified symbols are kept during '--gc-sections'
+    ///
+    /// Can be specified multiple times.
+    /// Accepts a comma separated list of symbols
+    #[arg(long, value_name = "symbol", value_delimiter = ',')]
+    pub keep_symbol: Vec<String>,
+
     /// Print colored output
     #[arg(long, value_name = "color", default_value_t = ColorOption::Auto)]
     pub color: ColorOption,

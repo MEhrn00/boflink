@@ -83,7 +83,11 @@ fn run_linker(args: &mut CliArgs) -> anyhow::Result<()> {
 
     let linker = LinkerBuilder::new()
         .library_searcher(library_searcher)
-        .entrypoint(std::mem::take(&mut args.entry));
+        .entrypoint(std::mem::take(&mut args.entry))
+        .add_libraries(std::mem::take(&mut args.libraries))
+        .merge_bss(args.merge_bss)
+        .gc_sections(args.gc_sections)
+        .add_gc_keep_symbols(std::mem::take(&mut args.keep_symbol));
 
     let linker = if let Some(target_arch) = args.machine.take() {
         linker.architecture(target_arch.into())
@@ -103,8 +107,6 @@ fn run_linker(args: &mut CliArgs) -> anyhow::Result<()> {
         linker
     };
 
-    let linker = linker.merge_bss(args.merge_bss);
-
     let mut error_flag = false;
     let inputs = std::mem::take(&mut args.files)
         .into_iter()
@@ -123,8 +125,6 @@ fn run_linker(args: &mut CliArgs) -> anyhow::Result<()> {
     if error_flag {
         bail!(EmptyError);
     }
-
-    let linker = linker.add_libraries(std::mem::take(&mut args.libraries));
 
     let mut linker = linker.build();
 
