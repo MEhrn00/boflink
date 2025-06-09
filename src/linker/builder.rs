@@ -42,6 +42,9 @@ pub struct LinkerBuilder<L: LibraryFind + 'static> {
 
     /// Keep the specified symbols during GC sections.
     pub(super) gc_keep_symbols: IndexSet<String>,
+
+    /// Print sections discarded during GC sections.
+    pub(super) print_gc_sections: bool,
 }
 
 impl<L: LibraryFind + 'static> LinkerBuilder<L> {
@@ -58,6 +61,7 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
             link_graph_output: None,
             gc_sections: false,
             gc_keep_symbols: Default::default(),
+            print_gc_sections: false,
         }
     }
 
@@ -103,6 +107,12 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
     /// Enable GC sections.
     pub fn gc_sections(mut self, val: bool) -> Self {
         self.gc_sections = val;
+        self
+    }
+
+    /// Print sections discarded during GC sections.
+    pub fn print_gc_sections(mut self, val: bool) -> Self {
+        self.print_gc_sections = val;
         self
     }
 

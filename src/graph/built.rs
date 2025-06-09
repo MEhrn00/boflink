@@ -246,6 +246,23 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
         section_dfs.for_each(|section| section.keep());
     }
 
+    /// Print discarded sections
+    pub fn print_discarded_sections(&self) {
+        for section in self
+            .sections
+            .values()
+            .flat_map(|sections| sections.nodes.iter())
+        {
+            if section.is_discarded() {
+                println!(
+                    "removing unused section {}:({})",
+                    section.coff(),
+                    section.name()
+                );
+            }
+        }
+    }
+
     /// Allocate space for COMMON symbols at the end of the .bss
     fn allocate_commons(&mut self) {
         // Take the value out of the OnceCell to make the function idempotent.

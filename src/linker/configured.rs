@@ -53,6 +53,9 @@ pub struct ConfiguredLinker<L: LibraryFind, Api: ApiInit> {
     /// GC roots.
     gc_roots: IndexSet<String>,
 
+    /// Print GC sections discarded.
+    print_gc_sections: bool,
+
     /// Output path for dumping the link graph.
     link_graph_output: Option<PathBuf>,
 }
@@ -79,6 +82,7 @@ impl<L: LibraryFind, Api: ApiInit> ConfiguredLinker<L, Api> {
             link_graph_output: builder.link_graph_output,
             gc_sections: builder.gc_sections,
             gc_roots: builder.gc_keep_symbols,
+            print_gc_sections: builder.print_gc_sections,
         }
     }
 }
@@ -472,6 +476,10 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
 
         if self.gc_sections {
             graph.gc_sections(self.entrypoint.iter().chain(self.gc_roots.iter()));
+
+            if self.print_gc_sections {
+                graph.print_discarded_sections();
+            }
         }
 
         if self.merge_bss {

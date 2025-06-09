@@ -77,6 +77,10 @@ pub struct CliArgs {
     #[arg(long, value_name = "symbol", value_delimiter = ',')]
     pub keep_symbol: Vec<String>,
 
+    /// Print sections discarded during '--gc-sections'
+    #[arg(long)]
+    pub print_gc_sections: bool,
+
     /// Print colored output
     #[arg(long, value_name = "color", default_value_t = ColorOption::Auto)]
     pub color: ColorOption,
