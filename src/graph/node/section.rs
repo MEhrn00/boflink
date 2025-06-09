@@ -122,6 +122,30 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
         &self.associative_edges
     }
 
+    /// Returns an iterator over all of the adjacent section nodes.
+    ///
+    /// This only returns outgoing adjacency and not incoming.
+    ///
+    ///
+    /// Adjacent sections are all section nodes which have a direct outgoing
+    /// connection
+    /// - section node -> associative edge -> section node
+    ///
+    /// Or a "next-hop" connection through a symbol node
+    /// - section node -> relocation edge -> symbol node -> definition edge -> section node.
+    pub fn adjacent_sections(&self) -> impl Iterator<Item = &'arena SectionNode<'arena, 'data>> {
+        self.associative_edges()
+            .iter()
+            .map(|associative_edge| associative_edge.target())
+            .chain(self.relocations().iter().flat_map(|relocation_edge| {
+                relocation_edge
+                    .target()
+                    .definitions()
+                    .iter()
+                    .map(|definition_edge| definition_edge.target())
+            }))
+    }
+
     /// Perform a BFS traversal over the associative section edges starting
     /// from this section.
     pub fn associative_bfs(&'arena self) -> AssociativeBfs<'arena, 'data> {
@@ -130,6 +154,20 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
         std::ptr::hash(self, &mut h);
         let visited = HashSet::from([h.finish()]);
         AssociativeBfs { queue, visited }
+    }
+
+    /// Perform a DFS traversal over reachable sections.
+    ///
+    /// Reachable sections are sections which have some form of outgoing
+    /// connection. This includes direct outgoing connections (i.e. associative
+    /// section edge connections) and indirect, single-hop,
+    /// relocation -> symbol -> definition -> section connections.
+    #[inline]
+    pub fn reachable_dfs(&'arena self) -> ReachableDfs<'arena, 'data> {
+        ReachableDfs {
+            stack: VecDeque::from([self]),
+            visited: HashSet::new(),
+        }
     }
 
     /// Returns the COFF associated with this section.
@@ -152,10 +190,10 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
         self.discarded.set(val);
     }
 
-    /// Keeps this section if it was previously discarded.
+    /// Keeps this section.
     #[inline]
     #[allow(unused)]
-    pub(super) fn keep(&self) {
+    pub fn keep(&self) {
         self.discarded.set(false);
     }
 
@@ -374,5 +412,56 @@ impl<'arena, 'data> Iterator for AssociativeBfs<'arena, 'data> {
         }
 
         Some(next_section)
+    }
+}
+
+/// DFS traversal over reachable sections.
+#[derive(Default)]
+pub struct ReachableDfs<'arena, 'data> {
+    stack: VecDeque<&'arena SectionNode<'arena, 'data>>,
+    visited: HashSet<u64>,
+}
+
+impl<'arena, 'data> ReachableDfs<'arena, 'data> {
+    /// Creates a new empty [`ReachableDfs`] with the specified capacity.
+    ///
+    /// The list of section nodes to visit should be added before performing the
+    /// DFS traversal.
+    pub fn with_capacity(capacity: usize) -> ReachableDfs<'arena, 'data> {
+        Self {
+            stack: VecDeque::with_capacity(capacity),
+            visited: HashSet::with_capacity(capacity),
+        }
+    }
+
+    /// Returns the number of nodes left in the visit stack.
+    ///
+    /// This is not the number of nodes that need to be visited since the stack
+    /// may include already visited nodes.
+    pub fn remaining(&self) -> usize {
+        self.stack.len()
+    }
+
+    /// Adds a section node to visit during the DFS traversal.
+    pub fn visit(&mut self, section: &'arena SectionNode<'arena, 'data>) {
+        self.stack.push_front(section);
+    }
+}
+
+impl<'arena, 'data> Iterator for ReachableDfs<'arena, 'data> {
+    type Item = &'arena SectionNode<'arena, 'data>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(next_section) = self.stack.pop_back() {
+            let mut h = DefaultHasher::new();
+            std::ptr::hash(next_section, &mut h);
+            if self.visited.insert(h.finish()) {
+                self.stack.reserve(next_section.adjacent_sections().count());
+                self.stack.extend(next_section.adjacent_sections());
+                return Some(next_section);
+            }
+        }
+
+        None
     }
 }

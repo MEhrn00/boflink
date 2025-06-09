@@ -4,7 +4,7 @@ use std::{
 };
 
 use indexmap::IndexMap;
-use log::debug;
+use log::{debug, warn};
 use object::{
     pe::{
         IMAGE_FILE_LINE_NUMS_STRIPPED, IMAGE_REL_AMD64_REL32, IMAGE_REL_I386_DIR32,
@@ -21,8 +21,8 @@ use super::{
     edge::{ComdatSelection, DefinitionEdgeWeight, Edge, RelocationEdgeWeight},
     link::{LinkGraph, LinkGraphArena},
     node::{
-        CoffNode, LibraryNode, SectionNode, SectionNodeCharacteristics, SectionNodeData,
-        SymbolName, SymbolNode, SymbolNodeStorageClass, SymbolNodeType,
+        CoffNode, LibraryNode, ReachableDfs, SectionNode, SectionNodeCharacteristics,
+        SectionNodeData, SymbolName, SymbolNode, SymbolNodeStorageClass, SymbolNodeType,
     },
 };
 
@@ -192,6 +192,58 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
 
         data_section.nodes.append(&mut bss_nodes);
         debug!("'.bss' output section merged with '.data' section");
+    }
+
+    /// Discards all sections which are not reachable by the specified symbols.
+    ///
+    /// This method should only be called once since it does not save state.
+    pub fn gc_sections<S: AsRef<str>>(&mut self, symbols: impl Iterator<Item = S>) {
+        let mut section_count = 0usize;
+
+        // Mark all sections as discarded
+        self.sections
+            .values()
+            .flat_map(|section| {
+                section_count += section.nodes.len();
+                section.nodes.iter()
+            })
+            .for_each(|section| {
+                section.discard();
+            });
+
+        // Set up the GC roots
+        let mut section_dfs = ReachableDfs::with_capacity(section_count);
+
+        for gc_symbol in symbols {
+            if let Some(root_symbol) = self.external_symbols.get(gc_symbol.as_ref()) {
+                if let Some(root_definition) = root_symbol.definitions().front() {
+                    section_dfs.visit(root_definition.target());
+                } else {
+                    warn!(
+                        "'--keep-symbol={}' is an imported symbol",
+                        gc_symbol.as_ref()
+                    );
+                }
+            } else {
+                warn!("'--keep-symbol={}' is non-existent", gc_symbol.as_ref());
+            }
+        }
+
+        // If no GC roots are established, the entire graph would be discarded.
+        // Keep all sections in the graph so that the graph stays valid and
+        // return out. This should never happen since the entrypoint is a GC
+        // root and the entrypoint should be defined in the graph.
+        if section_dfs.remaining() == 0 {
+            warn!("no GC roots were added for '--gc-sections', aborting");
+            self.sections
+                .values()
+                .flat_map(|section| section.nodes.iter())
+                .for_each(|section| section.keep());
+            return;
+        }
+
+        // Keep all sections reachable by the GC roots
+        section_dfs.for_each(|section| section.keep());
     }
 
     /// Allocate space for COMMON symbols at the end of the .bss

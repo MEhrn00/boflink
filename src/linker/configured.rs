@@ -47,6 +47,12 @@ pub struct ConfiguredLinker<L: LibraryFind, Api: ApiInit> {
     /// Whether to merge the .bss section with the .data section.
     merge_bss: bool,
 
+    /// Whether to perform GC sections.
+    gc_sections: bool,
+
+    /// GC roots.
+    gc_roots: IndexSet<String>,
+
     /// Output path for dumping the link graph.
     link_graph_output: Option<PathBuf>,
 }
@@ -71,6 +77,8 @@ impl<L: LibraryFind, Api: ApiInit> ConfiguredLinker<L, Api> {
             entrypoint: builder.entrypoint,
             merge_bss: builder.merge_bss,
             link_graph_output: builder.link_graph_output,
+            gc_sections: builder.gc_sections,
+            gc_roots: builder.gc_keep_symbols,
         }
     }
 }
@@ -275,7 +283,9 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
             if target_arch == LinkerTargetArch::I386 {
                 *entrypoint = format!("_{entrypoint}");
             }
+        }
 
+        if let Some(entrypoint) = &self.entrypoint {
             graph.add_external_symbol(entrypoint);
         }
 
@@ -459,6 +469,10 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
                 )));
             }
         };
+
+        if self.gc_sections {
+            graph.gc_sections(self.entrypoint.iter().chain(self.gc_roots.iter()));
+        }
 
         if self.merge_bss {
             graph.merge_bss();
