@@ -4,6 +4,7 @@ use std::{
     hash::{DefaultHasher, Hasher},
 };
 
+use log::debug;
 use object::pe::{
     IMAGE_SCN_ALIGN_1BYTES, IMAGE_SCN_ALIGN_2BYTES, IMAGE_SCN_ALIGN_4BYTES, IMAGE_SCN_ALIGN_8BYTES,
     IMAGE_SCN_ALIGN_16BYTES, IMAGE_SCN_ALIGN_32BYTES, IMAGE_SCN_ALIGN_64BYTES,
@@ -23,7 +24,7 @@ use crate::graph::edge::{
     RelocationEdgeWeight,
 };
 
-use super::{CoffNode, SymbolNode};
+use super::{CoffNode, SymbolNode, SymbolNodeStorageClass};
 
 /// A section node in the graph.
 pub struct SectionNode<'arena, 'data> {
@@ -105,6 +106,49 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
     ) -> &EdgeList<'arena, SymbolNode<'arena, 'data>, Self, DefinitionEdgeWeight, IncomingEdges>
     {
         &self.definition_edges
+    }
+
+    /// If this is a code section, attempts to find the associated .pdata section
+    /// with the exception information.
+    pub fn find_associated_pdata_section(&self) -> Option<&'arena SectionNode<'arena, 'data>> {
+        if !self
+            .characteristics()
+            .contains(SectionNodeCharacteristics::CntCode)
+        {
+            return None;
+        }
+
+        // Check to see if the associative edge was already added to this code
+        // section
+        if let Some(pdata_section) = self.associative_edges().iter().find_map(|edge| {
+            let target_section = edge.target();
+            (target_section.name().group_name() == ".pdata").then_some(target_section)
+        }) {
+            return Some(pdata_section);
+        }
+
+        debug!("traversing incoming references to find .pdata section");
+
+        // Traverse through incoming relocations to find the .pdata section
+        // which references this code section.
+        for possible_joined_symbol in self.definitions().iter().filter_map(|edge| {
+            let defined_symbol = edge.source();
+            (defined_symbol.storage_class() == SymbolNodeStorageClass::Label
+                || defined_symbol.is_section_symbol())
+            .then_some(defined_symbol)
+        }) {
+            debug!("possible symbol '{}'", possible_joined_symbol.name());
+            if let Some(pdata_section) =
+                possible_joined_symbol.references().iter().find_map(|edge| {
+                    let source_section = edge.source();
+                    (source_section.name().group_name() == ".pdata").then_some(source_section)
+                })
+            {
+                return Some(pdata_section);
+            }
+        }
+
+        None
     }
 
     /// Returns the list of output associative section edges for this section.
@@ -294,7 +338,7 @@ impl<'data> SectionName<'data> {
     /// Returns the `group ordering` value (`<group name>$<group ordering>`)
     /// from the section name if this is a grouped section.
     #[inline]
-    pub fn group_ordering(&self) -> Option<&str> {
+    pub fn group_ordering(&self) -> Option<&'data str> {
         self.0
             .split_once('$')
             .map(|(_, group_ordering)| group_ordering)

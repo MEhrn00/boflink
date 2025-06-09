@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
 use object::{SectionIndex, SymbolIndex};
 
 use super::{
@@ -15,6 +16,9 @@ pub struct LinkGraphCache<'arena, 'data> {
     /// Cached sections.
     sections: HashMap<SectionIndex, &'arena SectionNode<'arena, 'data>>,
 
+    /// The cached code sections.
+    code_sections: IndexMap<SectionIndex, &'arena SectionNode<'arena, 'data>>,
+
     /// Cached selection and section symbol values for COMDAT symbols.
     comdat_selections: HashMap<SectionIndex, ComdatSelection>,
 }
@@ -26,6 +30,7 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
             symbols: HashMap::new(),
             sections: HashMap::new(),
             comdat_selections: HashMap::new(),
+            code_sections: IndexMap::new(),
         }
     }
 
@@ -34,6 +39,7 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
         Self {
             symbols: HashMap::with_capacity(symbols),
             sections: HashMap::with_capacity(sections),
+            code_sections: IndexMap::new(),
             comdat_selections: HashMap::new(),
         }
     }
@@ -43,6 +49,7 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
         self.symbols.clear();
         self.sections.clear();
         self.comdat_selections.clear();
+        self.code_sections.clear();
     }
 
     #[inline]
@@ -80,6 +87,15 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
     }
 
     #[inline]
+    pub fn insert_code_section(
+        &mut self,
+        idx: SectionIndex,
+        section: &'arena SectionNode<'arena, 'data>,
+    ) {
+        let _ = self.code_sections.insert(idx, section);
+    }
+
+    #[inline]
     pub fn get_symbol(&self, idx: SymbolIndex) -> Option<&'arena SymbolNode<'arena, 'data>> {
         self.symbols.get(&idx).copied()
     }
@@ -92,5 +108,10 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
     #[inline]
     pub fn get_comdat_selection(&self, idx: SectionIndex) -> Option<ComdatSelection> {
         self.comdat_selections.get(&idx).copied()
+    }
+
+    #[inline]
+    pub fn iter_code_sections(&self) -> impl Iterator<Item = &'arena SectionNode<'arena, 'data>> {
+        self.code_sections.values().copied()
     }
 }

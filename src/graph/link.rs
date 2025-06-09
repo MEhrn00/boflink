@@ -7,7 +7,7 @@ use std::{
 };
 
 use indexmap::{IndexMap, IndexSet};
-use log::warn;
+use log::{debug, warn};
 use object::{
     Architecture, Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolIndex,
     coff::{CoffFile, CoffHeader, ImageSymbol},
@@ -255,6 +255,11 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
             self.node_count += 1;
 
             self.cache.insert_section(section.index(), section_node);
+            if characteristics.contains(SectionNodeCharacteristics::CntCode) {
+                self.cache
+                    .insert_code_section(section.index(), section_node);
+            }
+
             self.section_nodes.push(section_node);
         }
 
@@ -462,6 +467,41 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
 
                 graph_section.relocations().push_back(reloc_edge);
                 target_symbol.references().push_back(reloc_edge);
+            }
+        }
+
+        // Add associative edges to code sections to link them to the .pdata
+        // section with the exception information.
+        //
+        // This is so that the associated .pdata section does not get discarded
+        // if the code section is kept.
+        for code_section in self.cache.iter_code_sections() {
+            // If this is a non-COMDAT code section, add an associative edge to
+            // the .pdata section which contains the exception information
+            if !code_section.is_comdat() {
+                debug!("searching for associative .pdata section");
+                if let Some(pdata_section) = code_section.find_associated_pdata_section() {
+                    debug!("found associative .pdata section");
+                    // Only add the associative edge if it does not already exist
+                    if !code_section
+                        .associative_edges()
+                        .iter()
+                        .any(|edge| edge.target().name().group_name() == ".pdata")
+                    {
+                        debug!(
+                            "adding associative edge from '{}' to '{}'",
+                            code_section.name(),
+                            pdata_section.name()
+                        );
+                        code_section
+                            .associative_edges()
+                            .push_back(self.arena.alloc_with(|| {
+                                Edge::new(code_section, pdata_section, AssociativeSectionEdgeWeight)
+                            }));
+                    } else {
+                        debug!("associative .pdata edge already exists");
+                    }
+                }
             }
         }
 

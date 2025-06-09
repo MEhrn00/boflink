@@ -57,9 +57,6 @@ pub struct SymbolNode<'arena, 'data> {
     /// The symbol name for the output COFF.
     output_name: OnceCell<object::write::coff::Name>,
 
-    /// Cached flag for checking if this is an MSVC label symbol.
-    msvc_label: OnceCell<bool>,
-
     /// The name of the symbol.
     name: SymbolName<'arena>,
 
@@ -87,7 +84,6 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
             relocation_edges: EdgeList::new(),
             table_index: OnceCell::new(),
             output_name: OnceCell::new(),
-            msvc_label: OnceCell::new(),
             name: name.into(),
             storage_class,
             section,
@@ -105,7 +101,6 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
             relocation_edges: EdgeList::new(),
             table_index: OnceCell::new(),
             output_name: OnceCell::new(),
-            msvc_label: OnceCell::new(),
             name: name.into(),
             storage_class: coff_symbol.storage_class().try_into()?,
             section: coff_symbol.has_aux_section(),
@@ -175,18 +170,16 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     /// These are symbols with static storage class, have a name format of
     /// `$SG<number>` and are defined in a data section.
     pub fn is_msvc_label(&self) -> bool {
-        *self.msvc_label.get_or_init(|| {
-            self.storage_class() == SymbolNodeStorageClass::Static
-                && self
-                    .name()
-                    .as_str()
-                    .strip_prefix("$SG")
-                    .is_some_and(|unprefixed| unprefixed.parse::<usize>().is_ok())
-                && self
-                    .definitions()
-                    .front()
-                    .is_some_and(|definition| definition.target().name().group_name() == ".data")
-        })
+        self.storage_class() == SymbolNodeStorageClass::Static
+            && self
+                .name()
+                .as_str()
+                .strip_prefix("$SG")
+                .is_some_and(|unprefixed| unprefixed.parse::<usize>().is_ok())
+            && self
+                .definitions()
+                .front()
+                .is_some_and(|definition| definition.target().name().group_name() == ".data")
     }
 
     /// Returns `true` if this symbol has no references or all sections
