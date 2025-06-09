@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Incorrect checksum value calculation for GCC `.rdata$zzz` metadata sections (#7).
+- Entrypoint symbol from the command line not being validated (#8).
+- Relocations not being applied correctly when compiling with  `-ffunction-sections` (#9).
 
 ## [0.1.1] - 2025-06-07
 
