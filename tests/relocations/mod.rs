@@ -1,5 +1,8 @@
 use boflink::linker::LinkerTargetArch;
-use object::{Object, ObjectSection, ObjectSymbol, coff::CoffFile};
+use object::{
+    Object, ObjectSection, ObjectSymbol,
+    coff::{CoffFile, ImageSymbol},
+};
 
 use crate::link_yaml;
 
@@ -129,5 +132,49 @@ fn defined_symbol_target_no_shift() {
     assert_eq!(
         found_reloc_val, 0,
         "Relocation value should not have shifted"
+    );
+}
+
+#[test]
+fn same_section_symbol_flattened() {
+    let linked = link_yaml!(
+        "same_section_symbol_flattened.yaml",
+        LinkerTargetArch::Amd64
+    );
+
+    let coff: CoffFile = CoffFile::parse(linked.as_slice()).expect("Could not parse linked COFF");
+
+    let text_section = coff
+        .section_by_name(".text")
+        .expect("Could not find .text section in linked COFF");
+
+    let text_section_data = text_section
+        .data()
+        .expect("Could not get .text section data");
+
+    // Get the relocation from the source2_function symbol which calls the
+    // other symbol
+    let source2_function = coff
+        .symbol_by_name("source2_function")
+        .expect("Could not find source2_function symbol");
+
+    let other = coff
+        .symbol_by_name("other")
+        .expect("Could not find other symbol");
+
+    let reloc_addr = source2_function.coff_symbol().value() + 9;
+
+    let found_reloc_val = u32::from_le_bytes(
+        text_section_data[reloc_addr as usize..reloc_addr as usize + 4]
+            .try_into()
+            .unwrap(),
+    );
+
+    // The reloc value should = target symbol - 4 - reloc_addr
+    let expected_reloc_val = other.coff_symbol().value() - 4 - reloc_addr;
+
+    assert_eq!(
+        found_reloc_val, expected_reloc_val,
+        "Relocation value in the 'source2_function' that references the other did not get adjusted correctly"
     );
 }

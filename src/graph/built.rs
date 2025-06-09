@@ -967,7 +967,9 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
                         });
 
                     // Update relocations
-                    let relocated_val = if target_symbol.is_section_symbol() {
+                    let relocated_val = if target_symbol.is_section_symbol()
+                        && (section_node.name().group_name() != target_section.name().group_name())
+                    {
                         // Target symbol is a section symbol. Relocations need to
                         // be adjusted to account for the section shift.
                         let reloc_val = u32::from_le_bytes(reloc_data);
