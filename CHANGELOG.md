@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- GC sections (`--gc-sections`) support for discarding unreferenced sections (#10).
+
 ### Fixed
 
 - Incorrect checksum value calculation for GCC `.rdata$zzz` metadata sections (#7).
