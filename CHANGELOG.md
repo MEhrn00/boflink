@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2025-06-09
+
 ### Added
 
 - GC sections (`--gc-sections`) support for discarding unreferenced sections (#10).
@@ -36,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release
 
-[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.1.1...HEAD
+[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MEhrn00/boflink/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/MEhrn00/boflink/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/MEhrn00/boflink/releases/tag/v0.1.0
