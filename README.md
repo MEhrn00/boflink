@@ -58,3 +58,6 @@ boflink -o mybof.bof object1.o object2.o -lkernel32 -ladvapi32
 
 ## Examples
 Additional examples can be found in the [examples/](examples/) directory.
+
+## Blog Post
+https://blog.cybershenanigans.space/posts/boflink-a-linker-for-beacon-object-files/
