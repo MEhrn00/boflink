@@ -91,6 +91,24 @@ pub struct CliArgs {
     /// Print timing information
     #[arg(long)]
     pub print_timing: bool,
+
+    #[command(flatten)]
+    pub ignored: IgnoredCliArgs,
+}
+
+#[derive(Parser, Debug)]
+pub struct IgnoredCliArgs {
+    /// Ignored for compatibility with GCC
+    #[arg(long, value_name = "file", hide = true)]
+    pub out_implib: Option<String>,
+
+    /// Ignored for compatibility with GCC
+    #[arg(long, value_name = "number", hide = true)]
+    pub major_image_version: usize,
+
+    /// Ignored for compatibility with GCC
+    #[arg(long, value_name = "number", hide = true)]
+    pub minor_image_version: usize,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
