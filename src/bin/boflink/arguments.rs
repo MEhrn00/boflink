@@ -103,12 +103,12 @@ pub struct IgnoredCliArgs {
     pub out_implib: Option<String>,
 
     /// Ignored for compatibility with GCC
-    #[arg(long, value_name = "number", hide = true)]
-    pub major_image_version: usize,
+    #[arg(long, value_name = "number", default_value = "0", hide = true)]
+    pub major_image_version: u8,
 
     /// Ignored for compatibility with GCC
-    #[arg(long, value_name = "number", hide = true)]
-    pub minor_image_version: usize,
+    #[arg(long, value_name = "number", default_value = "0", hide = true)]
+    pub minor_image_version: u8,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
