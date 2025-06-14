@@ -50,20 +50,6 @@ impl std::fmt::Display for SearchLibraryName<'_> {
 /// A read in link library found from the [`LibrarySearcher`].
 pub type FoundLibrary = PathedItem<PathBuf, Vec<u8>>;
 
-impl std::hash::Hash for FoundLibrary {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.path().hash(state);
-    }
-}
-
-impl std::cmp::PartialEq for FoundLibrary {
-    fn eq(&self, other: &Self) -> bool {
-        self.path().eq(other.path())
-    }
-}
-
-impl std::cmp::Eq for FoundLibrary {}
-
 /// Used for finding link libraries.
 #[derive(Default)]
 pub struct LibrarySearcher {
