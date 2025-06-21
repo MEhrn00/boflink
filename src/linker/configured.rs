@@ -475,7 +475,7 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
         };
 
         if self.gc_sections {
-            graph.gc_sections(self.entrypoint.iter().chain(self.gc_roots.iter()));
+            graph.gc_sections(self.entrypoint.as_ref(), self.gc_roots.iter())?;
 
             if self.print_gc_sections {
                 graph.print_discarded_sections();

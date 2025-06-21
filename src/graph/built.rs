@@ -15,7 +15,7 @@ use object::{
     write::coff::{Relocation, SectionHeader, Writer},
 };
 
-use crate::linker::LinkerTargetArch;
+use crate::linker::{LinkerTargetArch, error::LinkError};
 
 use super::{
     edge::{ComdatSelection, DefinitionEdgeWeight, Edge, RelocationEdgeWeight},
@@ -197,7 +197,11 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
     /// Discards all sections which are not reachable by the specified symbols.
     ///
     /// This method should only be called once since it does not save state.
-    pub fn gc_sections<S: AsRef<str>>(&mut self, symbols: impl Iterator<Item = S>) {
+    pub fn gc_sections<S: AsRef<str>>(
+        &mut self,
+        entrypoint: Option<impl AsRef<str>>,
+        roots: impl Iterator<Item = S>,
+    ) -> Result<(), LinkError> {
         let mut section_count = 0usize;
 
         // Mark all sections as discarded
@@ -211,10 +215,20 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
                 section.discard();
             });
 
-        // Set up the GC roots
+        // Setup the GC roots
         let mut section_dfs = ReachableDfs::with_capacity(section_count);
 
-        for gc_symbol in symbols {
+        if let Some(entrypoint_symbol) = entrypoint {
+            if let Some(entrypoint_definition) = self
+                .external_symbols
+                .get(&entrypoint_symbol.as_ref())
+                .and_then(|symbol| symbol.definitions().front())
+            {
+                section_dfs.visit(entrypoint_definition.target());
+            }
+        }
+
+        for gc_symbol in roots {
             if let Some(root_symbol) = self.external_symbols.get(gc_symbol.as_ref()) {
                 if let Some(root_definition) = root_symbol.definitions().front() {
                     section_dfs.visit(root_definition.target());
@@ -229,21 +243,14 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
             }
         }
 
-        // If no GC roots are established, the entire graph would be discarded.
-        // Keep all sections in the graph so that the graph stays valid and
-        // return out. This should never happen since the entrypoint is a GC
-        // root and the entrypoint should be defined in the graph.
+        // Return an error if the GC roots could not be established.
         if section_dfs.remaining() == 0 {
-            warn!("no GC roots were added for '--gc-sections', aborting");
-            self.sections
-                .values()
-                .flat_map(|section| section.nodes.iter())
-                .for_each(|section| section.keep());
-            return;
+            return Err(LinkError::EmptyGcRoots);
         }
 
         // Keep all sections reachable by the GC roots
         section_dfs.for_each(|section| section.keep());
+        Ok(())
     }
 
     /// Print discarded sections

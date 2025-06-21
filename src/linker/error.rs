@@ -18,6 +18,9 @@ pub enum LinkError {
     #[error("{0}")]
     Graph(#[from] LinkGraphLinkError),
 
+    #[error("--gc-sections requires a defined --entry symbol or set of GC roots")]
+    EmptyGcRoots,
+
     #[error("no input files")]
     NoInput,
 
