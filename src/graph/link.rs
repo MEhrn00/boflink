@@ -612,7 +612,7 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
         let mut symbol_errors = Vec::new();
 
         for symbol in self.external_symbols.values().copied() {
-            if symbol.is_undefined() {
+            if symbol.is_undefined() && !symbol.references().is_empty() {
                 symbol_errors.push(SymbolError::Undefined(UndefinedSymbolError(symbol)));
             } else if symbol.is_duplicate() {
                 symbol_errors.push(SymbolError::Duplicate(DuplicateSymbolError(symbol)));
