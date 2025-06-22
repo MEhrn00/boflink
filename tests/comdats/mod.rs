@@ -52,7 +52,7 @@ fn associative() {
 
     assert!(
         root_data.iter().all(|b| *b == 0),
-        ".root section data should be all zeros"
+        ".root section data should be all zeros {root_data:x?}"
     );
 
     let assoc_section = coff
