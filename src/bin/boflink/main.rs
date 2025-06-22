@@ -88,7 +88,8 @@ fn run_linker(args: &mut CliArgs) -> anyhow::Result<()> {
         .merge_bss(args.merge_bss)
         .gc_sections(args.gc_sections)
         .print_gc_sections(args.print_gc_sections)
-        .add_gc_keep_symbols(std::mem::take(&mut args.keep_symbol));
+        .add_gc_keep_symbols(std::mem::take(&mut args.keep_symbol))
+        .merge_grouped_sections(!args.no_merge_groups);
 
     let linker = if let Some(target_arch) = args.machine.take() {
         linker.architecture(target_arch.into())

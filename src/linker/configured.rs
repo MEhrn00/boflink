@@ -53,6 +53,9 @@ pub struct ConfiguredLinker<L: LibraryFind, Api: ApiInit> {
     /// GC roots.
     gc_roots: IndexSet<String>,
 
+    /// Merge grouped sections.
+    merge_grouped_sections: bool,
+
     /// Print GC sections discarded.
     print_gc_sections: bool,
 
@@ -79,6 +82,7 @@ impl<L: LibraryFind, Api: ApiInit> ConfiguredLinker<L, Api> {
             library_searcher,
             entrypoint: builder.entrypoint,
             merge_bss: builder.merge_bss,
+            merge_grouped_sections: builder.merge_grouped_sections,
             link_graph_output: builder.link_graph_output,
             gc_sections: builder.gc_sections,
             gc_roots: builder.gc_keep_symbols,
@@ -486,6 +490,10 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
             graph.merge_bss();
         }
 
-        Ok(graph.link_merge_groups()?)
+        if self.merge_grouped_sections {
+            Ok(graph.link_merge_groups()?)
+        } else {
+            Ok(graph.link()?)
+        }
     }
 }
