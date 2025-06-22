@@ -31,6 +31,9 @@ pub struct LinkerBuilder<L: LibraryFind + 'static> {
     /// Whether to merge the .bss section with the .data section.
     pub(super) merge_bss: bool,
 
+    /// Merge grouped sections.
+    pub(super) merge_grouped_sections: bool,
+
     /// Searcher for finding link libraries.
     pub(super) library_searcher: Option<L>,
 
@@ -57,6 +60,7 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
             entrypoint: Default::default(),
             custom_api: Default::default(),
             merge_bss: false,
+            merge_grouped_sections: false,
             library_searcher: None,
             link_graph_output: None,
             gc_sections: false,
@@ -83,6 +87,12 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
     /// Merge the .bss section with the .data section.
     pub fn merge_bss(mut self, val: bool) -> Self {
         self.merge_bss = val;
+        self
+    }
+
+    /// Merge grouped sections.
+    pub fn merge_grouped_sections(mut self, val: bool) -> Self {
+        self.merge_grouped_sections = val;
         self
     }
 

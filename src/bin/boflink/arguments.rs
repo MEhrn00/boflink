@@ -66,6 +66,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub merge_bss: bool,
 
+    /// Do not merge grouped sections
+    #[arg(long, default_value = "false")]
+    pub no_merge_groups: bool,
+
     /// Enable garbage collection of unused sections
     #[arg(long)]
     pub gc_sections: bool,
