@@ -45,6 +45,7 @@ macro_rules! setup_linker {
 
         boflink::linker::LinkerBuilder::new()
             .architecture($arch)
+            .merge_grouped_sections(true)
             .library_searcher(__searcher)
             .add_inputs(__input_coffs)
             .add_libraries(__input_libraries)
