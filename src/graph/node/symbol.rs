@@ -295,7 +295,7 @@ impl std::fmt::Debug for SymbolNode<'_, '_> {
 }
 
 /// A symbol name.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SymbolName<'data>(&'data str);
 
 impl<'data> SymbolName<'data> {
@@ -310,11 +310,16 @@ impl<'data> SymbolName<'data> {
         SymbolNameDemangler(self)
     }
 
-    /// Returns the symbol name but without the `__declspeci(dllimport)` prefix
+    /// Returns the symbol name but without the `__declspec(dllimport)` prefix
     /// if it exists.
-    #[inline]
     pub fn strip_dllimport(&self) -> Option<&'data str> {
         self.0.strip_prefix("__imp_")
+    }
+
+    /// Returns `true` if the symbol name contains the `__declspec(dllimport)`
+    /// prefix
+    pub fn is_dllimport(&self) -> bool {
+        self.0.starts_with("__imp_")
     }
 }
 
@@ -336,7 +341,7 @@ pub struct SymbolNameDemangler<'a, 'data>(&'a SymbolName<'data>);
 
 impl std::fmt::Display for SymbolNameDemangler<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(unprefixed) = self.0.0.strip_prefix("__imp_") {
+        if let Some(unprefixed) = self.0.strip_dllimport() {
             write!(f, "__declspec(dllimport) {unprefixed}")
         } else {
             write!(f, "{}", self.0.0)

@@ -486,6 +486,6 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
             graph.merge_bss();
         }
 
-        Ok(graph.link()?)
+        Ok(graph.link_merge_groups()?)
     }
 }
