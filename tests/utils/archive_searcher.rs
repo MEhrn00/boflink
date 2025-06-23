@@ -12,10 +12,6 @@ impl MemoryArchiveSearcher {
             files: HashMap::new(),
         }
     }
-
-    pub fn add_library(&mut self, name: impl Into<String>, data: Vec<u8>) {
-        self.files.insert(name.into(), data);
-    }
 }
 
 impl LibraryFind for MemoryArchiveSearcher {
