@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, ops::Not, path::PathBuf};
 
 use crate::{
-    api::ApiSymbolError,
+    api::ApiSymbolsError,
     graph::{LinkGraphAddError, LinkGraphLinkError, SymbolError, node::SymbolNode},
     libsearch::LibsearchError,
     linkobject::archive::{ArchiveParseError, LinkArchiveParseError, MemberParseErrorKind},
@@ -47,11 +47,11 @@ pub enum LinkerSetupError {
     Library(LibsearchError),
 
     #[error("{0}")]
-    ApiInit(ApiInitError),
+    Api(ApiSetupError),
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ApiInitError {
+pub enum ApiSetupError {
     #[error("{}: could not open custom API: {error}", .path.display())]
     Io {
         path: PathBuf,
@@ -66,9 +66,15 @@ pub enum ApiInitError {
         path: PathBuf,
         error: LinkArchiveParseError,
     },
+
+    #[error("{}: {error}", .path.display())]
+    ApiSymbols {
+        path: PathBuf,
+        error: ApiSymbolsError,
+    },
 }
 
-impl From<LibsearchError> for ApiInitError {
+impl From<LibsearchError> for ApiSetupError {
     fn from(value: LibsearchError) -> Self {
         match value {
             LibsearchError::NotFound(name) => Self::NotFound(name),
@@ -120,22 +126,22 @@ pub enum LinkerPathErrorKind {
     DrectveLibrary(#[from] DrectveLibsearchError),
 
     #[error("{0}")]
-    ArchiveParse(#[from] LinkArchiveParseError),
+    LinkArchive(#[from] LinkArchiveParseError),
 
     #[error("{0}")]
-    ArchiveExtract(#[from] ArchiveParseError),
+    ArchiveParse(#[from] ArchiveParseError),
 
     #[error("{0}")]
-    MemberExtract(#[from] MemberParseErrorKind),
+    ArchiveMember(#[from] MemberParseErrorKind),
 
     #[error("{0}")]
     GraphAdd(#[from] LinkGraphAddError),
 
     #[error("{0}")]
-    ApiSymbol(#[from] ApiSymbolError),
+    Object(#[from] object::Error),
 
     #[error("{0}")]
-    Object(#[from] object::Error),
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]

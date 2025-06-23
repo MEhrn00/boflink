@@ -1,14 +1,30 @@
 use std::path::PathBuf;
 
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 
-use crate::{
-    api::BeaconApiInit,
-    libsearch::{LibraryFind, LibrarySearcher},
-    pathed_item::PathedItem,
-};
+use crate::libsearch::{LibraryFind, LibrarySearcher};
 
-use super::{ConfiguredLinker, CustomApiInit, LinkImpl, LinkerTargetArch};
+use super::{ConfiguredLinker, LinkImpl, LinkerTargetArch};
+
+/// The linker input types.
+#[derive(PartialEq, Eq, Hash)]
+pub(crate) enum LinkInput {
+    /// A file path passed on the command line.
+    File(PathBuf),
+
+    /// A link library passed on the command line.
+    Library(String),
+}
+
+/// The input attributes.
+#[derive(Default)]
+pub(crate) struct LinkInputItem {
+    /// An already opened buffer associated with the input.
+    pub buffer: Option<Vec<u8>>,
+
+    /// If the input is a static archive, include all the members as inputs
+    pub whole: bool,
+}
 
 /// Sets up inputs and configures a [`super::Linker`].
 #[derive(Default)]
@@ -16,16 +32,13 @@ pub struct LinkerBuilder<L: LibraryFind + 'static> {
     /// The target architecture.
     pub(super) target_arch: Option<LinkerTargetArch>,
 
-    /// The input files to link.
-    pub(super) inputs: Vec<PathedItem<PathBuf, Vec<u8>>>,
-
-    /// Link libraries.
-    pub(super) libraries: IndexSet<String>,
+    /// The ordered link inputs and attributes.
+    pub(super) inputs: IndexMap<LinkInput, LinkInputItem>,
 
     /// The name of the entrypoint symbol.
     pub(super) entrypoint: Option<String>,
 
-    /// Custom BOF API to use.
+    /// The custom BOF API library.
     pub(super) custom_api: Option<String>,
 
     /// Whether to merge the .bss section with the .data section.
@@ -56,13 +69,12 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
         Self {
             target_arch: Default::default(),
             inputs: Default::default(),
-            libraries: Default::default(),
             entrypoint: Default::default(),
-            custom_api: Default::default(),
             merge_bss: false,
             merge_grouped_sections: false,
             library_searcher: None,
             link_graph_output: None,
+            custom_api: None,
             gc_sections: false,
             gc_keep_symbols: Default::default(),
             print_gc_sections: false,
@@ -126,31 +138,42 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
         self
     }
 
-    /// Add an input file to the linker.
-    pub fn add_input(mut self, input: PathedItem<PathBuf, Vec<u8>>) -> Self {
-        self.inputs.push(input);
-        self
+    /// Add a file path to link
+    pub fn add_file_path(&mut self, path: impl Into<PathBuf>) {
+        self.inputs.entry(LinkInput::File(path.into())).or_default();
     }
 
-    /// Add a set of input files to the linker.
-    pub fn add_inputs(
-        mut self,
-        inputs: impl IntoIterator<Item = PathedItem<PathBuf, Vec<u8>>>,
-    ) -> Self {
-        self.inputs.extend(inputs);
-        self
+    /// Add a file path to link
+    pub fn add_whole_file_path(&mut self, path: impl Into<PathBuf>) {
+        let entry = self.inputs.entry(LinkInput::File(path.into())).or_default();
+        entry.whole = true;
+    }
+
+    /// Add a file from memory to link
+    pub fn add_file_memory(&mut self, path: impl Into<PathBuf>, buffer: impl Into<Vec<u8>>) {
+        let entry = self.inputs.entry(LinkInput::File(path.into())).or_default();
+        entry.buffer = Some(buffer.into());
     }
 
     /// Add a link library to the linker.
-    pub fn add_library(mut self, name: impl Into<String>) -> Self {
-        self.libraries.insert(name.into());
-        self
+    pub fn add_library(&mut self, name: impl Into<String>) {
+        self.inputs
+            .entry(LinkInput::Library(name.into()))
+            .or_default();
+    }
+
+    /// Add a link library to the linker.
+    pub fn add_whole_library(&mut self, name: impl Into<String>) {
+        let entry = self
+            .inputs
+            .entry(LinkInput::Library(name.into()))
+            .or_default();
+        entry.whole = true;
     }
 
     /// Add a set of link libraries to the linker.
-    pub fn add_libraries<S: Into<String>, I: IntoIterator<Item = S>>(mut self, names: I) -> Self {
-        self.libraries.extend(names.into_iter().map(Into::into));
-        self
+    pub fn add_libraries<S: Into<String>, I: IntoIterator<Item = S>>(&mut self, names: I) {
+        names.into_iter().for_each(|name| self.add_library(name));
     }
 
     /// Add the specified symbol to keep during GC sections.
@@ -172,31 +195,9 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
     /// Finishes configuring the linker.
     pub fn build(mut self) -> Box<dyn LinkImpl> {
         if let Some(library_searcher) = self.library_searcher.take() {
-            if let Some(custom_api) = self.custom_api.take() {
-                Box::new(ConfiguredLinker::with_opts(
-                    self,
-                    library_searcher,
-                    CustomApiInit::from(custom_api),
-                ))
-            } else {
-                Box::new(ConfiguredLinker::with_opts(
-                    self,
-                    library_searcher,
-                    BeaconApiInit,
-                ))
-            }
-        } else if let Some(custom_api) = self.custom_api.take() {
-            Box::new(ConfiguredLinker::with_opts(
-                self,
-                LibrarySearcher::new(),
-                CustomApiInit::from(custom_api),
-            ))
+            Box::new(ConfiguredLinker::with_opts(self, library_searcher))
         } else {
-            Box::new(ConfiguredLinker::with_opts(
-                self,
-                LibrarySearcher::new(),
-                BeaconApiInit,
-            ))
+            Box::new(ConfiguredLinker::with_opts(self, LibrarySearcher::new()))
         }
     }
 }

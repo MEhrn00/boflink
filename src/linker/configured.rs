@@ -1,48 +1,56 @@
 use std::{
-    collections::VecDeque,
-    io::BufWriter,
+    collections::{HashSet, VecDeque},
+    io::{BufWriter, ErrorKind},
     path::{Path, PathBuf},
 };
 
 use indexmap::{IndexMap, IndexSet};
 use log::warn;
-use object::{Object, coff::CoffFile};
+use object::{Architecture, Object, ObjectSymbol, coff::CoffFile};
 use typed_arena::Arena;
 
 use crate::{
-    api::{ApiSymbolError, ApiSymbolSource},
+    api::ApiSymbols,
     drectve,
-    graph::LinkGraph,
+    graph::SpecLinkGraph,
     libsearch::LibraryFind,
     linker::error::{DrectveLibsearchError, LinkerSymbolErrors},
-    linkobject::archive::{ExtractMemberError, ExtractedMemberContents, LinkArchive},
+    linkobject::archive::{
+        ArchiveMemberError, ExtractSymbolError, LinkArchive, LinkArchiveMemberVariant,
+    },
     pathed_item::PathedItem,
 };
 
 use super::{
-    ApiInit, ApiInitCtx, LinkImpl, LinkerBuilder, LinkerTargetArch,
-    error::{LinkError, LinkerSetupError, LinkerSetupErrors, LinkerSetupPathError},
+    LinkImpl, LinkInput, LinkInputItem, LinkerBuilder, LinkerTargetArch,
+    error::{
+        ApiSetupError, LinkError, LinkerPathErrorKind, LinkerSetupError, LinkerSetupErrors,
+        LinkerSetupPathError,
+    },
 };
 
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct CoffPath<'a> {
+    file_path: &'a Path,
+    member_path: Option<&'a Path>,
+}
+
 /// A configured linker.
-pub struct ConfiguredLinker<L: LibraryFind, Api: ApiInit> {
+pub struct ConfiguredLinker<L: LibraryFind> {
     /// The target architecture.
     target_arch: Option<LinkerTargetArch>,
 
-    /// The unparsed linker inputs
-    inputs: Vec<PathedItem<PathBuf, Vec<u8>>>,
-
-    /// The names of the link libraries.
-    library_names: IndexSet<String>,
-
-    /// The custom API.
-    custom_api: Api,
+    /// The linker inputs
+    inputs: IndexMap<LinkInput, LinkInputItem>,
 
     /// The link library searcher.
     library_searcher: L,
 
     /// The name of the entrypoint symbol.
     entrypoint: Option<String>,
+
+    /// The custom BOF API library.
+    custom_api: Option<String>,
 
     /// Whether to merge the .bss section with the .data section.
     merge_bss: bool,
@@ -63,7 +71,7 @@ pub struct ConfiguredLinker<L: LibraryFind, Api: ApiInit> {
     link_graph_output: Option<PathBuf>,
 }
 
-impl<L: LibraryFind, Api: ApiInit> ConfiguredLinker<L, Api> {
+impl<L: LibraryFind> ConfiguredLinker<L> {
     /// Returns a [`LinkerBuilder`] for configuring a linker.
     pub fn builder() -> LinkerBuilder<L> {
         LinkerBuilder::new()
@@ -72,15 +80,13 @@ impl<L: LibraryFind, Api: ApiInit> ConfiguredLinker<L, Api> {
     pub(super) fn with_opts<T: LibraryFind>(
         builder: LinkerBuilder<T>,
         library_searcher: L,
-        custom_api: Api,
-    ) -> ConfiguredLinker<L, Api> {
+    ) -> ConfiguredLinker<L> {
         Self {
             target_arch: builder.target_arch,
             inputs: builder.inputs,
-            library_names: builder.libraries,
-            custom_api,
             library_searcher,
             entrypoint: builder.entrypoint,
+            custom_api: builder.custom_api,
             merge_bss: builder.merge_bss,
             merge_grouped_sections: builder.merge_grouped_sections,
             link_graph_output: builder.link_graph_output,
@@ -91,142 +97,37 @@ impl<L: LibraryFind, Api: ApiInit> ConfiguredLinker<L, Api> {
     }
 }
 
-impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
+impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
     fn link(&mut self) -> Result<Vec<u8>, LinkError> {
-        // Parsed input COFFs
-        let mut parsed_inputs = Vec::with_capacity(self.inputs.len());
+        // Buffer arena
+        let buffer_arena = Arena::with_capacity(self.inputs.len());
+
+        let mut input_processor = LinkInputProcessor::with_capacity(
+            &buffer_arena,
+            &self.library_searcher,
+            self.entrypoint.take(),
+            self.inputs.len(),
+        );
 
         // Errors during setup
         let mut setup_errors = Vec::new();
 
-        // Parsed link libraries
-        let mut link_libraries =
-            IndexMap::with_capacity(self.inputs.len() + self.library_names.len());
-
-        // The opened link library names including .drectve libraries
-        let mut library_names: IndexSet<&str> =
-            IndexSet::from_iter(self.library_names.iter().map(|v| v.as_str()));
-
-        // Spec graph for calculating memory needed for allocating the link
-        // graph.
-        let mut spec = LinkGraph::spec();
-
-        // Queue of .drectve libraries to open
-        let mut drectve_queue = VecDeque::with_capacity(self.inputs.len());
-
-        // Parse the command line input files
-        for input in &self.inputs {
-            // Check if this is an archive file passed in the command line
-            if input
-                .get(..object::archive::MAGIC.len())
-                .is_some_and(|magic| magic == object::archive::MAGIC)
-            {
-                match LinkArchive::parse(input.as_slice())
-                    .map_err(|e| LinkerSetupPathError::nomember(input.path(), e))
-                {
-                    Ok(parsed) => {
-                        link_libraries.insert(input.path().as_path(), parsed);
-                    }
-                    Err(e) => {
-                        setup_errors.push(LinkerSetupError::Path(e));
-                    }
-                };
-            } else {
-                match CoffFile::<_>::parse(input.as_slice())
-                    .map_err(|e| LinkerSetupPathError::nomember(input.path(), e))
-                {
-                    Ok(parsed) => {
-                        // Add .drectve libraries to the drectve_queue.
-                        for library_name in drectve::parse_drectve_libraries(&parsed)
-                            .into_iter()
-                            .flatten()
-                        {
-                            let library_name = library_name.trim_end_matches(".lib");
-                            if library_names.insert(library_name) {
-                                drectve_queue.push_back((input.path().as_path(), library_name));
-                            }
-                        }
-
-                        spec.add_coff(&parsed);
-
-                        // Add the COFF to the list of parsed inputs.
-                        parsed_inputs.push(PathedItem::new(input.path().as_path(), parsed));
-                    }
-                    Err(e) => {
-                        setup_errors.push(LinkerSetupError::Path(e));
-                    }
-                }
+        // Process the input files
+        for (link_input, link_item) in std::mem::take(&mut self.inputs) {
+            if let Err(e) = input_processor.process_input(link_input, link_item) {
+                setup_errors.push(e);
             }
         }
 
-        let library_arena = Arena::with_capacity(library_names.len() + 1);
-
-        // Open link libraries
-        for link_library in &self.library_names {
-            let found = match self.library_searcher.find_library(link_library) {
-                Ok(found) => {
-                    if link_libraries.contains_key(found.path().as_path()) {
-                        continue;
-                    }
-
-                    library_arena.alloc(found)
-                }
-                Err(e) => {
-                    setup_errors.push(LinkerSetupError::Library(e));
-                    continue;
-                }
-            };
-
-            let parsed = match LinkArchive::parse(found.as_slice()) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    setup_errors.push(LinkerSetupError::Path(LinkerSetupPathError::nomember(
-                        found.path(),
-                        e,
-                    )));
-                    continue;
-                }
-            };
-
-            link_libraries.insert(found.path().as_path(), parsed);
-        }
-
-        // Open drectve link libraries
-        while let Some((coff_path, drectve_library)) = drectve_queue.pop_front() {
-            let found = match self.library_searcher.find_library(drectve_library) {
-                Ok(found) => {
-                    if link_libraries.contains_key(found.path().as_path()) {
-                        continue;
-                    }
-
-                    library_arena.alloc(found)
-                }
-                Err(e) => {
-                    setup_errors.push(LinkerSetupError::Path(LinkerSetupPathError::nomember(
-                        coff_path,
-                        DrectveLibsearchError::from(e),
-                    )));
-                    continue;
-                }
-            };
-
-            let parsed = match LinkArchive::parse(found.as_slice()) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    setup_errors.push(LinkerSetupError::Path(LinkerSetupPathError::nomember(
-                        found.path(),
-                        e,
-                    )));
-                    continue;
-                }
-            };
-
-            link_libraries.insert(found.path().as_path(), parsed);
+        if let Err(e) = input_processor.include_entrypoint() {
+            setup_errors.push(LinkerSetupError::Path(e));
+            return Err(LinkError::Setup(LinkerSetupErrors(setup_errors)));
         }
 
         let target_arch = self.target_arch.take().or_else(|| {
-            parsed_inputs
-                .iter()
+            input_processor
+                .coffs
+                .values()
                 .find_map(|coff| LinkerTargetArch::try_from(coff.architecture()).ok())
         });
 
@@ -237,7 +138,7 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
                     return Err(LinkError::Setup(LinkerSetupErrors(setup_errors)));
                 }
 
-                if self.inputs.is_empty() {
+                if input_processor.coffs.is_empty() {
                     return Err(LinkError::NoInput);
                 }
 
@@ -245,17 +146,15 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
             }
         };
 
-        // Initialize the custom API
-        let api_resolver = match self.custom_api.initialize_api(&ApiInitCtx {
-            target_arch,
-            library_searcher: &self.library_searcher,
-            arena: &library_arena,
-        }) {
-            Ok(resolver) => resolver,
-            Err(e) => {
-                setup_errors.push(LinkerSetupError::ApiInit(e));
-                return Err(LinkError::Setup(LinkerSetupErrors(setup_errors)));
-            }
+        let api_symbols = match self.custom_api.take() {
+            Some(custom_api) => match input_processor.open_custom_api(custom_api) {
+                Ok(api_symbols) => api_symbols,
+                Err(e) => {
+                    setup_errors.push(LinkerSetupError::Api(e));
+                    return Err(LinkError::Setup(LinkerSetupErrors(setup_errors)));
+                }
+            },
+            None => ApiSymbols::beacon(target_arch),
         };
 
         // Check errors
@@ -263,19 +162,60 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
             return Err(LinkError::Setup(LinkerSetupErrors(setup_errors)));
         }
 
-        if self.inputs.is_empty() {
+        if input_processor.coffs.is_empty() {
             return Err(LinkError::NoInput);
         }
 
         // Build the graph
-        let graph_arena = spec.alloc_arena();
-        let mut graph = spec.alloc_graph(&graph_arena, target_arch);
+        let graph_arena = input_processor.spec.alloc_arena();
+        let mut graph = input_processor.spec.alloc_graph(&graph_arena, target_arch);
 
         // Add COFFs
-        for coff in parsed_inputs {
-            if let Err(e) = graph.add_coff(coff.path(), None, &coff) {
-                setup_errors.push(LinkerSetupError::Path(LinkerSetupPathError::nomember(
-                    coff.path(),
+        for (coff_path, coff) in &input_processor.coffs {
+            for library_name in drectve::parse_drectve_libraries(coff).into_iter().flatten() {
+                if !input_processor.opened_library_names.contains(library_name) {
+                    let library = match self.library_searcher.find_library(library_name) {
+                        Ok(found) => found,
+                        Err(e) => {
+                            setup_errors.push(LinkerSetupError::Path(LinkerSetupPathError::new(
+                                coff_path.file_path,
+                                coff_path.member_path,
+                                LinkerPathErrorKind::DrectveLibrary(e.into()),
+                            )));
+                            continue;
+                        }
+                    };
+
+                    input_processor
+                        .opened_library_names
+                        .insert(library_name.to_string());
+
+                    if !input_processor
+                        .link_libraries
+                        .contains_key(library.path().as_path())
+                    {
+                        let library = input_processor.arena.alloc(library);
+                        let archive = match LinkArchive::parse(library.as_slice()) {
+                            Ok(parsed) => parsed,
+                            Err(e) => {
+                                setup_errors.push(LinkerSetupError::Path(
+                                    LinkerSetupPathError::nomember(library.path(), e),
+                                ));
+                                continue;
+                            }
+                        };
+
+                        input_processor
+                            .link_libraries
+                            .insert(library.path().as_path(), archive);
+                    }
+                }
+            }
+
+            if let Err(e) = graph.add_coff(coff_path.file_path, coff_path.member_path, coff) {
+                setup_errors.push(LinkerSetupError::Path(LinkerSetupPathError::new(
+                    coff_path.file_path,
+                    coff_path.member_path,
                     e,
                 )));
             }
@@ -284,17 +224,6 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
         // Return any errors
         if !setup_errors.is_empty() {
             return Err(LinkError::Setup(LinkerSetupErrors(setup_errors)));
-        }
-
-        // Add the entrypoint symbol so that it can be linked in from archives
-        if let Some(entrypoint) = &mut self.entrypoint {
-            if target_arch == LinkerTargetArch::I386 {
-                *entrypoint = format!("_{entrypoint}");
-            }
-        }
-
-        if let Some(entrypoint) = &self.entrypoint {
-            graph.add_external_symbol(entrypoint);
         }
 
         let mut drectve_queue: VecDeque<((&Path, &Path), &str)> = VecDeque::new();
@@ -320,23 +249,15 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
             // Attempt to resolve each symbol in the search list
             'symbol: while let Some(symbol_name) = symbol_search_buffer.pop_front() {
                 // Try resolving it as an API import first
-                match api_resolver.extract_api_symbol(symbol_name) {
-                    Ok(api_import) => {
-                        if let Err(e) = graph.add_api_import(symbol_name, &api_import) {
-                            setup_errors.push(LinkerSetupError::Path(
-                                LinkerSetupPathError::nomember(api_resolver.api_path(), e),
-                            ));
-                        } else {
-                            continue;
-                        }
-                    }
-                    Err(ApiSymbolError::NotFound) => (),
-                    Err(e) => {
+                if let Some(api_import) = api_symbols.get(symbol_name) {
+                    if let Err(e) = graph.add_api_import(symbol_name, api_import) {
                         setup_errors.push(LinkerSetupError::Path(LinkerSetupPathError::nomember(
-                            api_resolver.api_path(),
+                            api_symbols.archive_path(),
                             e,
                         )));
                     }
+
+                    continue;
                 }
 
                 // Open any pending libraries in the .drectve queue
@@ -345,12 +266,21 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
                 {
                     match self.library_searcher.find_library(drectve_library) {
                         Ok(found) => {
-                            if library_names.insert(drectve_library) {
-                                let found = library_arena.alloc(found);
+                            if !input_processor
+                                .opened_library_names
+                                .contains(drectve_library)
+                            {
+                                input_processor
+                                    .opened_library_names
+                                    .insert(drectve_library.to_string());
+
+                                let found = buffer_arena.alloc(found);
 
                                 match LinkArchive::parse(found.as_slice()) {
                                     Ok(parsed) => {
-                                        link_libraries.insert(found.path().as_path(), parsed);
+                                        input_processor
+                                            .link_libraries
+                                            .insert(found.path().as_path(), parsed);
                                     }
                                     Err(e) => {
                                         setup_errors.push(LinkerSetupError::Path(
@@ -375,20 +305,20 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
                 }
 
                 // Attempt to resolve the symbol using the opened link libraries
-                for (library_path, library) in &link_libraries {
-                    let extracted =
+                for (library_path, library) in &input_processor.link_libraries {
+                    let (member_path, member) =
                         match library.extract_symbol(symbol_name) {
                             Ok(extracted) => extracted,
-                            Err(ExtractMemberError::NotFound) => {
+                            Err(ExtractSymbolError::NotFound) => {
                                 continue;
                             }
-                            Err(ExtractMemberError::ArchiveParse(e)) => {
+                            Err(ExtractSymbolError::ArchiveParse(e)) => {
                                 setup_errors.push(LinkerSetupError::Path(
                                     LinkerSetupPathError::nomember(library_path, e),
                                 ));
                                 continue;
                             }
-                            Err(ExtractMemberError::MemberParse(e)) => {
+                            Err(ExtractSymbolError::MemberParse(e)) => {
                                 setup_errors.push(LinkerSetupError::Path(
                                     LinkerSetupPathError::new(library_path, Some(e.path), e.kind),
                                 ));
@@ -396,45 +326,39 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
                             }
                         };
 
-                    match extracted.contents() {
-                        ExtractedMemberContents::Coff(coff) => {
+                    match member {
+                        LinkArchiveMemberVariant::Coff(coff) => {
                             // Add any .drectve link libraries from linked in COFFs
                             // to the drectve queue
-                            for drectve_library in
-                                drectve::parse_drectve_libraries(coff).into_iter().flatten()
+                            for drectve_library in drectve::parse_drectve_libraries(&coff)
+                                .into_iter()
+                                .flatten()
                             {
                                 let drectve_library_name = drectve_library.trim_end_matches(".lib");
-                                if library_names.contains(drectve_library) {
+                                if !input_processor
+                                    .opened_library_names
+                                    .contains(drectve_library)
+                                {
                                     drectve_queue.push_back((
-                                        (library_path, extracted.path()),
+                                        (library_path, member_path),
                                         drectve_library_name,
                                     ));
                                 }
                             }
 
-                            if let Err(e) =
-                                graph.add_coff(library_path, Some(extracted.path()), coff)
-                            {
+                            if let Err(e) = graph.add_coff(library_path, Some(member_path), &coff) {
                                 setup_errors.push(LinkerSetupError::Path(
-                                    LinkerSetupPathError::new(
-                                        library_path,
-                                        Some(extracted.path()),
-                                        e,
-                                    ),
+                                    LinkerSetupPathError::new(library_path, Some(member_path), e),
                                 ));
                                 continue;
                             }
 
                             continue 'symbol;
                         }
-                        ExtractedMemberContents::Import(import_member) => {
-                            if let Err(e) = graph.add_library_import(symbol_name, import_member) {
+                        LinkArchiveMemberVariant::Import(import_member) => {
+                            if let Err(e) = graph.add_library_import(symbol_name, &import_member) {
                                 setup_errors.push(LinkerSetupError::Path(
-                                    LinkerSetupPathError::new(
-                                        library_path,
-                                        Some(extracted.path()),
-                                        e,
-                                    ),
+                                    LinkerSetupPathError::new(library_path, Some(member_path), e),
                                 ));
                                 continue;
                             }
@@ -478,6 +402,7 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
             }
         };
 
+        // Run GC sections
         if self.gc_sections {
             graph.gc_sections(self.entrypoint.as_ref(), self.gc_roots.iter())?;
 
@@ -486,14 +411,300 @@ impl<L: LibraryFind, A: ApiInit> LinkImpl for ConfiguredLinker<L, A> {
             }
         }
 
+        // Run merge bss
         if self.merge_bss {
             graph.merge_bss();
         }
 
+        // Build the linked output from the graph
         if self.merge_grouped_sections {
             Ok(graph.link_merge_groups()?)
         } else {
             Ok(graph.link()?)
         }
     }
+}
+
+/// Process the linker inputs
+struct LinkInputProcessor<'b, 'a, L: LibraryFind> {
+    /// Arena for holding opened files
+    arena: &'a Arena<PathedItem<PathBuf, Vec<u8>>>,
+
+    /// Used for finding link libraries
+    library_searcher: &'b L,
+
+    /// The names of opened link libraries
+    opened_library_names: HashSet<String>,
+
+    /// Parsed COFF inputs.
+    coffs: IndexMap<CoffPath<'a>, CoffFile<'a>>,
+
+    /// Parsed lazily linked libraries.
+    link_libraries: IndexMap<&'a Path, LinkArchive<'a>>,
+
+    /// The name of the entrypoint symbol.
+    entrypoint: Option<String>,
+
+    /// If the entrypoint has been found.
+    entrypoint_found: bool,
+
+    /// Spec graph
+    spec: SpecLinkGraph,
+}
+
+impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
+    pub fn with_capacity(
+        arena: &'a Arena<PathedItem<PathBuf, Vec<u8>>>,
+        library_searcher: &'b L,
+        entrypoint: Option<String>,
+        capacity: usize,
+    ) -> LinkInputProcessor<'b, 'a, L> {
+        Self {
+            arena,
+            library_searcher,
+            opened_library_names: HashSet::with_capacity(capacity),
+            coffs: IndexMap::with_capacity(capacity),
+            link_libraries: IndexMap::with_capacity(capacity),
+            spec: SpecLinkGraph::new(),
+            entrypoint,
+            entrypoint_found: false,
+        }
+    }
+
+    pub fn process_input(
+        &mut self,
+        input: LinkInput,
+        mut item: LinkInputItem,
+    ) -> Result<(), LinkerSetupError> {
+        match input {
+            LinkInput::File(file_path) => {
+                let buffer = if let Some(existing_buffer) = item.buffer.take() {
+                    self.arena
+                        .alloc(PathedItem::new(file_path, existing_buffer))
+                } else {
+                    let buffer = std::fs::read(&file_path).map_err(|e| {
+                        LinkerSetupError::Path(LinkerSetupPathError::nomember(&file_path, e))
+                    })?;
+                    self.arena.alloc(PathedItem::new(file_path, buffer))
+                };
+
+                if object_is_archive(buffer.as_slice()) {
+                    let library = LinkArchive::parse(buffer.as_slice()).map_err(|e| {
+                        LinkerSetupError::Path(LinkerSetupPathError::nomember(buffer.path(), e))
+                    })?;
+
+                    if item.whole {
+                        self.add_archive_members(buffer.path().as_path(), library)
+                            .map_err(LinkerSetupError::Path)?;
+                    } else if !self.link_libraries.contains_key(&buffer.path().as_path()) {
+                        self.link_libraries.insert(buffer.path().as_path(), library);
+                    }
+                } else {
+                    let coff: CoffFile = CoffFile::parse(buffer.as_slice()).map_err(|e| {
+                        LinkerSetupError::Path(LinkerSetupPathError::nomember(buffer.path(), e))
+                    })?;
+
+                    if let indexmap::map::Entry::Vacant(coff_entry) = self.coffs.entry(CoffPath {
+                        file_path: buffer.path().as_path(),
+                        member_path: None,
+                    }) {
+                        if !self.entrypoint_found {
+                            if let Some(entrypoint) = &self.entrypoint {
+                                if coff.architecture() == Architecture::I386 {
+                                    let entrypoint = format!("_{entrypoint}");
+
+                                    for symbol in coff.symbols() {
+                                        if symbol.is_global()
+                                            && symbol.is_definition()
+                                            && symbol.name().is_ok_and(|name| name == entrypoint)
+                                        {
+                                            self.entrypoint_found = true;
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    for symbol in coff.symbols() {
+                                        if symbol.is_global()
+                                            && symbol.is_definition()
+                                            && symbol.name().is_ok_and(|name| name == entrypoint)
+                                        {
+                                            self.entrypoint_found = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        self.spec.add_coff(&coff);
+                        coff_entry.insert(coff);
+                    }
+                }
+            }
+            LinkInput::Library(library_name) => {
+                if !self.opened_library_names.contains(&library_name) {
+                    let library = self
+                        .library_searcher
+                        .find_library(&library_name)
+                        .map_err(LinkerSetupError::Library)?;
+
+                    self.opened_library_names.insert(library_name);
+
+                    if item.whole {
+                        let library = self.arena.alloc(library);
+                        let archive = LinkArchive::parse(library.as_slice()).map_err(|e| {
+                            LinkerSetupError::Path(LinkerSetupPathError::nomember(
+                                library.path(),
+                                e,
+                            ))
+                        })?;
+
+                        self.add_archive_members(library.path().as_path(), archive)
+                            .map_err(LinkerSetupError::Path)?;
+                    } else if !self.link_libraries.contains_key(library.path().as_path()) {
+                        let library = self.arena.alloc(library);
+                        let archive = LinkArchive::parse(library.as_slice()).map_err(|e| {
+                            LinkerSetupError::Path(LinkerSetupPathError::nomember(
+                                library.path(),
+                                e,
+                            ))
+                        })?;
+
+                        self.link_libraries
+                            .insert(library.path().as_path(), archive);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn add_archive_members(
+        &mut self,
+        archive_path: &'a Path,
+        archive: LinkArchive<'a>,
+    ) -> Result<(), LinkerSetupPathError> {
+        for member in archive.coff_members() {
+            let (member_path, coff) = member.map_err(|e| match e {
+                ArchiveMemberError::ArchiveParse(e) => {
+                    LinkerSetupPathError::nomember(archive_path, e)
+                }
+                ArchiveMemberError::MemberParse(e) => {
+                    LinkerSetupPathError::new(archive_path, Some(e.path), e.kind)
+                }
+            })?;
+
+            if let indexmap::map::Entry::Vacant(coff_entry) = self.coffs.entry(CoffPath {
+                file_path: archive_path,
+                member_path: Some(member_path),
+            }) {
+                self.spec.add_coff(&coff);
+                coff_entry.insert(coff);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn open_custom_api(&mut self, library: String) -> Result<ApiSymbols<'a>, ApiSetupError> {
+        let custom_api = match std::fs::read(&library) {
+            Ok(buffer) => PathedItem::new(PathBuf::from(library), buffer),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                match self.library_searcher.find_library(&library) {
+                    Ok(found) => {
+                        self.opened_library_names.insert(library);
+                        found
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(e) => {
+                return Err(ApiSetupError::Io {
+                    path: PathBuf::from(library),
+                    error: e,
+                });
+            }
+        };
+
+        let custom_api = self.arena.alloc(custom_api);
+
+        let api_archive =
+            LinkArchive::parse(custom_api.as_slice()).map_err(|e| ApiSetupError::Parse {
+                path: custom_api.path().to_path_buf(),
+                error: e,
+            })?;
+
+        ApiSymbols::new(custom_api.path().as_path(), api_archive).map_err(|e| {
+            ApiSetupError::ApiSymbols {
+                path: custom_api.path().to_path_buf(),
+                error: e,
+            }
+        })
+    }
+
+    fn include_entrypoint(&mut self) -> Result<(), LinkerSetupPathError> {
+        if !self.entrypoint_found {
+            if let Some(entrypoint) = &self.entrypoint {
+                for (library_path, library) in &self.link_libraries {
+                    for member in library.coff_members() {
+                        let (member_path, coff) = member.map_err(|e| match e {
+                            ArchiveMemberError::MemberParse(e) => {
+                                LinkerSetupPathError::new(library_path, Some(e.path), e.kind)
+                            }
+                            ArchiveMemberError::ArchiveParse(e) => {
+                                LinkerSetupPathError::nomember(library_path, e)
+                            }
+                        })?;
+
+                        if coff.architecture() == Architecture::I386 {
+                            let entry_name = format!("_{entrypoint}");
+                            for symbol in coff.symbols() {
+                                if symbol.is_global()
+                                    && symbol.is_definition()
+                                    && symbol.name().is_ok_and(|name| name == entry_name)
+                                {
+                                    self.spec.add_coff(&coff);
+                                    self.coffs.insert(
+                                        CoffPath {
+                                            file_path: library_path,
+                                            member_path: Some(member_path),
+                                        },
+                                        coff,
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                        } else {
+                            for symbol in coff.symbols() {
+                                if symbol.is_global()
+                                    && symbol.is_definition()
+                                    && symbol.name().is_ok_and(|name| name == entrypoint)
+                                {
+                                    self.spec.add_coff(&coff);
+                                    self.coffs.insert(
+                                        CoffPath {
+                                            file_path: library_path,
+                                            member_path: Some(member_path),
+                                        },
+                                        coff,
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                        };
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn object_is_archive(buffer: impl AsRef<[u8]>) -> bool {
+    buffer
+        .as_ref()
+        .get(..object::archive::MAGIC.len())
+        .is_some_and(|magic| magic == object::archive::MAGIC)
 }
