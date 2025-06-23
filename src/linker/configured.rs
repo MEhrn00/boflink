@@ -5,7 +5,7 @@ use std::{
 };
 
 use indexmap::{IndexMap, IndexSet};
-use log::warn;
+use log::{trace, warn};
 use object::{Architecture, Object, ObjectSymbol, coff::CoffFile};
 use typed_arena::Arena;
 
@@ -599,6 +599,34 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
                 file_path: archive_path,
                 member_path: Some(member_path),
             }) {
+                if !self.entrypoint_found {
+                    if let Some(entrypoint) = &self.entrypoint {
+                        if coff.architecture() == Architecture::I386 {
+                            let entrypoint = format!("_{entrypoint}");
+
+                            for symbol in coff.symbols() {
+                                if symbol.is_global()
+                                    && symbol.is_definition()
+                                    && symbol.name().is_ok_and(|name| name == entrypoint)
+                                {
+                                    self.entrypoint_found = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            for symbol in coff.symbols() {
+                                if symbol.is_global()
+                                    && symbol.is_definition()
+                                    && symbol.name().is_ok_and(|name| name == entrypoint)
+                                {
+                                    self.entrypoint_found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 self.spec.add_coff(&coff);
                 coff_entry.insert(coff);
             }
@@ -645,6 +673,7 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
 
     fn include_entrypoint(&mut self) -> Result<(), LinkerSetupPathError> {
         if !self.entrypoint_found {
+            trace!("entrypoint not found. searching in link libraries");
             if let Some(entrypoint) = &self.entrypoint {
                 for (library_path, library) in &self.link_libraries {
                     for member in library.coff_members() {
