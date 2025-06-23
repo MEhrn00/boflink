@@ -7,7 +7,7 @@ use std::{
 };
 
 use indexmap::{IndexMap, IndexSet};
-use log::{debug, warn};
+use log::warn;
 use object::{
     Architecture, Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolIndex,
     coff::{CoffFile, CoffHeader, ImageSymbol},
@@ -479,27 +479,18 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
             // If this is a non-COMDAT code section, add an associative edge to
             // the .pdata section which contains the exception information
             if !code_section.is_comdat() {
-                debug!("searching for associative .pdata section");
                 if let Some(pdata_section) = code_section.find_associated_pdata_section() {
-                    debug!("found associative .pdata section");
                     // Only add the associative edge if it does not already exist
                     if !code_section
                         .associative_edges()
                         .iter()
                         .any(|edge| edge.target().name().group_name() == ".pdata")
                     {
-                        debug!(
-                            "adding associative edge from '{}' to '{}'",
-                            code_section.name(),
-                            pdata_section.name()
-                        );
                         code_section
                             .associative_edges()
                             .push_back(self.arena.alloc_with(|| {
                                 Edge::new(code_section, pdata_section, AssociativeSectionEdgeWeight)
                             }));
-                    } else {
-                        debug!("associative .pdata edge already exists");
                     }
                 }
             }

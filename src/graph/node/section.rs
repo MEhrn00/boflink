@@ -4,7 +4,6 @@ use std::{
     hash::{DefaultHasher, Hasher},
 };
 
-use log::debug;
 use object::pe::{
     IMAGE_SCN_ALIGN_1BYTES, IMAGE_SCN_ALIGN_2BYTES, IMAGE_SCN_ALIGN_4BYTES, IMAGE_SCN_ALIGN_8BYTES,
     IMAGE_SCN_ALIGN_16BYTES, IMAGE_SCN_ALIGN_32BYTES, IMAGE_SCN_ALIGN_64BYTES,
@@ -194,8 +193,6 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
             return Some(pdata_section);
         }
 
-        debug!("traversing incoming references to find .pdata section");
-
         // Traverse through incoming relocations to find the .pdata section
         // which references this code section.
         for possible_joined_symbol in self.definitions().iter().filter_map(|edge| {
@@ -204,7 +201,6 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
                 || defined_symbol.is_section_symbol())
             .then_some(defined_symbol)
         }) {
-            debug!("possible symbol '{}'", possible_joined_symbol.name());
             if let Some(pdata_section) =
                 possible_joined_symbol.references().iter().find_map(|edge| {
                     let source_section = edge.source();
