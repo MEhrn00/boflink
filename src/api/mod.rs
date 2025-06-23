@@ -2,8 +2,6 @@ mod beaconapi;
 
 use std::{collections::HashMap, path::Path};
 
-use log::warn;
-
 use crate::{
     linker::LinkerTargetArch,
     linkobject::{
@@ -55,19 +53,13 @@ impl<'a> ApiSymbols<'a> {
 
         for symbol in symbol_iter {
             let symbol = symbol?;
-            let (member_path, member) = symbol.extract()?;
+            let (_, member) = symbol.extract()?;
 
             match member {
                 LinkArchiveMemberVariant::Import(import_member) => {
                     symbols.insert(symbol.name(), import_member);
                 }
-                LinkArchiveMemberVariant::Coff(_) => {
-                    warn!(
-                        "{}: ignoring COFF member '{}' in --custom-api",
-                        path.display(),
-                        member_path.display()
-                    );
-                }
+                LinkArchiveMemberVariant::Coff(_) => {}
             }
         }
 
