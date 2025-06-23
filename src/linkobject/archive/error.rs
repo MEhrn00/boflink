@@ -15,7 +15,7 @@ pub enum LinkArchiveParseError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ExtractMemberError {
+pub enum ExtractSymbolError {
     #[error("member for symbol does not exist")]
     NotFound,
 
@@ -24,6 +24,24 @@ pub enum ExtractMemberError {
 
     #[error("{0}")]
     MemberParse(#[from] MemberParseError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ArchiveMemberError {
+    #[error("{0}")]
+    ArchiveParse(ArchiveParseError),
+
+    #[error("{0}")]
+    MemberParse(MemberParseError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ArchiveSymbolError {
+    #[error("symbol name is invalid: {0}")]
+    Name(std::str::Utf8Error),
+
+    #[error("failed parsing archive file: {0}")]
+    Object(object::read::Error),
 }
 
 #[derive(Debug, thiserror::Error)]

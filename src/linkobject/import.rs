@@ -1,6 +1,6 @@
 use std::str::Utf8Error;
 
-use object::Architecture;
+use object::{Architecture, pe::IMAGE_FILE_MACHINE_UNKNOWN};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TryFromImportFileError {
@@ -92,4 +92,12 @@ impl<'a> TryFrom<object::read::coff::ImportFile<'a>> for ImportMember<'a> {
             typ: value.import_type().into(),
         })
     }
+}
+
+pub fn object_is_import_file(data: impl AsRef<[u8]>) -> bool {
+    use std::mem::size_of_val;
+
+    data.as_ref()
+        .get(..size_of_val(&IMAGE_FILE_MACHINE_UNKNOWN))
+        .is_some_and(|magic| magic == IMAGE_FILE_MACHINE_UNKNOWN.to_le_bytes())
 }

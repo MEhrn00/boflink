@@ -1,23 +1,19 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
-    ops::Deref,
+    collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
+use indexmap::IndexMap;
 use object::{
     Object,
     coff::{CoffFile, ImportFile},
-    pe::IMAGE_FILE_MACHINE_UNKNOWN,
-    read::archive::{ArchiveFile, ArchiveMember, ArchiveOffset, ArchiveSymbolIterator},
+    read::archive::{
+        ArchiveFile, ArchiveMember, ArchiveMemberIterator, ArchiveOffset, ArchiveSymbolIterator,
+    },
 };
 
-use crate::{
-    api::{ApiSymbolError, ApiSymbolSource},
-    pathed_item::PathedItem,
-};
-
-use super::import::ImportMember;
+use super::import::{ImportMember, object_is_import_file};
 
 pub use error::*;
 
@@ -26,50 +22,14 @@ use legacy_importlib::{LegacyImportHeadMember, LegacyImportSymbolMember, LegacyI
 pub mod error;
 mod legacy_importlib;
 
-pub struct ExtractedMember<'a> {
-    path: &'a Path,
-    contents: ExtractedMemberContents<'a>,
-}
-
-impl<'a> ExtractedMember<'a> {
-    pub fn new(
-        path: &'a Path,
-        contents: impl Into<ExtractedMemberContents<'a>>,
-    ) -> ExtractedMember<'a> {
-        Self {
-            path,
-            contents: contents.into(),
-        }
-    }
-
-    pub fn path(&self) -> &'a Path {
-        self.path
-    }
-
-    pub fn contents(&self) -> &ExtractedMemberContents<'a> {
-        &self.contents
-    }
-}
-
-pub enum ExtractedMemberContents<'a> {
+pub enum LinkArchiveMemberVariant<'a> {
     Coff(CoffFile<'a>),
     Import(ImportMember<'a>),
 }
 
-impl<'a> From<CoffFile<'a>> for ExtractedMemberContents<'a> {
-    fn from(value: CoffFile<'a>) -> Self {
-        Self::Coff(value)
-    }
-}
-
-impl<'a> From<ImportMember<'a>> for ExtractedMemberContents<'a> {
-    fn from(value: ImportMember<'a>) -> Self {
-        Self::Import(value)
-    }
-}
-
+/// The archive symbol map iterator with caching.
 struct CachedSymbolMap<'a> {
-    cache: HashMap<&'a str, ArchiveOffset>,
+    cache: IndexMap<&'a str, ArchiveOffset>,
     iter: Option<ArchiveSymbolIterator<'a>>,
 }
 
@@ -132,7 +92,7 @@ impl<'a> LinkArchive<'a> {
         Ok(Self {
             archive_file,
             symbol_cache: RefCell::new(CachedSymbolMap {
-                cache: HashMap::with_capacity(symbol_count),
+                cache: IndexMap::with_capacity(symbol_count),
                 iter: Some(symbols),
             }),
             legacy_imports: RefCell::new(BTreeMap::new()),
@@ -140,48 +100,86 @@ impl<'a> LinkArchive<'a> {
         })
     }
 
+    /// Extracts the archive member that contains a definition for the
+    /// specified symbol.
     pub fn extract_symbol(
         &self,
         symbol: &'a str,
-    ) -> Result<ExtractedMember<'a>, ExtractMemberError> {
-        let extracted = self.extract_archive_member(symbol)?;
-        let member_name = std::str::from_utf8(extracted.name())
-            .map_err(|e| ExtractMemberError::ArchiveParse(ArchiveParseError::MemberName(e)))?;
+    ) -> Result<(&'a Path, LinkArchiveMemberVariant<'a>), ExtractSymbolError> {
+        let extracted = self.extract_archive_symbol(symbol)?;
 
-        self.parse_member(&extracted, member_name)
-            .map_err(ExtractMemberError::MemberParse)
+        let member_name = std::str::from_utf8(extracted.name())
+            .map_err(|e| ExtractSymbolError::ArchiveParse(ArchiveParseError::MemberName(e)))?;
+
+        self.parse_archive_member(&extracted, member_name)
+            .map_err(ExtractSymbolError::MemberParse)
     }
 
-    fn parse_member(
+    /// Returns an iterator over the archive symbols.
+    ///
+    /// This iterator bypasses the internal symbol cache used in
+    /// [`LinkArchive::extract_symbol`].
+    pub fn symbols(&self) -> LinkArchiveSymbolsIterator<'_, 'a> {
+        LinkArchiveSymbolsIterator {
+            archive: self,
+            iter: self.archive_file.symbols()
+                .unwrap_or_else(|e| unreachable!("Archive file symbol map validity should have been checked in LinkArchive::parse ({e:?})"))
+                .unwrap_or_else(|| unreachable!("Archive file symbol map existence should have been checked in LinkArchive::parse")),
+        }
+    }
+
+    /// Returns an iterator over the archive members.
+    pub fn members(&self) -> LinkArchiveMembersIterator<'_, 'a> {
+        LinkArchiveMembersIterator {
+            archive: self,
+            iter: self.archive_file.members(),
+        }
+    }
+
+    /// Returns an iterator over the archive COFF members.
+    pub fn coff_members(&self) -> LinkArchiveCoffMembersIterator<'_, 'a> {
+        LinkArchiveCoffMembersIterator {
+            archive: self,
+            iter: self.archive_file.members(),
+        }
+    }
+
+    /// Returns an iterator over the archive import members.
+    pub fn import_members(&self) -> LinkArchiveImportMembersIterator<'_, 'a> {
+        LinkArchiveImportMembersIterator {
+            archive: self,
+            iter: self.archive_file.members(),
+        }
+    }
+
+    /// Parses a generic [`ArchiveMember`] into a [`LinkArchiveMemberVariant`].
+    fn parse_archive_member(
         &self,
         member: &ArchiveMember<'a>,
         member_name: &'a str,
-    ) -> Result<ExtractedMember<'a>, MemberParseError> {
+    ) -> Result<(&'a Path, LinkArchiveMemberVariant<'a>), MemberParseError> {
         let member_data = member
             .data(self.archive_data)
             .map_err(|e| MemberParseError::new(PathBuf::from(member_name), e))?;
 
         let member_path = Path::new(member_name);
 
-        if member_data
-            .get(..2)
-            .is_some_and(|magic| magic == IMAGE_FILE_MACHINE_UNKNOWN.to_le_bytes())
-        {
-            Ok(ExtractedMember {
-                path: member_path,
-                contents: ExtractedMemberContents::Import(
+        if object_is_import_file(member_data) {
+            Ok((
+                member_path,
+                LinkArchiveMemberVariant::Import(
                     ImportFile::parse(member_data)
                         .map_err(|e| MemberParseError::new(member_path, e))?
                         .try_into()
                         .map_err(|e| MemberParseError::new(member_path, e))?,
                 ),
-            })
+            ))
         } else {
             let coff = CoffFile::<&[u8]>::parse(member_data)
                 .map_err(|e| MemberParseError::new(member_path, e))?;
 
             match self.parse_legacy_import_member(member_name, &coff) {
-                Ok(import) => Ok(ExtractedMember::new(member_path, import)),
+                Ok(import) => Ok((member_path, LinkArchiveMemberVariant::Import(import))),
                 Err(e)
                     if matches!(
                         e.kind,
@@ -190,13 +188,14 @@ impl<'a> LinkArchive<'a> {
                         )
                     ) =>
                 {
-                    Ok(ExtractedMember::new(member_path, coff))
+                    Ok((member_path, LinkArchiveMemberVariant::Coff(coff)))
                 }
                 Err(e) => Err(e),
             }
         }
     }
 
+    /// Parses a COFF from the archive as a legacy import symbol member.
     fn parse_legacy_import_member(
         &self,
         member_name: &str,
@@ -213,7 +212,7 @@ impl<'a> LinkArchive<'a> {
             std::collections::btree_map::Entry::Vacant(dll_entry) => {
                 // Get the head COFF for this symbol import member
                 let head_coff_member = self
-                    .extract_archive_member(symbol_member.head_symbol)
+                    .extract_archive_symbol(symbol_member.head_symbol)
                     .map_err(|_| {
                         MemberParseError::new(
                             member_path,
@@ -246,7 +245,7 @@ impl<'a> LinkArchive<'a> {
 
                 // Get the tail COFF for the head member.
                 let tail_coff_member = self
-                    .extract_archive_member(legacy_head_member.tail_symbol)
+                    .extract_archive_symbol(legacy_head_member.tail_symbol)
                     .map_err(|_| {
                         let path =
                             std::str::from_utf8(head_coff_member.name()).unwrap_or(member_name);
@@ -296,73 +295,207 @@ impl<'a> LinkArchive<'a> {
         })
     }
 
-    fn extract_archive_member(
+    /// Extracts the [`ArchiveMember`] that contains a definition for `symbol`.
+    fn extract_archive_symbol(
         &self,
         symbol: &'a str,
-    ) -> Result<ArchiveMember<'a>, ExtractMemberError> {
+    ) -> Result<ArchiveMember<'a>, ExtractSymbolError> {
         let mut symbol_map = self.symbol_cache.borrow_mut();
         let member_idx = symbol_map
             .find_symbol(symbol)
-            .ok_or(ExtractMemberError::NotFound)?;
+            .ok_or(ExtractSymbolError::NotFound)?;
 
         self.archive_file
             .member(member_idx)
-            .map_err(|e| ExtractMemberError::ArchiveParse(ArchiveParseError::Object(e)))
+            .map_err(|e| ExtractSymbolError::ArchiveParse(ArchiveParseError::Object(e)))
     }
 }
 
-impl<'a> ApiSymbolSource<'a> for PathedItem<&Path, LinkArchive<'a>> {
-    fn api_path(&self) -> &Path {
-        self.path()
-    }
+/// Iterator over the [`LinkArchive`] members.
+pub struct LinkArchiveMembersIterator<'b, 'a> {
+    archive: &'b LinkArchive<'a>,
+    iter: ArchiveMemberIterator<'a>,
+}
 
-    fn extract_api_symbol(&self, symbol: &'a str) -> Result<ImportMember<'a>, ApiSymbolError> {
-        self.deref().extract_api_symbol(symbol)
+impl<'b, 'a> Iterator for LinkArchiveMembersIterator<'b, 'a> {
+    type Item = Result<(&'a Path, LinkArchiveMemberVariant<'a>), ArchiveMemberError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let member = self.iter.next().map(|member| {
+            member.map_err(|e| ArchiveMemberError::ArchiveParse(ArchiveParseError::Object(e)))
+        })?;
+
+        Some(member.and_then(
+            |member| -> Result<(&'a Path, LinkArchiveMemberVariant<'a>), ArchiveMemberError> {
+                let member_name = std::str::from_utf8(member.name()).map_err(|e| {
+                    ArchiveMemberError::ArchiveParse(ArchiveParseError::MemberName(e))
+                })?;
+
+                self.archive
+                    .parse_archive_member(&member, member_name)
+                    .map_err(ArchiveMemberError::MemberParse)
+            },
+        ))
     }
 }
 
-impl<'a> ApiSymbolSource<'a> for LinkArchive<'a> {
-    fn extract_api_symbol(&self, symbol: &'a str) -> Result<ImportMember<'a>, ApiSymbolError> {
-        let member = match self.extract_archive_member(symbol) {
-            Ok(member) => member,
-            Err(e) => return Err(e.into()),
-        };
+/// Iterator over the [`LinkArchive`] COFF members.
+pub struct LinkArchiveCoffMembersIterator<'b, 'a> {
+    archive: &'b LinkArchive<'a>,
+    iter: ArchiveMemberIterator<'a>,
+}
 
-        let member_name = std::str::from_utf8(member.name())
-            .map_err(|e| ApiSymbolError::ArchiveParse(ArchiveParseError::MemberName(e)))?;
+impl<'b, 'a> Iterator for LinkArchiveCoffMembersIterator<'b, 'a> {
+    type Item = Result<(&'a Path, CoffFile<'a>), ArchiveMemberError>;
 
-        let member_path = Path::new(member_name);
-
-        let member_data = member
-            .data(self.archive_data)
-            .map_err(|e| ApiSymbolError::MemberParse(MemberParseError::new(member_path, e)))?;
-
-        if member_data
-            .get(..2)
-            .is_some_and(|magic| magic == IMAGE_FILE_MACHINE_UNKNOWN.to_le_bytes())
-        {
-            Ok(ImportFile::parse(member_data)
-                .map_err(|e| ApiSymbolError::MemberParse(MemberParseError::new(member_path, e)))?
-                .try_into()
-                .map_err(|e| ApiSymbolError::MemberParse(MemberParseError::new(member_path, e)))?)
-        } else {
-            let coff = CoffFile::<&[u8]>::parse(member_data)
-                .map_err(|e| ApiSymbolError::MemberParse(MemberParseError::new(member_path, e)))?;
-
-            match self.parse_legacy_import_member(member_name, &coff) {
-                Ok(import) => Ok(import),
-                Err(e)
-                    if matches!(
-                        e.kind,
-                        MemberParseErrorKind::LegacyImportLibrarySymbolMember(
-                            LegacyImportSymbolMemberParseError::Invalid
-                        )
-                    ) =>
-                {
-                    Err(ApiSymbolError::ImportMember)
+    fn next(&mut self) -> Option<Self::Item> {
+        for member in self.iter.by_ref() {
+            let member = match member {
+                Ok(member) => member,
+                Err(e) => {
+                    return Some(Err(ArchiveMemberError::ArchiveParse(
+                        ArchiveParseError::Object(e),
+                    )));
                 }
-                Err(e) => Err(ApiSymbolError::MemberParse(e)),
+            };
+
+            let member_name = match std::str::from_utf8(member.name()) {
+                Ok(member_name) => member_name,
+                Err(e) => {
+                    return Some(Err(ArchiveMemberError::ArchiveParse(
+                        ArchiveParseError::MemberName(e),
+                    )));
+                }
+            };
+
+            let (member_path, member) =
+                match self.archive.parse_archive_member(&member, member_name) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        return Some(Err(ArchiveMemberError::MemberParse(e)));
+                    }
+                };
+
+            if let LinkArchiveMemberVariant::Coff(coff) = member {
+                return Some(Ok((member_path, coff)));
             }
         }
+
+        None
+    }
+}
+
+/// Iterator over the [`LinkArchive`] import members.
+pub struct LinkArchiveImportMembersIterator<'b, 'a> {
+    archive: &'b LinkArchive<'a>,
+    iter: ArchiveMemberIterator<'a>,
+}
+
+impl<'b, 'a> Iterator for LinkArchiveImportMembersIterator<'b, 'a> {
+    type Item = Result<(&'a Path, ImportMember<'a>), ArchiveMemberError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for member in self.iter.by_ref() {
+            let member = match member {
+                Ok(member) => member,
+                Err(e) => {
+                    return Some(Err(ArchiveMemberError::ArchiveParse(
+                        ArchiveParseError::Object(e),
+                    )));
+                }
+            };
+
+            let member_name = match std::str::from_utf8(member.name()) {
+                Ok(member_name) => member_name,
+                Err(e) => {
+                    return Some(Err(ArchiveMemberError::ArchiveParse(
+                        ArchiveParseError::MemberName(e),
+                    )));
+                }
+            };
+
+            let (member_path, member) =
+                match self.archive.parse_archive_member(&member, member_name) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        return Some(Err(ArchiveMemberError::MemberParse(e)));
+                    }
+                };
+
+            if let LinkArchiveMemberVariant::Import(import_member) = member {
+                return Some(Ok((member_path, import_member)));
+            }
+        }
+
+        None
+    }
+}
+
+/// Iterator over the [`LinkArchive`] symbols.
+pub struct LinkArchiveSymbolsIterator<'b, 'a> {
+    /// Reference to the archive
+    archive: &'b LinkArchive<'a>,
+
+    /// The symbol iterator
+    iter: ArchiveSymbolIterator<'a>,
+}
+
+impl<'b, 'a> Iterator for LinkArchiveSymbolsIterator<'b, 'a> {
+    type Item = Result<LinkArchiveSymbol<'b, 'a>, ArchiveSymbolError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let symbol = self
+            .iter
+            .next()
+            .map(|member| member.map_err(ArchiveSymbolError::Object))?;
+
+        Some(
+            symbol.and_then(|symbol| -> Result<LinkArchiveSymbol, ArchiveSymbolError> {
+                Ok(LinkArchiveSymbol {
+                    archive: self.archive,
+                    name: std::str::from_utf8(symbol.name()).map_err(ArchiveSymbolError::Name)?,
+                    offset: symbol.offset(),
+                })
+            }),
+        )
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+/// A symbol from the [`LinkArchive`] symbol map.
+pub struct LinkArchiveSymbol<'b, 'a> {
+    /// Reference to the archive
+    archive: &'b LinkArchive<'a>,
+
+    /// The name of the symbol
+    name: &'a str,
+
+    /// The archive offset for the member which holds this symbol
+    offset: ArchiveOffset,
+}
+
+impl<'b, 'a> LinkArchiveSymbol<'b, 'a> {
+    /// Returns the symbol name.
+    pub fn name(&self) -> &'a str {
+        self.name
+    }
+
+    /// Extracts the archive member for this symbol.
+    pub fn extract(&self) -> Result<(&'a Path, LinkArchiveMemberVariant<'a>), ArchiveMemberError> {
+        let member = self
+            .archive
+            .archive_file
+            .member(self.offset)
+            .map_err(|e| ArchiveMemberError::ArchiveParse(ArchiveParseError::Object(e)))?;
+
+        let member_name = std::str::from_utf8(member.name())
+            .map_err(|e| ArchiveMemberError::ArchiveParse(ArchiveParseError::MemberName(e)))?;
+
+        self.archive
+            .parse_archive_member(&member, member_name)
+            .map_err(ArchiveMemberError::MemberParse)
     }
 }
