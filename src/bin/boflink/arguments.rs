@@ -1,12 +1,26 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
 use boflink::linker::LinkerTargetArch;
-use clap::{Parser, ValueEnum};
-use clap_verbosity_flag::{InfoLevel, Verbosity};
+use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
 pub struct CliArgs {
+    #[command(flatten)]
+    pub inputs: CliInputArgs,
+
+    #[command(flatten)]
+    pub options: CliOptionArgs,
+
+    #[command(flatten)]
+    pub long_ignored: IgnoredLongCliArgs,
+
+    #[command(flatten)]
+    pub ignored: IgnoredCliArgs,
+}
+
+#[derive(Parser, Debug)]
+pub struct CliOptionArgs {
     /// Set the output file name
     #[arg(
         short,
@@ -17,22 +31,10 @@ pub struct CliArgs {
     )]
     pub output: PathBuf,
 
-    /// Files to link
-    #[arg(
-        value_name = "files",
-        value_hint = clap::ValueHint::FilePath
-    )]
-    pub files: Vec<PathBuf>,
-
-    /// Add the specified library to search for symbols
-    #[arg(id = "library", short, long, value_name = "libname")]
-    pub libraries: Vec<String>,
-
     /// Add the directory to the library search path
     #[arg(
-        id = "library-path",
         short = 'L',
-        long,
+        long = "library-path",
         value_name = "directory",
         value_hint = clap::ValueHint::DirPath
     )]
@@ -67,8 +69,8 @@ pub struct CliArgs {
     pub merge_bss: bool,
 
     /// Do not merge grouped sections
-    #[arg(long, default_value = "false")]
-    pub no_merge_groups: bool,
+    #[arg(long, long = "no-merge-groups", action = ArgAction::SetFalse)]
+    pub merge_groups: bool,
 
     /// Enable garbage collection of unused sections
     #[arg(long)]
@@ -89,30 +91,159 @@ pub struct CliArgs {
     #[arg(long, value_name = "color", default_value_t = ColorOption::Auto)]
     pub color: ColorOption,
 
-    #[command(flatten)]
-    pub verbose: Verbosity<InfoLevel>,
+    /// Increasing logging verbosity
+    #[arg(long, short = 'v', action = clap::ArgAction::Count)]
+    pub verbose: u8,
 
     /// Print timing information
     #[arg(long)]
     pub print_timing: bool,
+}
 
-    #[command(flatten)]
-    pub ignored: IgnoredCliArgs,
+#[derive(Parser, Debug)]
+#[command(args_override_self = true)]
+pub struct CliInputArgs {
+    /// Files to link
+    #[arg(
+        value_name = "files",
+        value_hint = clap::ValueHint::FilePath
+    )]
+    pub files: Vec<PathBuf>,
+
+    /// Add the specified library to search for symbols
+    #[arg(short, long = "libraries", value_name = "libname")]
+    pub libraries: Vec<String>,
+
+    /// Include all objects from following archives
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(bool),
+        action = ArgAction::Append,
+        num_args = 0,
+        default_missing_value = "false",
+        default_value = "false",
+    )]
+    pub whole_archive: bool,
+
+    /// Turn off --whole-archive
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(bool),
+        action = ArgAction::Append,
+        num_args = 0,
+        default_missing_value = "false",
+        default_value = "false",
+    )]
+    pub no_whole_archive: bool,
+}
+
+impl CliInputArgs {
+    fn from_matches(matches: &ArgMatches) -> Vec<ParsedCliInput> {
+        let mut values = BTreeMap::new();
+        for id in matches.ids() {
+            if matches.try_get_many::<clap::Id>(id.as_str()).is_ok() {
+                continue;
+            }
+
+            ParsedCliInput::extract(matches, id, &mut values);
+        }
+
+        values.into_values().collect::<Vec<_>>()
+    }
 }
 
 #[derive(Parser, Debug)]
 pub struct IgnoredCliArgs {
     /// Ignored for compatibility with GCC
-    #[arg(long, value_name = "file", hide = true)]
+    #[arg(long, value_name = "file")]
     pub out_implib: Option<String>,
 
     /// Ignored for compatibility with GCC
-    #[arg(long, value_name = "number", default_value = "0", hide = true)]
+    #[arg(
+        long,
+        value_name = "number",
+        default_value = "0",
+        hide_default_value = true
+    )]
     pub major_image_version: u8,
 
     /// Ignored for compatibility with GCC
-    #[arg(long, value_name = "number", default_value = "0", hide = true)]
+    #[arg(
+        long,
+        value_name = "number",
+        default_value = "0",
+        hide_default_value = true
+    )]
     pub minor_image_version: u8,
+}
+
+#[derive(Parser, Debug)]
+pub struct IgnoredLongCliArgs {
+    /// Ignored for compatibility with GCC
+    #[arg(long = "Bdynamic", aliases = ["dy", "call_shared"])]
+    pub dynamic: bool,
+}
+
+#[derive(Parser, Debug)]
+#[command()]
+pub struct ParsedCliArgs {
+    #[arg(skip)]
+    pub inputs: Vec<ParsedCliInput>,
+
+    #[command(flatten)]
+    pub options: CliOptionArgs,
+}
+
+#[derive(Debug, Clone)]
+pub enum ParsedCliInput {
+    WholeArchiveStart,
+    File(PathBuf),
+    Library(String),
+    WholeArchiveEnd,
+}
+
+impl ParsedCliInput {
+    fn extract(matches: &ArgMatches, id: &clap::Id, output: &mut BTreeMap<usize, Self>) {
+        match id.as_str() {
+            "files" => {
+                if let Some(values) = matches.get_many::<PathBuf>(id.as_str()) {
+                    for (value, index) in values.zip(
+                        matches
+                            .indices_of(id.as_str())
+                            .expect("id came from matches"),
+                    ) {
+                        output.insert(index, ParsedCliInput::File(value.clone()));
+                    }
+                }
+            }
+            "libraries" => {
+                if let Some(values) = matches.get_many::<String>(id.as_str()) {
+                    for (value, index) in values.zip(
+                        matches
+                            .indices_of(id.as_str())
+                            .expect("id came from matches"),
+                    ) {
+                        output.insert(index, ParsedCliInput::Library(value.clone()));
+                    }
+                }
+            }
+            "whole_archive" => {
+                if let Some(indicies) = matches.indices_of(id.as_str()) {
+                    for idx in indicies {
+                        output.insert(idx, ParsedCliInput::WholeArchiveStart);
+                    }
+                }
+            }
+            "no_whole_archive" => {
+                if let Some(indicies) = matches.indices_of(id.as_str()) {
+                    for idx in indicies {
+                        output.insert(idx, ParsedCliInput::WholeArchiveEnd);
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,14 +320,50 @@ impl From<ColorOption> for termcolor::ColorChoice {
 }
 
 /// Parses the command line arguments into the [`CliArgs`].
-pub fn parse_arguments() -> anyhow::Result<CliArgs> {
-    let args = CliArgs::parse_from(argfile::expand_args_from(
-        std::env::args_os().filter(|arg| arg != "-Bdynamic"),
+pub fn parse_arguments() -> anyhow::Result<ParsedCliArgs> {
+    let mut legacy_flags = Vec::new();
+
+    let legacy_command = IgnoredLongCliArgs::command();
+    for arg in legacy_command.get_arguments() {
+        if let Some(long_arg) = arg.get_long() {
+            legacy_flags.push(long_arg);
+        }
+
+        if let Some(long_aliases) = arg.get_all_aliases() {
+            legacy_flags.extend(long_aliases);
+        }
+    }
+
+    let matches = CliArgs::command().get_matches_from(argfile::expand_args_from(
+        std::env::args_os().map(|arg| {
+            let arg_str = match arg.to_str() {
+                Some(arg_str) => arg_str,
+                None => return arg,
+            };
+
+            if arg_str.chars().next().is_some_and(|c| c == '-')
+                && arg_str.chars().nth(1).is_some_and(|c| c != '-')
+            {
+                if let Some(unprefixed) = arg_str.strip_prefix('-') {
+                    if legacy_flags.contains(&unprefixed) {
+                        let mut remapped = OsString::from("-");
+                        remapped.push(&arg);
+                        return remapped;
+                    }
+                }
+            }
+
+            arg
+        }),
         argfile::parse_fromfile,
         argfile::PREFIX,
     )?);
 
-    crate::logging::setup_logger(&args)?;
+    let options = CliOptionArgs::from_arg_matches(&matches)?;
+    crate::logging::setup_logger(&options)?;
 
-    Ok(args)
+    Ok(ParsedCliArgs {
+        inputs: CliInputArgs::from_matches(&matches),
+        options: CliOptionArgs::from_arg_matches(&matches)?,
+    })
 }

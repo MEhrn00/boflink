@@ -26,7 +26,6 @@ anyhow = "1.0.92"
 argfile = "0.2.1"
 bitflags = "2.9.0"
 bumpalo = "3.17.0"
-clap-verbosity-flag = "3.0.2"
 indexmap = "2.7.1"
 jamcrc = { path = "crates/jamcrc" }
 log = { version = "0.4.26", features = ["std"] }

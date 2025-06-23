@@ -3,7 +3,7 @@ use std::io::{IsTerminal, Write};
 use log::Level;
 use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 
-use crate::arguments::{CliArgs, ColorOption};
+use crate::arguments::{CliOptionArgs, ColorOption};
 
 struct CliLogger {
     stdout: BufferWriter,
@@ -66,35 +66,43 @@ impl log::Log for CliLogger {
 }
 
 /// Sets up logging for the cli
-pub fn setup_logger(args: &CliArgs) -> anyhow::Result<()> {
-    let color_option = if args.color == ColorOption::Auto
+pub fn setup_logger(options: &CliOptionArgs) -> anyhow::Result<()> {
+    let color_choice = if options.color == ColorOption::Auto
         && std::env::var("TERM")
             .ok()
             .is_none_or(|term| !term.eq_ignore_ascii_case("dumb"))
         && std::env::var_os("NO_COLOR").is_none()
     {
-        args.color.into()
+        options.color.into()
     } else {
         ColorChoice::Never
     };
 
     log::set_boxed_logger(Box::from(CliLogger {
         stdout: BufferWriter::stdout(
-            if color_option != ColorChoice::Never && std::io::stdout().is_terminal() {
-                color_option
+            if color_choice != ColorChoice::Never && std::io::stdout().is_terminal() {
+                color_choice
             } else {
                 ColorChoice::Never
             },
         ),
         stderr: BufferWriter::stderr(
-            if color_option != ColorChoice::Never && std::io::stderr().is_terminal() {
-                color_option
+            if color_choice != ColorChoice::Never && std::io::stderr().is_terminal() {
+                color_choice
             } else {
                 ColorChoice::Never
             },
         ),
     }))
-    .map(|()| log::set_max_level(args.verbose.log_level_filter()))?;
+    .map(|()| {
+        if options.verbose >= 2 {
+            log::set_max_level(log::LevelFilter::Trace);
+        } else if options.verbose >= 1 {
+            log::set_max_level(log::LevelFilter::Debug);
+        } else {
+            log::set_max_level(log::LevelFilter::Info);
+        }
+    })?;
 
     Ok(())
 }

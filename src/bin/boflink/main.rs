@@ -1,11 +1,10 @@
-use anyhow::{Result, anyhow, bail};
-use arguments::CliArgs;
+use anyhow::{Result, anyhow};
+use arguments::{ParsedCliArgs, ParsedCliInput};
 use log::{error, info};
 
 use boflink::{
     libsearch::LibrarySearcher,
     linker::{LinkerBuilder, error::LinkError},
-    pathed_item::PathedItem,
 };
 
 mod arguments;
@@ -61,19 +60,20 @@ fn try_main() -> Result<()> {
 
     let it = std::time::Instant::now();
 
-    let link_res = run_linker(&mut args);
+    let link_result = run_linker(&mut args);
 
     let elapsed = std::time::Instant::now() - it;
-    if args.print_timing {
+    if args.options.print_timing {
         info!("link time: {}ms", elapsed.as_micros() as f64 / 1000f64);
     }
 
-    link_res
+    link_result
 }
 
-fn run_linker(args: &mut CliArgs) -> anyhow::Result<()> {
+/// Runs the linker with the command line arguments
+fn run_linker(args: &mut ParsedCliArgs) -> anyhow::Result<()> {
     let mut library_searcher = LibrarySearcher::new();
-    library_searcher.extend_search_paths(std::mem::take(&mut args.library_paths));
+    library_searcher.extend_search_paths(std::mem::take(&mut args.options.library_paths));
 
     if cfg!(windows) {
         if let Some(libenv) = std::env::var_os("LIB") {
@@ -83,56 +83,62 @@ fn run_linker(args: &mut CliArgs) -> anyhow::Result<()> {
 
     let linker = LinkerBuilder::new()
         .library_searcher(library_searcher)
-        .entrypoint(std::mem::take(&mut args.entry))
-        .add_libraries(std::mem::take(&mut args.libraries))
-        .merge_bss(args.merge_bss)
-        .gc_sections(args.gc_sections)
-        .print_gc_sections(args.print_gc_sections)
-        .add_gc_keep_symbols(std::mem::take(&mut args.keep_symbol))
-        .merge_grouped_sections(!args.no_merge_groups);
+        .entrypoint(std::mem::take(&mut args.options.entry))
+        .merge_bss(args.options.merge_bss)
+        .gc_sections(args.options.gc_sections)
+        .print_gc_sections(args.options.print_gc_sections)
+        .add_gc_keep_symbols(std::mem::take(&mut args.options.keep_symbol))
+        .merge_grouped_sections(args.options.merge_groups);
 
-    let linker = if let Some(target_arch) = args.machine.take() {
+    let linker = if let Some(target_arch) = args.options.machine.take() {
         linker.architecture(target_arch.into())
     } else {
         linker
     };
 
-    let linker = if let Some(graph_path) = args.dump_link_graph.take() {
+    let linker = if let Some(graph_path) = args.options.dump_link_graph.take() {
         linker.link_graph_path(graph_path)
     } else {
         linker
     };
 
-    let linker = if let Some(custom_api) = args.custom_api.take() {
+    let mut linker = if let Some(custom_api) = args.options.custom_api.take() {
         linker.custom_api(custom_api)
     } else {
         linker
     };
 
-    let mut error_flag = false;
-    let inputs = std::mem::take(&mut args.files)
-        .into_iter()
-        .filter_map(|file| match std::fs::read(&file) {
-            Ok(buffer) => Some(PathedItem::new(file, buffer)),
-            Err(e) => {
-                error!("could not open {}: {e}", file.display());
-                error_flag = true;
-                None
+    let mut whole_input = false;
+    for input in std::mem::take(&mut args.inputs) {
+        match input {
+            ParsedCliInput::WholeArchiveStart => {
+                whole_input = true;
             }
-        })
-        .collect::<Vec<_>>();
-
-    let linker = linker.add_inputs(inputs);
-
-    if error_flag {
-        bail!(EmptyError);
+            ParsedCliInput::WholeArchiveEnd => {
+                whole_input = false;
+            }
+            ParsedCliInput::File(file_path) => {
+                if whole_input {
+                    linker.add_whole_file_path(file_path);
+                } else {
+                    linker.add_file_path(file_path);
+                }
+            }
+            ParsedCliInput::Library(library) => {
+                if whole_input {
+                    linker.add_whole_library(library);
+                } else {
+                    linker.add_library(library);
+                }
+            }
+        }
     }
 
     let mut linker = linker.build();
 
     match linker.link() {
         Ok(built) => {
-            std::fs::write(&args.output, built)
+            std::fs::write(&args.options.output, built)
                 .map_err(|e| anyhow!("could not write output file: {e}"))?;
         }
         Err(e) => {
