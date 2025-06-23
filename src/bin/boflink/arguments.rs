@@ -334,30 +334,47 @@ pub fn parse_arguments() -> anyhow::Result<ParsedCliArgs> {
         }
     }
 
-    let matches = CliArgs::command().get_matches_from(argfile::expand_args_from(
-        std::env::args_os().map(|arg| {
-            let arg_str = match arg.to_str() {
-                Some(arg_str) => arg_str,
-                None => return arg,
-            };
-
-            if arg_str.chars().next().is_some_and(|c| c == '-')
-                && arg_str.chars().nth(1).is_some_and(|c| c != '-')
-            {
-                if let Some(unprefixed) = arg_str.strip_prefix('-') {
-                    if legacy_flags.contains(&unprefixed) {
-                        let mut remapped = OsString::from("-");
-                        remapped.push(&arg);
-                        return remapped;
-                    }
-                }
-            }
-
-            arg
-        }),
+    let commandline = argfile::expand_args_from(
+        std::env::args_os(),
         argfile::parse_fromfile,
         argfile::PREFIX,
-    )?);
+    )?;
+
+    if commandline.iter().any(|v| {
+        v.to_str()
+            .is_some_and(|v| v.starts_with("-v") || v == "--verbose")
+    }) {
+        if let Some(version) = CliArgs::command().get_version() {
+            println!("boflink version {version}");
+        }
+
+        let commandline_str = commandline
+            .iter()
+            .map(|s| s.to_string_lossy())
+            .collect::<Vec<_>>();
+        println!("boflink args: {}", commandline_str.join(" "));
+    }
+
+    let matches = CliArgs::command().get_matches_from(commandline.into_iter().map(|arg| {
+        let arg_str = match arg.to_str() {
+            Some(arg_str) => arg_str,
+            None => return arg,
+        };
+
+        if arg_str.chars().next().is_some_and(|c| c == '-')
+            && arg_str.chars().nth(1).is_some_and(|c| c != '-')
+        {
+            if let Some(unprefixed) = arg_str.strip_prefix('-') {
+                if legacy_flags.contains(&unprefixed) {
+                    let mut remapped = OsString::from("-");
+                    remapped.push(&arg);
+                    return remapped;
+                }
+            }
+        }
+
+        arg
+    }));
 
     let options = CliOptionArgs::from_arg_matches(&matches)?;
     crate::logging::setup_logger(&options)?;

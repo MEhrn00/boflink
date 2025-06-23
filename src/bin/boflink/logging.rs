@@ -1,6 +1,6 @@
 use std::io::{IsTerminal, Write};
 
-use log::Level;
+use log::{Level, LevelFilter};
 use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 
 use crate::arguments::{CliOptionArgs, ColorOption};
@@ -8,15 +8,20 @@ use crate::arguments::{CliOptionArgs, ColorOption};
 struct CliLogger {
     stdout: BufferWriter,
     stderr: BufferWriter,
+    max_level: LevelFilter,
 }
 
 impl log::Log for CliLogger {
     #[inline]
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
-        true
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level().to_level_filter() <= self.max_level
     }
 
     fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
         if record.args().as_str().is_some_and(|args| args.is_empty()) {
             return;
         }
@@ -38,7 +43,7 @@ impl log::Log for CliLogger {
             Level::Warn => {
                 let _ =
                     buffer.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)).set_bold(true));
-                write!(buffer, "warn:").unwrap();
+                write!(buffer, "warning:").unwrap();
             }
             Level::Info => {
                 let _ =
@@ -78,6 +83,14 @@ pub fn setup_logger(options: &CliOptionArgs) -> anyhow::Result<()> {
         ColorChoice::Never
     };
 
+    let max_level = if options.verbose >= 2 {
+        LevelFilter::Trace
+    } else if options.verbose >= 1 {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Info
+    };
+
     log::set_boxed_logger(Box::from(CliLogger {
         stdout: BufferWriter::stdout(
             if color_choice != ColorChoice::Never && std::io::stdout().is_terminal() {
@@ -93,15 +106,10 @@ pub fn setup_logger(options: &CliOptionArgs) -> anyhow::Result<()> {
                 ColorChoice::Never
             },
         ),
+        max_level,
     }))
     .map(|()| {
-        if options.verbose >= 2 {
-            log::set_max_level(log::LevelFilter::Trace);
-        } else if options.verbose >= 1 {
-            log::set_max_level(log::LevelFilter::Debug);
-        } else {
-            log::set_max_level(log::LevelFilter::Info);
-        }
+        log::set_max_level(max_level);
     })?;
 
     Ok(())
