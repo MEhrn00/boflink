@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ops::Not, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use crate::{
     api::ApiSymbolsError,
@@ -176,10 +176,7 @@ impl LinkerSymbolErrors {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "{kind}: {demangled}{}",
-    .kind.context_is_empty().not().then(|| format!("\n{}", .kind.display_context())).unwrap_or_default()
-)]
+#[error("{kind}: {demangled}{}", .display_demangled_context(kind))]
 pub struct LinkerSymbolError {
     pub name: String,
     pub demangled: String,
@@ -222,6 +219,14 @@ impl From<SymbolError<'_, '_>> for LinkerSymbolError {
     }
 }
 
+fn display_demangled_context(kind: &LinkerSymbolErrorKind) -> String {
+    if !kind.context_is_empty() {
+        format!("\n{}", kind.display_context())
+    } else {
+        Default::default()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LinkerSymbolErrorKind {
     #[error("duplicate symbol")]
@@ -256,8 +261,7 @@ impl LinkerSymbolErrorKind {
 #[error(
     "{}{}",
     display_vec(.definitions),
-    .remaining.ne(&0).then(|| format!("\n>>> defined {remaining} more times"))
-        .unwrap_or_default()
+    display_remaining_definitions(.remaining)
 )]
 pub struct SymbolDefinitionsContext {
     pub definitions: Vec<SymbolDefinition>,
@@ -283,6 +287,14 @@ impl SymbolDefinitionsContext {
     }
 }
 
+fn display_remaining_definitions(remaining: &usize) -> String {
+    if *remaining != 0 {
+        format!("\n>>> defined {remaining} more times")
+    } else {
+        Default::default()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error(">>> defined at {coff_path}")]
 pub struct SymbolDefinition {
@@ -293,8 +305,7 @@ pub struct SymbolDefinition {
 #[error(
     "{}{}",
     display_vec(.references),
-    .remaining.ne(&0).then(|| format!("\n>>> referenced {remaining} more times"))
-        .unwrap_or_default()
+    display_remaining_references(.remaining),
 )]
 pub struct SymbolReferencesContext {
     pub references: Vec<SymbolReference>,
@@ -342,6 +353,14 @@ impl SymbolReferencesContext {
             references,
             remaining,
         }
+    }
+}
+
+fn display_remaining_references(remaining: &usize) -> String {
+    if *remaining != 0 {
+        format!("\n>>> referenced {remaining} more times")
+    } else {
+        Default::default()
     }
 }
 

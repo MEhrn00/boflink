@@ -83,9 +83,7 @@ mod tests {
         for library in LIBRARIES {
             assert!(
                 parsed.contains(&library),
-                "Could not find {} in {:?}",
-                library,
-                parsed
+                "Could not find {library} in {parsed:?}",
             );
         }
     }
@@ -100,9 +98,7 @@ mod tests {
         for library in LIBRARIES {
             assert!(
                 parsed.contains(&library),
-                "Could not find {} in {:?}",
-                library,
-                parsed
+                "Could not find {library} in {parsed:?}",
             );
         }
     }
@@ -117,9 +113,7 @@ mod tests {
         for library in LIBRARIES {
             assert!(
                 parsed.contains(&library),
-                "Could not find {} in {:?}",
-                library,
-                parsed
+                "Could not find {library} in {parsed:?}",
             );
         }
     }

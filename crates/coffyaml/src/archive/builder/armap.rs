@@ -168,8 +168,7 @@ mod tests {
             let built = symbol_map.build(&archive_map);
             assert!(
                 built.len() % 2 == 0,
-                "built archive map member with {} symbols should be 2-byte aligned",
-                i,
+                "built archive map member with {i} symbols should be 2-byte aligned",
             );
         }
     }

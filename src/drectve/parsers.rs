@@ -310,7 +310,7 @@ mod tests {
         assert_eq!(remaining, "000");
 
         let result = many1(token("0")).parse("111");
-        assert!(result.is_err(), "Expected error: {:?}", result);
+        assert!(result.is_err(), "Expected error: {result:?}");
     }
 
     #[test]
