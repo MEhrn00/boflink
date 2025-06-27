@@ -198,6 +198,11 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
         self.imports().is_empty() && self.definitions().is_empty()
     }
 
+    /// Returns `true` if this symbol is defined.
+    pub fn is_defined(&self) -> bool {
+        !self.is_undefined()
+    }
+
     /// Returns `true` if this symbol has multiple non-COMDAT definitions.
     pub fn is_duplicate(&self) -> bool {
         self.definitions()

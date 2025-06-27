@@ -5,8 +5,8 @@ use std::{
 };
 
 use indexmap::{IndexMap, IndexSet};
-use log::{trace, warn};
-use object::{Architecture, Object, ObjectSymbol, coff::CoffFile};
+use log::warn;
+use object::{Object, ObjectSymbol, coff::CoffFile};
 use typed_arena::Arena;
 
 use crate::{
@@ -105,7 +105,6 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
         let mut input_processor = LinkInputProcessor::with_capacity(
             &buffer_arena,
             &self.library_searcher,
-            self.entrypoint.take(),
             self.inputs.len(),
         );
 
@@ -119,9 +118,8 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
             }
         }
 
-        if let Err(e) = input_processor.include_entrypoint() {
-            setup_errors.push(LinkerSetupError::Path(e));
-            return Err(LinkError::Setup(LinkerSetupErrors(setup_errors)));
+        if let Some(entrypoint) = self.entrypoint.as_ref() {
+            input_processor.ensure_entrypoint(entrypoint);
         }
 
         let target_arch = self.target_arch.take().or_else(|| {
@@ -442,12 +440,6 @@ struct LinkInputProcessor<'b, 'a, L: LibraryFind> {
     /// Parsed lazily linked libraries.
     link_libraries: IndexMap<&'a Path, LinkArchive<'a>>,
 
-    /// The name of the entrypoint symbol.
-    entrypoint: Option<String>,
-
-    /// If the entrypoint has been found.
-    entrypoint_found: bool,
-
     /// Spec graph
     spec: SpecLinkGraph,
 }
@@ -456,7 +448,6 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
     pub fn with_capacity(
         arena: &'a Arena<PathedItem<PathBuf, Vec<u8>>>,
         library_searcher: &'b L,
-        entrypoint: Option<String>,
         capacity: usize,
     ) -> LinkInputProcessor<'b, 'a, L> {
         Self {
@@ -466,8 +457,6 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
             coffs: IndexMap::with_capacity(capacity),
             link_libraries: IndexMap::with_capacity(capacity),
             spec: SpecLinkGraph::new(),
-            entrypoint,
-            entrypoint_found: false,
         }
     }
 
@@ -508,34 +497,6 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
                         file_path: buffer.path().as_path(),
                         member_path: None,
                     }) {
-                        if !self.entrypoint_found {
-                            if let Some(entrypoint) = &self.entrypoint {
-                                if coff.architecture() == Architecture::I386 {
-                                    let entrypoint = format!("_{entrypoint}");
-
-                                    for symbol in coff.symbols() {
-                                        if symbol.is_global()
-                                            && symbol.is_definition()
-                                            && symbol.name().is_ok_and(|name| name == entrypoint)
-                                        {
-                                            self.entrypoint_found = true;
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    for symbol in coff.symbols() {
-                                        if symbol.is_global()
-                                            && symbol.is_definition()
-                                            && symbol.name().is_ok_and(|name| name == entrypoint)
-                                        {
-                                            self.entrypoint_found = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
                         self.spec.add_coff(&coff);
                         coff_entry.insert(coff);
                     }
@@ -599,34 +560,6 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
                 file_path: archive_path,
                 member_path: Some(member_path),
             }) {
-                if !self.entrypoint_found {
-                    if let Some(entrypoint) = &self.entrypoint {
-                        if coff.architecture() == Architecture::I386 {
-                            let entrypoint = format!("_{entrypoint}");
-
-                            for symbol in coff.symbols() {
-                                if symbol.is_global()
-                                    && symbol.is_definition()
-                                    && symbol.name().is_ok_and(|name| name == entrypoint)
-                                {
-                                    self.entrypoint_found = true;
-                                    break;
-                                }
-                            }
-                        } else {
-                            for symbol in coff.symbols() {
-                                if symbol.is_global()
-                                    && symbol.is_definition()
-                                    && symbol.name().is_ok_and(|name| name == entrypoint)
-                                {
-                                    self.entrypoint_found = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
                 self.spec.add_coff(&coff);
                 coff_entry.insert(coff);
             }
@@ -671,63 +604,33 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
         })
     }
 
-    fn include_entrypoint(&mut self) -> Result<(), LinkerSetupPathError> {
-        if !self.entrypoint_found {
-            trace!("entrypoint not found. searching in link libraries");
-            if let Some(entrypoint) = &self.entrypoint {
-                for (library_path, library) in &self.link_libraries {
-                    for member in library.coff_members() {
-                        let (member_path, coff) = member.map_err(|e| match e {
-                            ArchiveMemberError::MemberParse(e) => {
-                                LinkerSetupPathError::new(library_path, Some(e.path), e.kind)
-                            }
-                            ArchiveMemberError::ArchiveParse(e) => {
-                                LinkerSetupPathError::nomember(library_path, e)
-                            }
-                        })?;
-
-                        if coff.architecture() == Architecture::I386 {
-                            let entry_name = format!("_{entrypoint}");
-                            for symbol in coff.symbols() {
-                                if symbol.is_global()
-                                    && symbol.is_definition()
-                                    && symbol.name().is_ok_and(|name| name == entry_name)
-                                {
-                                    self.spec.add_coff(&coff);
-                                    self.coffs.insert(
-                                        CoffPath {
-                                            file_path: library_path,
-                                            member_path: Some(member_path),
-                                        },
-                                        coff,
-                                    );
-                                    return Ok(());
-                                }
-                            }
-                        } else {
-                            for symbol in coff.symbols() {
-                                if symbol.is_global()
-                                    && symbol.is_definition()
-                                    && symbol.name().is_ok_and(|name| name == entrypoint)
-                                {
-                                    self.spec.add_coff(&coff);
-                                    self.coffs.insert(
-                                        CoffPath {
-                                            file_path: library_path,
-                                            member_path: Some(member_path),
-                                        },
-                                        coff,
-                                    );
-                                    return Ok(());
-                                }
-                            }
-                        };
+    fn ensure_entrypoint(&mut self, entrypoint: &str) {
+        if !self.coffs.values().any(|coff| {
+            coff.symbol_by_name(entrypoint)
+                .is_some_and(|symbol| symbol.is_global() && symbol.is_definition())
+        }) {
+            for (library_path, library) in &self.link_libraries {
+                if let Some(symbol) = library
+                    .symbols()
+                    .filter_map(|symbol| symbol.ok())
+                    .find(|symbol| symbol.name() == entrypoint)
+                {
+                    if let Ok((member_path, LinkArchiveMemberVariant::Coff(coff_member))) =
+                        symbol.extract()
+                    {
+                        self.coffs.insert(
+                            CoffPath {
+                                file_path: library_path,
+                                member_path: Some(member_path),
+                            },
+                            coff_member,
+                        );
                     }
+
+                    return;
                 }
             }
         }
-
-        Ok(())
     }
 }
 

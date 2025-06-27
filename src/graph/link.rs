@@ -27,7 +27,7 @@ use super::{
     },
     node::{
         CoffNode, LibraryNode, LibraryNodeWeight, SectionNode, SectionNodeCharacteristics,
-        SectionNodeData, SymbolNode, SymbolNodeStorageClass, SymbolNodeType, TryFromSymbolError,
+        SectionNodeData, SymbolNode, TryFromSymbolError,
     },
 };
 
@@ -193,6 +193,11 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
     #[inline]
     pub fn allocated_bytes(&self) -> usize {
         self.arena.allocated_bytes()
+    }
+
+    /// Returns `true` if the graph is empty.
+    pub fn is_empty(&self) -> bool {
+        self.node_count == 0
     }
 
     /// Adds a COFF to the graph.
@@ -499,20 +504,11 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
         Ok(())
     }
 
-    /// Adds an external symbol to the graph if it does not exist.
-    ///
-    /// The newly added symbol will be undefined.
-    pub fn add_external_symbol(&mut self, name: &'data str) {
-        self.external_symbols.entry(name).or_insert_with(|| {
-            self.arena.alloc_with(|| {
-                SymbolNode::new(
-                    name,
-                    SymbolNodeStorageClass::External,
-                    false,
-                    SymbolNodeType::Value(0),
-                )
-            })
-        });
+    /// Returns an iterator over the defined external symbols
+    pub fn defined_externals(&self) -> impl Iterator<Item = &'data str> + use<'_, 'data, 'arena> {
+        self.external_symbols
+            .iter()
+            .filter_map(|(name, symbol)| symbol.is_defined().then_some(*name))
     }
 
     /// Returns an iterator over the names of the undefined symbols
