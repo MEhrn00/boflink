@@ -1,6 +1,8 @@
-use anyhow::{Result, anyhow};
+use std::process::Command;
+
+use anyhow::{Result, anyhow, bail};
 use arguments::{ParsedCliArgs, ParsedCliInput};
-use log::{error, info};
+use log::{debug, error, info};
 
 use boflink::{
     libsearch::LibrarySearcher,
@@ -78,6 +80,52 @@ fn run_linker(args: &mut ParsedCliArgs) -> anyhow::Result<()> {
     if cfg!(windows) {
         if let Some(libenv) = std::env::var_os("LIB") {
             library_searcher.extend_search_paths(std::env::split_paths(&libenv));
+        }
+    }
+
+    let mingwbin = if args.options.mingw64 {
+        Some("x86_64-w64-mingw32-gcc")
+    } else if args.options.mingw32 {
+        Some("i686-w64-mingw32-gcc")
+    } else if args.options.ucrt64 {
+        Some("x86_64-w64-mingw32ucrt-gcc")
+    } else if args.options.ucrt32 {
+        Some("i686-w64-mingw32ucrt-gcc")
+    } else {
+        None
+    };
+
+    if let Some(mingwbin) = mingwbin {
+        let query = Command::new(mingwbin)
+            .arg("--print-search-dirs")
+            .output()
+            .map_err(|e| anyhow!("could not query {mingwbin} ({e})"))?;
+
+        if !query.status.success() {
+            if let Some(code) = query.status.code() {
+                bail!("{mingwbin} returned a non-zero exit code {code}");
+            } else {
+                bail!("{mingwbin} exited abruptly");
+            }
+        }
+
+        let stdout = std::str::from_utf8(&query.stdout)
+            .map_err(|e| anyhow!("could not decode {mingwbin} output ({e})"))?;
+
+        for line in stdout.lines() {
+            if let Some(line) = line.strip_prefix("libraries: ") {
+                let line = line.trim_start_matches("=");
+
+                if log::log_enabled!(log::Level::Debug) {
+                    let search_paths = std::env::split_paths(line).collect::<Vec<_>>();
+                    debug!("search paths from {mingwbin}: {search_paths:?}");
+                    library_searcher.extend_search_paths(search_paths);
+                } else {
+                    library_searcher.extend_search_paths(std::env::split_paths(line));
+                }
+
+                break;
+            }
         }
     }
 

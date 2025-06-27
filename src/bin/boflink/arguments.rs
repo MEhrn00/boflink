@@ -87,6 +87,22 @@ pub struct CliOptionArgs {
     #[arg(long)]
     pub print_gc_sections: bool,
 
+    /// Query x86_64-w64-mingw32-gcc for its list of library search paths
+    #[arg(long, conflicts_with_all = ["mingw32", "ucrt64", "ucrt32"])]
+    pub mingw64: bool,
+
+    /// Query i686-w64-mingw32-gcc for its list of library search paths
+    #[arg(long, conflicts_with_all = ["ucrt64", "ucrt32"])]
+    pub mingw32: bool,
+
+    /// Query x86_64-w64-mingw32ucrt-gcc for its list of library search paths
+    #[arg(long, conflicts_with = "ucrt32")]
+    pub ucrt64: bool,
+
+    /// Query i686-w64-mingw32ucrt-gcc for its list of library search paths
+    #[arg(long)]
+    pub ucrt32: bool,
+
     /// Print colored output
     #[arg(long, value_name = "color", default_value_t = ColorOption::Auto)]
     pub color: ColorOption,

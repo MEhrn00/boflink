@@ -51,7 +51,7 @@ impl std::fmt::Display for SearchLibraryName<'_> {
 pub type FoundLibrary = PathedItem<PathBuf, Vec<u8>>;
 
 /// Used for finding link libraries.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct LibrarySearcher {
     search_paths: IndexSet<PathBuf>,
 }
