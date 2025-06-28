@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Additional ignored command line arguments for better GCC compatibility (f3d02e2).
+- `--no-merge-groups` flag to not merge grouped sections (#19).
+- Whole archive linking using `--whole-archive/--no-whole-archive` (#20).
+- Debug logging header with the entire command line used to invoke boflink when the `-v/--verbose` flag is passed (e8e8d47).
+- Support for including MinGW link library search paths using the `--mingw[64|32]/--ucrt[64|32]` flag (#23).
+
+### Changed
+
+- Relax requirements on undefined external symbols (#18).
+
 ## [0.2.0] - 2025-06-09
 
 ### Added
