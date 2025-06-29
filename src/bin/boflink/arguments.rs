@@ -371,7 +371,7 @@ pub fn parse_arguments() -> anyhow::Result<ParsedCliArgs> {
             .iter()
             .map(|s| s.to_string_lossy())
             .collect::<Vec<_>>();
-        println!("boflink args: {}", commandline_str.join(" "));
+        println!("boflink command line: {}", commandline_str.join(" "));
     }
 
     let matches = CliArgs::command().get_matches_from(commandline.into_iter().map(|arg| {
