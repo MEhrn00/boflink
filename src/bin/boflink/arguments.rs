@@ -4,7 +4,10 @@ use boflink::linker::LinkerTargetArch;
 use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(
+    about,
+    version = format!("version {} ({})", clap::crate_version!(), env!("GIT_SHORT_HASH")),
+)]
 pub struct CliArgs {
     #[command(flatten)]
     pub inputs: CliInputArgs,
@@ -361,7 +364,7 @@ pub fn parse_arguments() -> anyhow::Result<ParsedCliArgs> {
             .is_some_and(|v| v.starts_with("-v") || v == "--verbose")
     }) {
         if let Some(version) = CliArgs::command().get_version() {
-            println!("boflink version {version}");
+            println!("boflink {version}");
         }
 
         let commandline_str = commandline

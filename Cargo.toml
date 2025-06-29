@@ -37,7 +37,7 @@ typed-arena = "2.0.2"
 [dependencies.clap]
 version = "4.5.24"
 default-features = false
-features = ["std", "color", "help", "suggestions", "usage", "derive"]
+features = ["std", "color", "help", "suggestions", "usage", "derive", "string", "cargo"]
 
 [dependencies.object]
 version = "0.37.0"
