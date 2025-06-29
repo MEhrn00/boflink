@@ -41,6 +41,8 @@ impl<'a> Iterator for DrectveLibraries<'a> {
     }
 }
 
+/// Returns an iterator over the link libraries specified in the .drectve
+/// section of the specified COFF if the .drectve section exists.
 pub fn parse_drectve_libraries<'a>(coff: &CoffFile<'a>) -> Option<DrectveLibraries<'a>> {
     let drectve_section = coff.section_by_name(".drectve")?;
     if drectve_section
@@ -66,6 +68,26 @@ pub fn parse_drectve_libraries<'a>(coff: &CoffFile<'a>) -> Option<DrectveLibrari
             std::str::from_utf8(section_data).ok()?,
         ))
     }
+}
+
+/// Returns an iterator over the .drectve section link libraries in the specified
+/// COFF.
+///
+/// The link libraries will be normalized with the '.lib' extensions removed.
+pub fn parse_drectve_libraries_normalized<'a>(
+    coff: &CoffFile<'a>,
+) -> Option<impl Iterator<Item = &'a str>> {
+    parse_drectve_libraries(coff).map(|libraries| {
+        libraries.map(|library| {
+            if let Some((prefix, suffix)) = library.rsplit_once(".") {
+                if suffix.eq_ignore_ascii_case("lib") {
+                    return prefix;
+                }
+            }
+
+            library
+        })
+    })
 }
 
 #[cfg(test)]

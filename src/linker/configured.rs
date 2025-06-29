@@ -170,7 +170,10 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
 
         // Add COFFs
         for (coff_path, coff) in &input_processor.coffs {
-            for library_name in drectve::parse_drectve_libraries(coff).into_iter().flatten() {
+            for library_name in drectve::parse_drectve_libraries_normalized(coff)
+                .into_iter()
+                .flatten()
+            {
                 if !input_processor.opened_library_names.contains(library_name) {
                     let library = match self.library_searcher.find_library(library_name) {
                         Ok(found) => found,
@@ -328,19 +331,17 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
                         LinkArchiveMemberVariant::Coff(coff) => {
                             // Add any .drectve link libraries from linked in COFFs
                             // to the drectve queue
-                            for drectve_library in drectve::parse_drectve_libraries(&coff)
-                                .into_iter()
-                                .flatten()
+                            for drectve_library in
+                                drectve::parse_drectve_libraries_normalized(&coff)
+                                    .into_iter()
+                                    .flatten()
                             {
-                                let drectve_library_name = drectve_library.trim_end_matches(".lib");
                                 if !input_processor
                                     .opened_library_names
                                     .contains(drectve_library)
                                 {
-                                    drectve_queue.push_back((
-                                        (library_path, member_path),
-                                        drectve_library_name,
-                                    ));
+                                    drectve_queue
+                                        .push_back(((library_path, member_path), drectve_library));
                                 }
                             }
 
