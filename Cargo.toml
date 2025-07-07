@@ -5,6 +5,10 @@ members = [
   "xtask",
 ]
 
+exclude = [
+  "crates/undname/sys"
+]
+
 [package]
 name = "boflink"
 version = "0.3.1"
@@ -43,6 +47,9 @@ features = ["std", "color", "help", "suggestions", "usage", "derive", "string", 
 version = "0.37.0"
 default-features = false
 features = ["archive", "coff", "write", "read"]
+
+[target.'cfg(windows)'.dependencies]
+undname = { path = "crates/undname" }
 
 [dev-dependencies]
 coffyaml = { path = "crates/coffyaml" }
