@@ -371,6 +371,13 @@ impl std::fmt::Display for SymbolNameDemangler<'_, '_> {
             }
         }
 
+        if (self.0.is_i386() && symbol_name.starts_with("__Z")) || symbol_name.starts_with("_Z") {
+            if let Ok(demangled) = cpp_demangle::Symbol::new(symbol_name) {
+                write!(f, "{demangled}")?;
+                return Ok(());
+            }
+        }
+
         write!(f, "{symbol_name}")
     }
 }
