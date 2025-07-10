@@ -14,6 +14,7 @@ use object::{
 };
 
 use crate::{
+    graph::node::SymbolName,
     linker::LinkerTargetArch,
     linkobject::import::{ImportMember, ImportName},
 };
@@ -274,14 +275,15 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
             let symbol_name = symbol.name()?;
             let coff_symbol = symbol.coff_symbol();
 
-            let graph_symbol =
-                SymbolNode::try_from_symbol::<C>(symbol_name, coff_symbol).map_err(|e| {
-                    LinkGraphAddError::Symbol {
-                        name: symbol_name.to_string(),
-                        index: symbol.index(),
-                        error: e,
-                    }
-                })?;
+            let graph_symbol = SymbolNode::try_from_symbol::<C>(
+                SymbolName::new(symbol_name, self.machine == LinkerTargetArch::I386),
+                coff_symbol,
+            )
+            .map_err(|e| LinkGraphAddError::Symbol {
+                name: symbol_name.to_string(),
+                index: symbol.index(),
+                error: e,
+            })?;
 
             let graph_symbol = if symbol.is_global() {
                 *self
@@ -584,9 +586,16 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
             }
         };
 
-        let import_edge = self
-            .arena
-            .alloc_with(|| Edge::new(symbol_node, library, ImportEdgeWeight::new(import_name)));
+        let import_edge = self.arena.alloc_with(|| {
+            Edge::new(
+                symbol_node,
+                library,
+                ImportEdgeWeight::new(SymbolName::new(
+                    import_name,
+                    self.machine == LinkerTargetArch::I386,
+                )),
+            )
+        });
 
         symbol_node.imports().push_back(import_edge);
         library.imports().push_back(import_edge);

@@ -7,7 +7,10 @@ use indexmap::IndexMap;
 use log::{debug, warn};
 use object::pe::{IMAGE_REL_AMD64_REL32, IMAGE_REL_I386_DIR32};
 
-use crate::linker::{LinkerTargetArch, error::LinkError};
+use crate::{
+    graph::node::SymbolName,
+    linker::{LinkerTargetArch, error::LinkError},
+};
 
 use super::{
     edge::{ComdatSelection, DefinitionEdgeWeight, Edge, RelocationEdgeWeight},
@@ -399,9 +402,12 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
                 // Add a new import symbol for the thunk definition
                 let thunk_import_symbol = self.arena.alloc_with(|| {
                     SymbolNode::new(
-                        &*self
-                            .arena
-                            .alloc_str(&format!("__imp_{}", import_name.as_str())),
+                        SymbolName::new(
+                            &*self
+                                .arena
+                                .alloc_str(&format!("__imp_{}", import_name.as_str())),
+                            self.machine == LinkerTargetArch::I386,
+                        ),
                         SymbolNodeStorageClass::External,
                         false,
                         SymbolNodeType::Value(0),

@@ -143,9 +143,8 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     }
 
     /// Returns the name of the symbol.
-    #[inline]
-    pub fn name(&self) -> SymbolName<'arena> {
-        self.name
+    pub fn name(&self) -> &SymbolName<'arena> {
+        &self.name
     }
 
     /// Returns the storage class of the symbol.
@@ -300,17 +299,22 @@ impl std::fmt::Debug for SymbolNode<'_, '_> {
 }
 
 /// A symbol name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SymbolName<'data>(&'data str);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SymbolName<'data> {
+    name: &'data str,
+    i386: bool,
+}
 
 impl<'data> SymbolName<'data> {
-    #[inline]
+    pub fn new(name: &'data str, i386: bool) -> SymbolName<'data> {
+        Self { name, i386 }
+    }
+
     pub fn as_str(&self) -> &'data str {
-        self.0
+        self.name
     }
 
     /// Returns a [`SymbolNameDemangler`] for demangling the name of the symbol.
-    #[inline]
     pub fn demangle(&self) -> SymbolNameDemangler<'_, 'data> {
         SymbolNameDemangler(self)
     }
@@ -318,25 +322,24 @@ impl<'data> SymbolName<'data> {
     /// Returns the symbol name but without the `__declspec(dllimport)` prefix
     /// if it exists.
     pub fn strip_dllimport(&self) -> Option<&'data str> {
-        self.0.strip_prefix("__imp_")
+        self.name.strip_prefix("__imp_")
     }
 
     /// Returns `true` if the symbol name contains the `__declspec(dllimport)`
     /// prefix
     pub fn is_dllimport(&self) -> bool {
-        self.0.starts_with("__imp_")
+        self.name.starts_with("__imp_")
     }
-}
 
-impl<'data> From<&'data str> for SymbolName<'data> {
-    fn from(value: &'data str) -> Self {
-        Self(value)
+    /// Returns `true` if this symbol is an i386 symbol.
+    pub fn is_i386(&self) -> bool {
+        self.i386
     }
 }
 
 impl std::fmt::Display for SymbolName<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.name.fmt(f)
     }
 }
 
@@ -346,11 +349,29 @@ pub struct SymbolNameDemangler<'a, 'data>(&'a SymbolName<'data>);
 
 impl std::fmt::Display for SymbolNameDemangler<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(unprefixed) = self.0.strip_dllimport() {
-            write!(f, "__declspec(dllimport) {unprefixed}")
+        let symbol_name = if let Some(unprefixed) = self.0.strip_dllimport() {
+            write!(f, "__declspec(dllimport) ")?;
+            unprefixed
         } else {
-            write!(f, "{}", self.0.0)
+            self.0.name
+        };
+
+        #[cfg(windows)]
+        if symbol_name.starts_with('?') {
+            use undname::UndnameFlags;
+
+            let mut flags = UndnameFlags::NoPtr64Expansion;
+            if self.0.is_i386() {
+                flags |= UndnameFlags::ThirtyTwoBitDecode;
+            }
+
+            if let Ok(demangled) = undname::undname(symbol_name, flags) {
+                write!(f, "{demangled}")?;
+                return Ok(());
+            }
         }
+
+        write!(f, "{symbol_name}")
     }
 }
 

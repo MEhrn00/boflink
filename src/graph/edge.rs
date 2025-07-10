@@ -394,8 +394,8 @@ impl<'data> ImportEdgeWeight<'data> {
     }
 
     #[inline]
-    pub fn import_name(&self) -> SymbolName<'data> {
-        self.import_name
+    pub fn import_name(&self) -> &SymbolName<'data> {
+        &self.import_name
     }
 }
 
