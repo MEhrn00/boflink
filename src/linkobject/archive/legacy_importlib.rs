@@ -37,7 +37,7 @@ impl<'a> LegacyImportSymbolMember<'a> {
     pub fn parse(
         coff: &CoffFile<'a>,
     ) -> Result<LegacyImportSymbolMember<'a>, LegacyImportSymbolMemberParseError> {
-        if coff.coff_section_table().len() != 7 {
+        if coff.coff_section_table().len() > 7 {
             return Err(LegacyImportSymbolMemberParseError::Invalid);
         }
 
@@ -146,7 +146,7 @@ impl<'a> LegacyImportHeadMember<'a> {
     pub fn parse(
         coff: &CoffFile<'a>,
     ) -> Result<LegacyImportHeadMember<'a>, LegacyImportHeadMemberParseError> {
-        if coff.coff_section_table().len() != 6 {
+        if coff.coff_section_table().len() > 6 {
             return Err(LegacyImportHeadMemberParseError::Invalid);
         }
 
@@ -182,7 +182,7 @@ impl<'a> LegacyImportTailMember<'a> {
     pub fn parse(
         coff: &CoffFile<'a>,
     ) -> Result<LegacyImportTailMember<'a>, LegacyImportTailMemberParseError> {
-        if coff.coff_section_table().len() != 6 {
+        if coff.coff_section_table().len() > 6 {
             return Err(LegacyImportTailMemberParseError::Invalid);
         }
 
