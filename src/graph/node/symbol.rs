@@ -21,11 +21,9 @@ use object::{
 };
 
 use crate::graph::edge::{
-    ComdatSelection, DefinitionEdgeWeight, EdgeList, ImportEdgeWeight, IncomingEdges,
-    OutgoingEdges, RelocationEdgeWeight,
+    ComdatSelection, DefinitionEdge, EdgeList, ImportEdge, IncomingEdges, OutgoingEdges,
+    RelocationEdge,
 };
-
-use super::{LibraryNode, SectionNode};
 
 #[derive(Debug, Copy, Clone, thiserror::Error)]
 #[error("unknown storage class value ({0})")]
@@ -40,16 +38,13 @@ pub enum TryFromSymbolError {
 /// A symbol node in the graph.
 pub struct SymbolNode<'arena, 'data> {
     /// The list of outgoing definition edges for this symbol.
-    definition_edges:
-        EdgeList<'arena, Self, SectionNode<'arena, 'data>, DefinitionEdgeWeight, OutgoingEdges>,
+    definition_edges: EdgeList<'arena, DefinitionEdge<'arena, 'data>, OutgoingEdges>,
 
     /// The list of outgoing import edges for this symbol.
-    import_edges:
-        EdgeList<'arena, Self, LibraryNode<'arena, 'data>, ImportEdgeWeight<'data>, OutgoingEdges>,
+    import_edges: EdgeList<'arena, ImportEdge<'arena, 'data>, OutgoingEdges>,
 
     /// The incoming relocation edges for this symbol.
-    relocation_edges:
-        EdgeList<'arena, SectionNode<'arena, 'data>, Self, RelocationEdgeWeight, IncomingEdges>,
+    relocation_edges: EdgeList<'arena, RelocationEdge<'arena, 'data>, IncomingEdges>,
 
     /// The symbol table index when inserted into the output COFF.
     table_index: OnceCell<u32>,
@@ -114,31 +109,19 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
 
     /// Returns the list of adjacent outgoing definition edges for this symbol
     /// node.
-    #[inline]
-    pub fn definitions(
-        &self,
-    ) -> &EdgeList<'arena, Self, SectionNode<'arena, 'data>, DefinitionEdgeWeight, OutgoingEdges>
-    {
+    pub fn definitions(&self) -> &EdgeList<'arena, DefinitionEdge<'arena, 'data>, OutgoingEdges> {
         &self.definition_edges
     }
 
     /// Returns the list of adjacent incoming relocation edges for this symbol
     /// node.
-    #[inline]
-    pub fn references(
-        &self,
-    ) -> &EdgeList<'arena, SectionNode<'arena, 'data>, Self, RelocationEdgeWeight, IncomingEdges>
-    {
+    pub fn references(&self) -> &EdgeList<'arena, RelocationEdge<'arena, 'data>, IncomingEdges> {
         &self.relocation_edges
     }
 
     /// Returns the list of adjacent outgoing import edges for this symbol
     /// node.
-    #[inline]
-    pub fn imports(
-        &self,
-    ) -> &EdgeList<'arena, Self, LibraryNode<'arena, 'data>, ImportEdgeWeight<'data>, OutgoingEdges>
-    {
+    pub fn imports(&self) -> &EdgeList<'arena, ImportEdge<'arena, 'data>, OutgoingEdges> {
         &self.import_edges
     }
 

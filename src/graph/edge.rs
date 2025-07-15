@@ -1,5 +1,7 @@
 use std::{cell::Cell, marker::PhantomData};
 
+use crate::graph::node::{LibraryNode, SectionNode, SymbolNode};
+
 use super::node::SymbolName;
 
 use __private::SealedTrait;
@@ -19,10 +21,8 @@ pub struct IncomingEdges;
 impl SealedTrait for IncomingEdges {}
 impl EdgeListTraversal for IncomingEdges {}
 
-pub trait EdgeListEntry<'arena, Source, Target, Weight, Tr: EdgeListTraversal>:
-    SealedTrait
-{
-    fn next_node(&self) -> &Cell<Option<&'arena Edge<'arena, Source, Target, Weight>>>;
+pub trait EdgeListEntry<'arena, Tr: EdgeListTraversal>: SealedTrait {
+    fn next_node(&self) -> &Cell<Option<&'arena Self>>;
 }
 
 #[derive(Debug, Copy, Clone, thiserror::Error)]
@@ -30,15 +30,12 @@ pub trait EdgeListEntry<'arena, Source, Target, Weight, Tr: EdgeListTraversal>:
 pub struct TryFromComdatSelectionError(u8);
 
 /// An adjacency list for a node's adjacent edges.
-pub struct EdgeList<'arena, Source, Target, Weight, Tr: EdgeListTraversal>
-where
-    Edge<'arena, Source, Target, Weight>: EdgeListEntry<'arena, Source, Target, Weight, Tr>,
-{
+pub struct EdgeList<'arena, E: EdgeListEntry<'arena, Tr>, Tr: EdgeListTraversal> {
     /// The head edge in the list.
-    head: Cell<Option<&'arena Edge<'arena, Source, Target, Weight>>>,
+    head: Cell<Option<&'arena E>>,
 
     /// The tail edge in the list.
-    tail: Cell<Option<&'arena Edge<'arena, Source, Target, Weight>>>,
+    tail: Cell<Option<&'arena E>>,
 
     /// The number of edges in the list.
     size: Cell<usize>,
@@ -47,13 +44,9 @@ where
     _traversal: PhantomData<Tr>,
 }
 
-impl<'arena, Source, Target, Weight, Tr: EdgeListTraversal>
-    EdgeList<'arena, Source, Target, Weight, Tr>
-where
-    Edge<'arena, Source, Target, Weight>: EdgeListEntry<'arena, Source, Target, Weight, Tr>,
-{
+impl<'arena, E: EdgeListEntry<'arena, Tr>, Tr: EdgeListTraversal> EdgeList<'arena, E, Tr> {
     /// Creates a new empty [`EdgeList`].
-    pub(super) fn new() -> EdgeList<'arena, Source, Target, Weight, Tr> {
+    pub(super) fn new() -> EdgeList<'arena, E, Tr> {
         Self {
             head: Cell::new(None),
             tail: Cell::new(None),
@@ -63,38 +56,38 @@ where
     }
 
     /// Returns the number of entries in this [`EdgeList`].
-    #[inline]
     pub fn len(&self) -> usize {
         self.size.get()
     }
 
     /// Returns `true` if the list is empty.
-    #[inline]
     pub fn is_empty(&self) -> bool {
         self.head.get().is_none()
     }
 
     /// Returns the first edge in the edge list if the list is non-empty.
-    #[inline]
-    pub fn front(&self) -> Option<&'arena Edge<'arena, Source, Target, Weight>> {
+    pub fn front(&self) -> Option<&'arena E> {
         self.head.get()
     }
 
     /// Returns the last edge in the edge list if the list is non-empty.
-    #[inline]
-    pub fn back(&self) -> Option<&'arena Edge<'arena, Source, Target, Weight>> {
+    pub fn back(&self) -> Option<&'arena E> {
         self.tail.get()
     }
+}
 
+impl<'arena, S, T, W, Tr: EdgeListTraversal> EdgeList<'arena, Edge<'arena, S, T, W>, Tr>
+where
+    Edge<'arena, S, T, W>: EdgeListEntry<'arena, Tr>,
+{
     /// Returns an [`EdgeListIter`] for iterating over the list of edges.
-    #[inline]
-    pub fn iter(&self) -> EdgeListIter<'arena, Source, Target, Weight, Tr> {
+    pub fn iter(&self) -> EdgeListIter<'arena, Edge<'arena, S, T, W>, Tr> {
         EdgeListIter((self.head.get(), PhantomData))
     }
 
     /// Adds an edge to this list with the specified weight and linked to the
     /// target node.
-    pub(super) fn push_back(&self, edge: &'arena Edge<'arena, Source, Target, Weight>) {
+    pub(super) fn push_back(&self, edge: &'arena Edge<'arena, S, T, W>) {
         if let Some(tail_node) = self.tail.get() {
             tail_node.next_node().set(Some(edge));
             self.tail.set(Some(edge));
@@ -110,7 +103,7 @@ where
     ///
     /// # Note
     /// This will leak the removed edge.
-    pub(super) fn pop_front(&self) -> Option<&'arena Edge<'arena, Source, Target, Weight>> {
+    pub(super) fn pop_front(&self) -> Option<&'arena Edge<'arena, S, T, W>> {
         let removed_edge = self.head.get()?;
         let size = self.size.get().saturating_sub(1);
 
@@ -139,15 +132,13 @@ where
     }
 }
 
-impl<'arena, Source, Target, Weight, T: EdgeListTraversal> IntoIterator
-    for EdgeList<'arena, Source, Target, Weight, T>
+impl<'arena, S, T, W, Tr: EdgeListTraversal> IntoIterator
+    for EdgeList<'arena, Edge<'arena, S, T, W>, Tr>
 where
-    Edge<'arena, Source, Target, Weight>: EdgeListEntry<'arena, Source, Target, Weight, T>,
-    EdgeListIter<'arena, Source, Target, Weight, T>:
-        Iterator<Item = &'arena Edge<'arena, Source, Target, Weight>>,
+    Edge<'arena, S, T, W>: EdgeListEntry<'arena, Tr>,
 {
     type Item = <Self::IntoIter as Iterator>::Item;
-    type IntoIter = EdgeListIter<'arena, Source, Target, Weight, T>;
+    type IntoIter = EdgeListIter<'arena, Edge<'arena, S, T, W>, Tr>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
@@ -155,15 +146,13 @@ where
     }
 }
 
-impl<'arena, Source, Target, Weight, T: EdgeListTraversal> IntoIterator
-    for &EdgeList<'arena, Source, Target, Weight, T>
+impl<'arena, S, T, W, Tr: EdgeListTraversal> IntoIterator
+    for &EdgeList<'arena, Edge<'arena, S, T, W>, Tr>
 where
-    Edge<'arena, Source, Target, Weight>: EdgeListEntry<'arena, Source, Target, Weight, T>,
-    EdgeListIter<'arena, Source, Target, Weight, T>:
-        Iterator<Item = &'arena Edge<'arena, Source, Target, Weight>>,
+    Edge<'arena, S, T, W>: EdgeListEntry<'arena, Tr>,
 {
     type Item = <Self::IntoIter as Iterator>::Item;
-    type IntoIter = EdgeListIter<'arena, Source, Target, Weight, T>;
+    type IntoIter = EdgeListIter<'arena, Edge<'arena, S, T, W>, Tr>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
@@ -172,15 +161,12 @@ where
 }
 
 /// Iterator for iterating over the edges of an [`EdgeList`].
-pub struct EdgeListIter<'arena, Source, Target, Weight, T: EdgeListTraversal>(
-    (
-        Option<&'arena Edge<'arena, Source, Target, Weight>>,
-        PhantomData<T>,
-    ),
+pub struct EdgeListIter<'arena, E: EdgeListEntry<'arena, T>, T: EdgeListTraversal>(
+    (Option<&'arena E>, PhantomData<T>),
 );
 
-impl<Source, Target, Weight, T: EdgeListTraversal> Clone
-    for EdgeListIter<'_, Source, Target, Weight, T>
+impl<'arena, E: EdgeListEntry<'arena, T>, T: EdgeListTraversal> Clone
+    for EdgeListIter<'arena, E, T>
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -188,16 +174,16 @@ impl<Source, Target, Weight, T: EdgeListTraversal> Clone
     }
 }
 
-impl<'arena, Source, Target, Weight, T: EdgeListTraversal> Iterator
-    for EdgeListIter<'arena, Source, Target, Weight, T>
+impl<'arena, S, T, W, Tr: EdgeListTraversal> Iterator
+    for EdgeListIter<'arena, Edge<'arena, S, T, W>, Tr>
 where
-    Edge<'arena, Source, Target, Weight>: EdgeListEntry<'arena, Source, Target, Weight, T>,
+    Edge<'arena, S, T, W>: EdgeListEntry<'arena, Tr>,
 {
-    type Item = &'arena Edge<'arena, Source, Target, Weight>;
+    type Item = &'arena Edge<'arena, S, T, W>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let curr = self.0.0?;
-        self.0.0 = EdgeListEntry::<_, _, _, T>::next_node(curr).get();
+        self.0.0 = EdgeListEntry::next_node(curr).get();
         Some(curr)
     }
 }
@@ -273,20 +259,16 @@ impl<'arena, S, T, W> Edge<'arena, S, T, W> {
 
 impl<S, T, W> SealedTrait for Edge<'_, S, T, W> {}
 
-impl<'arena, Source, Target, Weight> EdgeListEntry<'arena, Source, Target, Weight, OutgoingEdges>
-    for Edge<'arena, Source, Target, Weight>
-{
+impl<'arena, S, T, W> EdgeListEntry<'arena, OutgoingEdges> for Edge<'arena, S, T, W> {
     #[inline]
-    fn next_node(&self) -> &Cell<Option<&'arena Edge<'arena, Source, Target, Weight>>> {
+    fn next_node(&self) -> &Cell<Option<&'arena Edge<'arena, S, T, W>>> {
         &self.next_outgoing
     }
 }
 
-impl<'arena, Source, Target, Weight> EdgeListEntry<'arena, Source, Target, Weight, IncomingEdges>
-    for Edge<'arena, Source, Target, Weight>
-{
+impl<'arena, S, T, W> EdgeListEntry<'arena, IncomingEdges> for Edge<'arena, S, T, W> {
     #[inline]
-    fn next_node(&self) -> &Cell<Option<&'arena Edge<'arena, Source, Target, Weight>>> {
+    fn next_node(&self) -> &Cell<Option<&'arena Edge<'arena, S, T, W>>> {
         &self.next_incoming
     }
 }
@@ -350,6 +332,9 @@ pub enum ComdatSelection {
     Largest = IMAGE_COMDAT_SELECT_LARGEST,
 }
 
+pub type DefinitionEdge<'arena, 'data> =
+    Edge<'arena, SymbolNode<'arena, 'data>, SectionNode<'arena, 'data>, DefinitionEdgeWeight>;
+
 /// The weight for a relocation edge.
 pub struct RelocationEdgeWeight {
     /// The virtual address of the relocation.
@@ -379,6 +364,9 @@ impl RelocationEdgeWeight {
     }
 }
 
+pub type RelocationEdge<'arena, 'data> =
+    Edge<'arena, SectionNode<'arena, 'data>, SymbolNode<'arena, 'data>, RelocationEdgeWeight>;
+
 /// The weight for an import edge.
 pub struct ImportEdgeWeight<'data> {
     /// The name to import the symbol as.
@@ -399,8 +387,18 @@ impl<'data> ImportEdgeWeight<'data> {
     }
 }
 
+pub type ImportEdge<'arena, 'data> =
+    Edge<'arena, SymbolNode<'arena, 'data>, LibraryNode<'arena, 'data>, ImportEdgeWeight<'data>>;
+
 /// The weight for a COMDAT associative section edge.
 pub struct AssociativeSectionEdgeWeight;
+
+pub type AssociativeEdge<'arena, 'data> = Edge<
+    'arena,
+    SectionNode<'arena, 'data>,
+    SectionNode<'arena, 'data>,
+    AssociativeSectionEdgeWeight,
+>;
 
 mod __private {
     pub trait SealedTrait {}

@@ -19,11 +19,10 @@ use object::pe::{
 };
 
 use crate::graph::edge::{
-    AssociativeSectionEdgeWeight, DefinitionEdgeWeight, EdgeList, IncomingEdges, OutgoingEdges,
-    RelocationEdgeWeight,
+    AssociativeEdge, DefinitionEdge, EdgeList, IncomingEdges, OutgoingEdges, RelocationEdge,
 };
 
-use super::{CoffNode, SymbolNode, SymbolNodeStorageClass};
+use super::{CoffNode, SymbolNodeStorageClass};
 
 /// Shift value for section alignment flags
 const SECTION_ALIGN_SHIFT: u32 = 20;
@@ -95,21 +94,13 @@ pub enum SectionType {
 /// A section node in the graph.
 pub struct SectionNode<'arena, 'data> {
     /// The list of outgoing relocation edges for this section.
-    relocation_edges:
-        EdgeList<'arena, Self, SymbolNode<'arena, 'data>, RelocationEdgeWeight, OutgoingEdges>,
+    relocation_edges: EdgeList<'arena, RelocationEdge<'arena, 'data>, OutgoingEdges>,
 
     /// The list of incoming definition edges for this section.
-    definition_edges:
-        EdgeList<'arena, SymbolNode<'arena, 'data>, Self, DefinitionEdgeWeight, IncomingEdges>,
+    definition_edges: EdgeList<'arena, DefinitionEdge<'arena, 'data>, IncomingEdges>,
 
     /// The list of outgoing COMDAT associative edges for this section.
-    associative_edges: EdgeList<
-        'arena,
-        Self,
-        SectionNode<'arena, 'data>,
-        AssociativeSectionEdgeWeight,
-        OutgoingEdges,
-    >,
+    associative_edges: EdgeList<'arena, AssociativeEdge<'arena, 'data>, OutgoingEdges>,
 
     /// The COFF this section is from.
     coff: &'arena CoffNode<'data>,
@@ -157,20 +148,12 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
     }
 
     /// Returns the list of outgoing relocation edges for this section.
-    #[inline]
-    pub fn relocations(
-        &self,
-    ) -> &EdgeList<'arena, Self, SymbolNode<'arena, 'data>, RelocationEdgeWeight, OutgoingEdges>
-    {
+    pub fn relocations(&self) -> &EdgeList<'arena, RelocationEdge<'arena, 'data>, OutgoingEdges> {
         &self.relocation_edges
     }
 
     /// Returns the list of incoming relocation edges for this section.
-    #[inline]
-    pub fn definitions(
-        &self,
-    ) -> &EdgeList<'arena, SymbolNode<'arena, 'data>, Self, DefinitionEdgeWeight, IncomingEdges>
-    {
+    pub fn definitions(&self) -> &EdgeList<'arena, DefinitionEdge<'arena, 'data>, IncomingEdges> {
         &self.definition_edges
     }
 
@@ -216,16 +199,9 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
 
     /// Returns the list of output associative section edges for this section.
     /// If this section is linked, the adjacent sections must also be linked.
-    #[inline]
     pub fn associative_edges(
         &self,
-    ) -> &EdgeList<
-        'arena,
-        Self,
-        SectionNode<'arena, 'data>,
-        AssociativeSectionEdgeWeight,
-        OutgoingEdges,
-    > {
+    ) -> &EdgeList<'arena, AssociativeEdge<'arena, 'data>, OutgoingEdges> {
         &self.associative_edges
     }
 

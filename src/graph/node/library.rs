@@ -1,12 +1,9 @@
-use crate::graph::edge::{EdgeList, ImportEdgeWeight, IncomingEdges};
-
-use super::SymbolNode;
+use crate::graph::edge::{EdgeList, ImportEdge, IncomingEdges};
 
 /// A library node in the graph.
 pub struct LibraryNode<'arena, 'data> {
     /// The list of incoming import edges for this library node.
-    import_edges:
-        EdgeList<'arena, SymbolNode<'arena, 'data>, Self, ImportEdgeWeight<'data>, IncomingEdges>,
+    import_edges: EdgeList<'arena, ImportEdge<'arena, 'data>, IncomingEdges>,
 
     /// The node weight.
     weight: LibraryNodeWeight<'data>,
@@ -21,11 +18,7 @@ impl<'arena, 'data> LibraryNode<'arena, 'data> {
         }
     }
 
-    #[inline]
-    pub fn imports(
-        &self,
-    ) -> &EdgeList<'arena, SymbolNode<'arena, 'data>, Self, ImportEdgeWeight<'data>, IncomingEdges>
-    {
+    pub fn imports(&self) -> &EdgeList<'arena, ImportEdge<'arena, 'data>, IncomingEdges> {
         &self.import_edges
     }
 
