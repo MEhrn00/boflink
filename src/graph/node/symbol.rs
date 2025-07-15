@@ -25,6 +25,8 @@ use crate::graph::edge::{
     RelocationEdge,
 };
 
+use super::SectionType;
+
 #[derive(Debug, Copy, Clone, thiserror::Error)]
 #[error("unknown storage class value ({0})")]
 pub struct TryFromStorageClassError(u8);
@@ -161,7 +163,7 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
             && self
                 .definitions()
                 .front()
-                .is_some_and(|definition| definition.target().name().group_name() == ".data")
+                .is_some_and(|definition| definition.target().typ() == SectionType::InitializedData)
     }
 
     /// Returns `true` if this symbol has no references or all sections
@@ -175,7 +177,6 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     }
 
     /// Returns `true` if this symbol is undefined.
-    #[inline]
     pub fn is_undefined(&self) -> bool {
         self.imports().is_empty() && self.definitions().is_empty()
     }

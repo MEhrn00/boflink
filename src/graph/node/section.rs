@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, OnceCell},
     collections::{HashSet, VecDeque},
     hash::{DefaultHasher, Hasher},
 };
@@ -91,6 +91,173 @@ pub enum SectionType {
     Other,
 }
 
+impl SectionType {
+    fn from_name_and_flags(
+        name: SectionName<'_>,
+        characteristics: SectionNodeCharacteristics,
+    ) -> SectionType {
+        if !name.as_str().starts_with('.') {
+            return Self::Other;
+        }
+
+        let group_name = name.group_name();
+
+        // Code (.text)
+        if characteristics.contains(
+            SectionNodeCharacteristics::CntCode
+                | SectionNodeCharacteristics::MemExecute
+                | SectionNodeCharacteristics::MemRead,
+        ) && group_name == ".text"
+        {
+            return SectionType::Code;
+        }
+
+        // Initialized data (.data)
+        if characteristics.contains(
+            SectionNodeCharacteristics::CntInitializedData
+                | SectionNodeCharacteristics::MemRead
+                | SectionNodeCharacteristics::MemWrite,
+        ) && group_name == ".data"
+        {
+            return SectionType::InitializedData;
+        }
+
+        // Uninitialized data (.bss)
+        if characteristics.contains(
+            SectionNodeCharacteristics::CntUninitializedData
+                | SectionNodeCharacteristics::MemRead
+                | SectionNodeCharacteristics::MemWrite,
+        ) && group_name == ".bss"
+        {
+            return SectionType::UninitializedData;
+        }
+
+        // Read only (.rdata)
+        if characteristics.contains(
+            SectionNodeCharacteristics::CntInitializedData | SectionNodeCharacteristics::MemRead,
+        ) && group_name == ".rdata"
+        {
+            return SectionType::ReadOnlyData;
+        }
+
+        // Exception (.pdata)
+        if characteristics.contains(
+            SectionNodeCharacteristics::CntInitializedData | SectionNodeCharacteristics::MemRead,
+        ) && group_name == ".pdata"
+        {
+            return SectionType::Exception;
+        }
+
+        // Unwind (.xdata)
+        if characteristics.contains(
+            SectionNodeCharacteristics::CntInitializedData | SectionNodeCharacteristics::MemRead,
+        ) && group_name == ".xdata"
+        {
+            return SectionType::ExceptionUnwind;
+        }
+
+        // Linker Options (.drectve)
+        if characteristics.contains(SectionNodeCharacteristics::LnkInfo) && group_name == ".drectve"
+        {
+            return SectionType::LinkerOptions;
+        }
+
+        // Debug Symbols (.debug$S)
+        if characteristics.contains(
+            SectionNodeCharacteristics::CntInitializedData
+                | SectionNodeCharacteristics::MemRead
+                | SectionNodeCharacteristics::MemDiscardable,
+        ) && group_name == ".debug$S"
+        {
+            return SectionType::DebugSymbols;
+        }
+
+        // Import tables (.idata)
+        if characteristics.contains(
+            SectionNodeCharacteristics::CntInitializedData
+                | SectionNodeCharacteristics::MemRead
+                | SectionNodeCharacteristics::MemWrite,
+        ) && group_name == ".idata"
+        {
+            return SectionType::ImportTables;
+        }
+
+        // TLS (.tls)
+        if characteristics.contains(
+            SectionNodeCharacteristics::CntInitializedData
+                | SectionNodeCharacteristics::MemRead
+                | SectionNodeCharacteristics::MemWrite,
+        ) && group_name == ".tls"
+        {
+            return SectionType::Tls;
+        }
+
+        // The above section types should be in a rough order of the most common
+        // types in COFFs.
+        // The order of the section types below here should not matter for optimization.
+
+        if characteristics.contains(SectionNodeCharacteristics::LnkInfo) && group_name == ".cormeta"
+        {
+            return SectionType::ClrMetadata;
+        }
+
+        if characteristics.contains(
+            SectionNodeCharacteristics::CntInitializedData
+                | SectionNodeCharacteristics::MemRead
+                | SectionNodeCharacteristics::MemDiscardable,
+        ) && group_name == ".debug$P"
+        {
+            return SectionType::PrecompiledDebugTypes;
+        }
+
+        if characteristics.contains(
+            SectionNodeCharacteristics::CntInitializedData
+                | SectionNodeCharacteristics::MemRead
+                | SectionNodeCharacteristics::MemDiscardable,
+        ) && group_name == ".debug$T"
+        {
+            return SectionType::PrecompiledDebugTypes;
+        }
+
+        if characteristics.contains(
+            SectionNodeCharacteristics::CntInitializedData | SectionNodeCharacteristics::MemRead,
+        ) && group_name == ".rsrc"
+        {
+            return SectionType::ResourceDirectory;
+        }
+
+        if characteristics.contains(SectionNodeCharacteristics::GPRel) {
+            if characteristics.contains(
+                SectionNodeCharacteristics::CntUninitializedData
+                    | SectionNodeCharacteristics::MemRead
+                    | SectionNodeCharacteristics::MemWrite,
+            ) && group_name == ".sbss"
+            {
+                return SectionType::GPRelUninitialized;
+            }
+
+            if characteristics.contains(
+                SectionNodeCharacteristics::CntInitializedData
+                    | SectionNodeCharacteristics::MemRead
+                    | SectionNodeCharacteristics::MemWrite,
+            ) && group_name == ".sdata"
+            {
+                return SectionType::GPRelInitialized;
+            }
+
+            if characteristics.contains(
+                SectionNodeCharacteristics::CntInitializedData
+                    | SectionNodeCharacteristics::MemRead,
+            ) && group_name == ".srdata"
+            {
+                return SectionType::GPRelReadOnly;
+            }
+        }
+
+        Self::Other
+    }
+}
+
 /// A section node in the graph.
 pub struct SectionNode<'arena, 'data> {
     /// The list of outgoing relocation edges for this section.
@@ -122,6 +289,12 @@ pub struct SectionNode<'arena, 'data> {
 
     /// The data checksum
     checksum: Cell<u32>,
+
+    /// The cached section type.
+    ///
+    /// This can be kept as a `OnceCell` unless the section name or section
+    /// characteristics get wrapped in a Cell.
+    kind: OnceCell<SectionType>,
 }
 
 impl<'arena, 'data> SectionNode<'arena, 'data> {
@@ -144,6 +317,7 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
             characteristics,
             checksum: Cell::from(checksum),
             name: name.into(),
+            kind: OnceCell::new(),
         }
     }
 
@@ -275,7 +449,6 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
 
     /// Keeps this section.
     #[inline]
-    #[allow(unused)]
     pub fn keep(&self) {
         self.discarded.set(false);
     }
@@ -355,136 +528,9 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
 
     /// Returns the type of section.
     pub fn typ(&self) -> SectionType {
-        if self.name().group_name() == ".bss"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntUninitializedData
-                    | SectionNodeCharacteristics::MemRead
-                    | SectionNodeCharacteristics::MemWrite,
-            )
-        {
-            SectionType::UninitializedData
-        } else if self.name().group_name() == ".cormeta"
-            && self
-                .characteristics()
-                .contains(SectionNodeCharacteristics::LnkInfo)
-        {
-            SectionType::ClrMetadata
-        } else if self.name().group_name() == ".data"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead
-                    | SectionNodeCharacteristics::MemWrite,
-            )
-        {
-            SectionType::InitializedData
-        } else if self.name().as_str() == ".debug$P"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead
-                    | SectionNodeCharacteristics::MemDiscardable,
-            )
-        {
-            SectionType::PrecompiledDebugTypes
-        } else if self.name().as_str() == ".debug$S"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead
-                    | SectionNodeCharacteristics::MemDiscardable,
-            )
-        {
-            SectionType::DebugSymbols
-        } else if self.name().as_str() == ".debug$T"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead
-                    | SectionNodeCharacteristics::MemDiscardable,
-            )
-        {
-            SectionType::DebugTypes
-        } else if self.name().group_name() == ".drectve"
-            && self
-                .characteristics()
-                .contains(SectionNodeCharacteristics::LnkInfo)
-        {
-            SectionType::LinkerOptions
-        } else if self.name().group_name() == ".idata"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead
-                    | SectionNodeCharacteristics::MemWrite,
-            )
-        {
-            SectionType::ImportTables
-        } else if self.name().group_name() == ".pdata"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead,
-            )
-        {
-            SectionType::Exception
-        } else if self.name().group_name() == ".rdata"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead,
-            )
-        {
-            SectionType::ReadOnlyData
-        } else if self.name().group_name() == ".rsrc"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead,
-            )
-        {
-            SectionType::ResourceDirectory
-        } else if self.name().group_name() == ".sbss"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntUninitializedData
-                    | SectionNodeCharacteristics::MemRead
-                    | SectionNodeCharacteristics::MemWrite
-                    | SectionNodeCharacteristics::GPRel,
-            )
-        {
-            SectionType::GPRelUninitialized
-        } else if self.name().group_name() == ".sdata"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead
-                    | SectionNodeCharacteristics::GPRel,
-            )
-        {
-            SectionType::GPRelInitialized
-        } else if self.name().group_name() == ".srdata"
-            && self
-                .characteristics()
-                .contains(SectionNodeCharacteristics::LnkInfo)
-        {
-            SectionType::RegisteredExceptionHandler
-        } else if self.name().group_name() == ".text"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntCode
-                    | SectionNodeCharacteristics::MemExecute
-                    | SectionNodeCharacteristics::MemRead,
-            )
-        {
-            SectionType::Code
-        } else if self.name().group_name() == ".tls"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead
-                    | SectionNodeCharacteristics::MemWrite,
-            )
-        {
-            SectionType::Tls
-        } else if self.name().group_name() == ".xdata"
-            && self.characteristics().contains(
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead,
-            )
-        {
-            SectionType::ExceptionUnwind
-        } else {
-            SectionType::Other
-        }
+        *self
+            .kind
+            .get_or_init(|| SectionType::from_name_and_flags(self.name(), self.characteristics()))
     }
 
     /// Returns `true` if this is a section with GCC metadata.
@@ -513,14 +559,12 @@ impl std::fmt::Debug for SectionNode<'_, '_> {
 pub struct SectionName<'data>(&'data str);
 
 impl<'data> SectionName<'data> {
-    #[inline]
     pub fn as_str(&self) -> &'data str {
         self.0
     }
 
     /// Returns the `group name` value (`<group name>$<group ordering>`) from
     /// the section name.
-    #[inline]
     pub fn group_name(&self) -> &'data str {
         self.0
             .split_once('$')
@@ -530,7 +574,6 @@ impl<'data> SectionName<'data> {
 
     /// Returns the `group ordering` value (`<group name>$<group ordering>`)
     /// from the section name if this is a grouped section.
-    #[inline]
     pub fn group_ordering(&self) -> Option<&'data str> {
         self.0
             .split_once('$')
