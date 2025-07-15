@@ -55,9 +55,6 @@ jobs:
     permissions:
       actions: write
 
-    env:
-      RUSTFLAGS: -C target-feature=+crt-static
-
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
