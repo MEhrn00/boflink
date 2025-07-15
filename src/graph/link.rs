@@ -1,6 +1,6 @@
 use std::{
     cell::OnceCell,
-    collections::{HashMap, LinkedList, hash_map},
+    collections::{HashMap, HashSet, LinkedList, hash_map},
     fmt::Write,
     hash::{DefaultHasher, Hasher},
     path::Path,
@@ -696,11 +696,17 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
     }
 
     /// Finishes building the link graph.
-    pub fn finish(self) -> Result<BuiltLinkGraph<'arena, 'data>, Vec<SymbolError<'arena, 'data>>> {
+    pub fn finish(
+        self,
+        ignored_unresolved: &HashSet<String>,
+    ) -> Result<BuiltLinkGraph<'arena, 'data>, Vec<SymbolError<'arena, 'data>>> {
         let mut symbol_errors = Vec::new();
 
         for symbol in self.external_symbols.values().copied() {
-            if symbol.is_undefined() && !symbol.references().is_empty() {
+            if symbol.is_undefined()
+                && !symbol.references().is_empty()
+                && !ignored_unresolved.contains(symbol.name().as_str())
+            {
                 symbol_errors.push(SymbolError::Undefined(UndefinedSymbolError(symbol)));
             } else if symbol.is_duplicate() {
                 symbol_errors.push(SymbolError::Duplicate(DuplicateSymbolError(symbol)));
@@ -724,12 +730,16 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
     /// printed output.
     pub fn finish_unresolved(
         self,
+        ignored_unresolved: &HashSet<String>,
     ) -> Result<BuiltLinkGraph<'arena, 'data>, Vec<SymbolError<'arena, 'data>>> {
         let mut symbol_errors = Vec::new();
         let mut unresolved_symbols = Vec::new();
 
         for symbol in self.external_symbols.values().copied() {
-            if symbol.is_undefined() && !symbol.references().is_empty() {
+            if symbol.is_undefined()
+                && !symbol.references().is_empty()
+                && !ignored_unresolved.contains(symbol.name().as_str())
+            {
                 unresolved_symbols.push(SymbolError::Undefined(UndefinedSymbolError(symbol)));
             } else if symbol.is_duplicate() {
                 symbol_errors.push(SymbolError::Duplicate(DuplicateSymbolError(symbol)));

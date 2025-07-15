@@ -94,6 +94,10 @@ pub struct CliOptionArgs {
     #[arg(long)]
     pub warn_unresolved_symbols: bool,
 
+    /// Unresolved <symbol> will not cause an error or warning
+    #[arg(long, value_name = "symbol", value_delimiter = ',')]
+    pub ignore_unresolved_symbol: Vec<String>,
+
     /// Query x86_64-w64-mingw32-gcc for its list of library search paths
     #[arg(long, conflicts_with_all = ["mingw32", "ucrt64", "ucrt32"])]
     pub mingw64: bool,

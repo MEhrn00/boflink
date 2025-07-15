@@ -129,7 +129,7 @@ fn run_linker(args: &mut ParsedCliArgs) -> anyhow::Result<()> {
         }
     }
 
-    let linker = LinkerBuilder::new()
+    let mut linker = LinkerBuilder::new()
         .library_searcher(library_searcher)
         .entrypoint(std::mem::take(&mut args.options.entry))
         .merge_bss(args.options.merge_bss)
@@ -138,6 +138,9 @@ fn run_linker(args: &mut ParsedCliArgs) -> anyhow::Result<()> {
         .add_gc_keep_symbols(std::mem::take(&mut args.options.keep_symbol))
         .merge_grouped_sections(args.options.merge_groups)
         .warn_unresolved(args.options.warn_unresolved_symbols);
+
+    linker
+        .add_ignored_unresolved_symbols(std::mem::take(&mut args.options.ignore_unresolved_symbol));
 
     let linker = if let Some(target_arch) = args.options.machine.take() {
         linker.architecture(target_arch.into())

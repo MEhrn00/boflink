@@ -70,6 +70,9 @@ pub struct ConfiguredLinker<L: LibraryFind> {
     /// Report unresolved symbols as warnings.
     warn_unresolved: bool,
 
+    /// Ignored unresolved symbols.
+    ignored_unresolved_symbols: HashSet<String>,
+
     /// Output path for dumping the link graph.
     link_graph_output: Option<PathBuf>,
 }
@@ -97,6 +100,7 @@ impl<L: LibraryFind> ConfiguredLinker<L> {
             gc_roots: builder.gc_keep_symbols,
             print_gc_sections: builder.print_gc_sections,
             warn_unresolved: builder.warn_unresolved,
+            ignored_unresolved_symbols: builder.ignored_unresolved_symbols,
         }
     }
 }
@@ -397,9 +401,9 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
 
         // Finish building the link graph
         let finish_result = if self.warn_unresolved {
-            graph.finish_unresolved()
+            graph.finish_unresolved(&self.ignored_unresolved_symbols)
         } else {
-            graph.finish()
+            graph.finish(&self.ignored_unresolved_symbols)
         };
 
         let mut graph = match finish_result {

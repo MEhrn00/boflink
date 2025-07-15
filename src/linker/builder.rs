@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use indexmap::{IndexMap, IndexSet};
 
@@ -64,6 +64,9 @@ pub struct LinkerBuilder<L: LibraryFind + 'static> {
 
     /// Report unresolved symbols as warnings.
     pub(super) warn_unresolved: bool,
+
+    /// List of ignored unresolved symbols.
+    pub(super) ignored_unresolved_symbols: HashSet<String>,
 }
 
 impl<L: LibraryFind + 'static> LinkerBuilder<L> {
@@ -82,6 +85,7 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
             gc_keep_symbols: Default::default(),
             print_gc_sections: false,
             warn_unresolved: false,
+            ignored_unresolved_symbols: HashSet::new(),
         }
     }
 
@@ -200,6 +204,15 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
         self.gc_keep_symbols
             .extend(symbols.into_iter().map(Into::into));
         self
+    }
+
+    /// Add ignored unresolved symbols.
+    pub fn add_ignored_unresolved_symbols<S: Into<String>, I: IntoIterator<Item = S>>(
+        &mut self,
+        symbols: I,
+    ) {
+        self.ignored_unresolved_symbols
+            .extend(symbols.into_iter().map(Into::into));
     }
 
     /// Finishes configuring the linker.
