@@ -61,6 +61,9 @@ pub struct LinkerBuilder<L: LibraryFind + 'static> {
 
     /// Print sections discarded during GC sections.
     pub(super) print_gc_sections: bool,
+
+    /// Report unresolved symbols as warnings.
+    pub(super) warn_unresolved: bool,
 }
 
 impl<L: LibraryFind + 'static> LinkerBuilder<L> {
@@ -78,6 +81,7 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
             gc_sections: false,
             gc_keep_symbols: Default::default(),
             print_gc_sections: false,
+            warn_unresolved: false,
         }
     }
 
@@ -135,6 +139,12 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
     /// Print sections discarded during GC sections.
     pub fn print_gc_sections(mut self, val: bool) -> Self {
         self.print_gc_sections = val;
+        self
+    }
+
+    /// Report unresolved symbols as warnings.
+    pub fn warn_unresolved(mut self, val: bool) -> Self {
+        self.warn_unresolved = val;
         self
     }
 

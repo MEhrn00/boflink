@@ -2,7 +2,7 @@ use std::{cell::Cell, marker::PhantomData};
 
 use crate::graph::node::{LibraryNode, SectionNode, SymbolNode};
 
-use super::node::SymbolName;
+use super::node::{SymbolName, SymbolReferencesIter};
 
 use __private::SealedTrait;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
@@ -164,6 +164,13 @@ where
 pub struct EdgeListIter<'arena, E: EdgeListEntry<'arena, T>, T: EdgeListTraversal>(
     (Option<&'arena E>, PhantomData<T>),
 );
+
+impl<'arena, 'data> EdgeListIter<'arena, RelocationEdge<'arena, 'data>, IncomingEdges> {
+    /// Adapts this iterator to return symbol references
+    pub fn symbols(self) -> SymbolReferencesIter<'arena, 'data> {
+        SymbolReferencesIter::new(self)
+    }
+}
 
 impl<'arena, E: EdgeListEntry<'arena, T>, T: EdgeListTraversal> Clone
     for EdgeListIter<'arena, E, T>

@@ -67,6 +67,9 @@ pub struct ConfiguredLinker<L: LibraryFind> {
     /// Print GC sections discarded.
     print_gc_sections: bool,
 
+    /// Report unresolved symbols as warnings.
+    warn_unresolved: bool,
+
     /// Output path for dumping the link graph.
     link_graph_output: Option<PathBuf>,
 }
@@ -93,6 +96,7 @@ impl<L: LibraryFind> ConfiguredLinker<L> {
             gc_sections: builder.gc_sections,
             gc_roots: builder.gc_keep_symbols,
             print_gc_sections: builder.print_gc_sections,
+            warn_unresolved: builder.warn_unresolved,
         }
     }
 }
@@ -392,7 +396,13 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
         }
 
         // Finish building the link graph
-        let mut graph = match graph.finish() {
+        let finish_result = if self.warn_unresolved {
+            graph.finish_unresolved()
+        } else {
+            graph.finish()
+        };
+
+        let mut graph = match finish_result {
             Ok(graph) => graph,
             Err(e) => {
                 return Err(LinkError::Symbol(LinkerSymbolErrors(

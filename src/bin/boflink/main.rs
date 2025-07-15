@@ -136,7 +136,8 @@ fn run_linker(args: &mut ParsedCliArgs) -> anyhow::Result<()> {
         .gc_sections(args.options.gc_sections)
         .print_gc_sections(args.options.print_gc_sections)
         .add_gc_keep_symbols(std::mem::take(&mut args.options.keep_symbol))
-        .merge_grouped_sections(args.options.merge_groups);
+        .merge_grouped_sections(args.options.merge_groups)
+        .warn_unresolved(args.options.warn_unresolved_symbols);
 
     let linker = if let Some(target_arch) = args.options.machine.take() {
         linker.architecture(target_arch.into())

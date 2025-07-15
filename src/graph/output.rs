@@ -166,6 +166,8 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
             }
         }
 
+        let mut local_undefined = IndexMap::new();
+
         // Reserve relocations skipping relocations to the same output section
         for output_section in self.output_sections.iter_mut() {
             let mut reloc_count = 0usize;
@@ -174,7 +176,10 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
                 for reloc in section_node.relocations() {
                     let symbol = reloc.target();
 
-                    if let Some(definition) = symbol
+                    // Relocation to an imported or undefined symbol.
+                    if symbol.definitions().is_empty() && symbol.imports().is_empty() {
+                        local_undefined.insert(symbol.name().as_str(), symbol);
+                    } else if let Some(definition) = symbol
                         .definitions()
                         .iter()
                         .find(|definition| !definition.target().is_discarded())
@@ -303,6 +308,22 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
                         )
                     });
             }
+        }
+
+        // Reserve undefined symbols
+        for symbol in local_undefined.values() {
+            let _ = symbol
+                .output_name()
+                .get_or_init(|| coff_writer.add_name(symbol.name().as_str().as_bytes()));
+
+            symbol
+                .assign_table_index(coff_writer.reserve_symbol_index())
+                .unwrap_or_else(|v| {
+                    panic!(
+                        "symbol {} already assigned to symbol table index {v}",
+                        symbol.name().demangle()
+                    )
+                });
         }
 
         // Reserve library imported symbols
@@ -517,6 +538,23 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
                     number_of_aux_symbols: 0,
                 });
             }
+        }
+
+        // Write out local undefined symbols
+        for symbol in local_undefined.values() {
+            coff_writer.write_symbol(object::write::coff::Symbol {
+                name: symbol.output_name().get().copied().unwrap_or_else(|| {
+                    panic!(
+                        "symbol {} never had the name reserved in the output COFF",
+                        symbol.name().demangle()
+                    )
+                }),
+                value: 0,
+                section_number: 0,
+                typ: 0,
+                storage_class: IMAGE_SYM_CLASS_EXTERNAL,
+                number_of_aux_symbols: 0,
+            });
         }
 
         // Write out library imported symbols

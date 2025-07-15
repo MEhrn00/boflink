@@ -1,6 +1,7 @@
 use std::{
     cell::OnceCell,
     collections::{HashMap, LinkedList, hash_map},
+    fmt::Write,
     hash::{DefaultHasher, Hasher},
     path::Path,
     sync::LazyLock,
@@ -90,12 +91,19 @@ pub enum LinkGraphAddError {
     Object(#[from] object::read::Error),
 }
 
+#[derive(Debug, thiserror::Error)]
 pub enum SymbolError<'arena, 'data> {
+    #[error("duplicate symbol: {0}")]
     Duplicate(DuplicateSymbolError<'arena, 'data>),
+
+    #[error("undefined symbol: {0}")]
     Undefined(UndefinedSymbolError<'arena, 'data>),
+
+    #[error("multiply defined symbol: {0}")]
     MultiplyDefined(MultiplyDefinedSymbolError<'arena, 'data>),
 }
 
+#[derive(Debug, thiserror::Error)]
 pub struct DuplicateSymbolError<'arena, 'data>(&'arena SymbolNode<'arena, 'data>);
 
 impl<'arena, 'data> DuplicateSymbolError<'arena, 'data> {
@@ -104,6 +112,13 @@ impl<'arena, 'data> DuplicateSymbolError<'arena, 'data> {
     }
 }
 
+impl std::fmt::Display for DuplicateSymbolError<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        display_symbol_definitions(f, self.0)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
 pub struct UndefinedSymbolError<'arena, 'data>(&'arena SymbolNode<'arena, 'data>);
 
 impl<'arena, 'data> UndefinedSymbolError<'arena, 'data> {
@@ -112,12 +127,89 @@ impl<'arena, 'data> UndefinedSymbolError<'arena, 'data> {
     }
 }
 
+impl std::fmt::Display for UndefinedSymbolError<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.name().demangle())?;
+
+        let mut reference_iter = self.0.symbol_references().peekable();
+        let mut logged_references = 0;
+
+        while logged_references < 5 {
+            let reference = match reference_iter.next() {
+                Some(reference) => reference,
+                None => break,
+            };
+
+            let reloc = reference.relocation();
+            let section = reloc.source();
+            let coff = section.coff();
+
+            if reference.source_symbol().is_section_symbol() {
+                if reference_iter.peek().is_some_and(|next_reference| {
+                    next_reference.source_symbol().is_section_symbol()
+                }) {
+                    write!(
+                        f,
+                        "\n>>> referenced by {coff}:({}+{:#x})",
+                        section.name(),
+                        reloc.weight().address()
+                    )?;
+                    logged_references += 1;
+                }
+            } else {
+                write!(
+                    f,
+                    "\n>>> referenced by {coff}:({})",
+                    reference.source_symbol().name().demangle()
+                )?;
+                logged_references += 1;
+            }
+        }
+
+        let remaining = self.0.references().len().saturating_sub(logged_references);
+        if remaining > 0 {
+            write!(f, "\n>>> referenced {remaining} more times")?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
 pub struct MultiplyDefinedSymbolError<'arena, 'data>(&'arena SymbolNode<'arena, 'data>);
 
 impl<'arena, 'data> MultiplyDefinedSymbolError<'arena, 'data> {
     pub fn symbol(&self) -> &'arena SymbolNode<'arena, 'data> {
         self.0
     }
+}
+
+impl std::fmt::Display for MultiplyDefinedSymbolError<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        display_symbol_definitions(f, self.0)
+    }
+}
+
+fn display_symbol_definitions<'arena, 'data>(
+    f: &mut std::fmt::Formatter<'_>,
+    symbol: &'arena SymbolNode<'arena, 'data>,
+) -> std::fmt::Result {
+    write!(f, "{}", symbol.name().demangle())?;
+
+    let definitions = symbol.definitions();
+    if !definitions.is_empty() {
+        let mut definition_iter = definitions.iter();
+        for definition in definition_iter.by_ref().take(5) {
+            write!(f, "\n>>> defined at {}", definition.target().coff())?;
+        }
+
+        let remaining = definitions.len().saturating_sub(5);
+        if remaining > 0 {
+            write!(f, "\n>>> defined {remaining} more times")?;
+        }
+    }
+
+    Ok(())
 }
 
 /// The link graph.
@@ -616,6 +708,58 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                 symbol_errors.push(SymbolError::MultiplyDefined(MultiplyDefinedSymbolError(
                     symbol,
                 )));
+            }
+        }
+
+        if !symbol_errors.is_empty() {
+            return Err(symbol_errors);
+        }
+
+        Ok(BuiltLinkGraph::new(self))
+    }
+
+    /// Finishes building the link graph and warns on unresolved symbols.
+    ///
+    /// Warnings are reported here so that they appear above errors in the
+    /// printed output.
+    pub fn finish_unresolved(
+        self,
+    ) -> Result<BuiltLinkGraph<'arena, 'data>, Vec<SymbolError<'arena, 'data>>> {
+        let mut symbol_errors = Vec::new();
+        let mut unresolved_symbols = Vec::new();
+
+        for symbol in self.external_symbols.values().copied() {
+            if symbol.is_undefined() && !symbol.references().is_empty() {
+                unresolved_symbols.push(SymbolError::Undefined(UndefinedSymbolError(symbol)));
+            } else if symbol.is_duplicate() {
+                symbol_errors.push(SymbolError::Duplicate(DuplicateSymbolError(symbol)));
+            } else if symbol.is_multiply_defined() {
+                symbol_errors.push(SymbolError::MultiplyDefined(MultiplyDefinedSymbolError(
+                    symbol,
+                )));
+            }
+        }
+
+        if !unresolved_symbols.is_empty() {
+            let mut log_buffer = String::new();
+            let mut unresolved_iter = unresolved_symbols.iter();
+
+            for unresolved_symbol in unresolved_iter
+                .by_ref()
+                .take(unresolved_symbols.len().saturating_sub(1))
+            {
+                writeln!(log_buffer, "{unresolved_symbol}").unwrap();
+                log::warn!("{log_buffer}");
+                log_buffer.clear();
+            }
+
+            if let Some(unresolved_symbol) = unresolved_iter.next() {
+                write!(log_buffer, "{unresolved_symbol}").unwrap();
+                if !symbol_errors.is_empty() {
+                    log_buffer.push('\n');
+                }
+
+                log::warn!("{log_buffer}");
             }
         }
 

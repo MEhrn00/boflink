@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
 
 use crate::{
     api::ApiSymbolsError,
@@ -314,44 +314,40 @@ pub struct SymbolReferencesContext {
 
 impl SymbolReferencesContext {
     pub fn new(symbol: &SymbolNode<'_, '_>) -> SymbolReferencesContext {
-        let mut reference_iter = symbol.references().iter();
+        let mut reference_iter = symbol.symbol_references().peekable();
+
         let mut references = Vec::with_capacity(5);
 
-        for reference in reference_iter.by_ref().take(5) {
-            let section = reference.source();
+        while references.len() < 5 {
+            let reference = match reference_iter.next() {
+                Some(reference) => reference,
+                None => break,
+            };
+
+            let reloc = reference.relocation();
+            let section = reference.section();
             let coff = section.coff();
 
-            let symbol_defs =
-                BTreeMap::from_iter(section.definitions().iter().filter_map(|definition| {
-                    let ref_symbol = definition.source();
-                    if ref_symbol.is_section_symbol() || ref_symbol.is_label() {
-                        None
-                    } else {
-                        Some((definition.weight().address(), ref_symbol.name()))
-                    }
-                }));
-
-            if let Some(reference_symbol) = symbol_defs
-                .range(0..=reference.weight().address())
-                .next_back()
-            {
-                references.push(SymbolReference {
-                    coff_path: coff.to_string(),
-                    reference: reference_symbol.1.demangle().to_string(),
-                });
+            if reference.source_symbol().is_section_symbol() {
+                if reference_iter.peek().is_some_and(|next_reference| {
+                    next_reference.source_symbol().is_section_symbol()
+                }) {
+                    references.push(SymbolReference {
+                        coff_path: coff.to_string(),
+                        reference: format!("{}+{:#x}", section.name(), reloc.weight().address()),
+                    });
+                }
             } else {
                 references.push(SymbolReference {
                     coff_path: coff.to_string(),
-                    reference: format!("{}+{:#x}", section.name(), reference.weight().address()),
+                    reference: reference.source_symbol().name().demangle().to_string(),
                 });
             }
         }
 
-        let remaining = reference_iter.count();
-
         SymbolReferencesContext {
+            remaining: symbol.references().len().saturating_sub(references.len()),
             references,
-            remaining,
         }
     }
 }

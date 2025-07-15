@@ -90,6 +90,10 @@ pub struct CliOptionArgs {
     #[arg(long)]
     pub print_gc_sections: bool,
 
+    /// Report unresolved symbols as warnings
+    #[arg(long)]
+    pub warn_unresolved_symbols: bool,
+
     /// Query x86_64-w64-mingw32-gcc for its list of library search paths
     #[arg(long, conflicts_with_all = ["mingw32", "ucrt64", "ucrt32"])]
     pub mingw64: bool,

@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, OnceCell},
-    collections::HashSet,
+    collections::{BTreeMap, HashSet, VecDeque},
 };
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
@@ -21,11 +21,11 @@ use object::{
 };
 
 use crate::graph::edge::{
-    ComdatSelection, DefinitionEdge, EdgeList, ImportEdge, IncomingEdges, OutgoingEdges,
-    RelocationEdge,
+    ComdatSelection, DefinitionEdge, EdgeList, EdgeListIter, ImportEdge, IncomingEdges,
+    OutgoingEdges, RelocationEdge,
 };
 
-use super::SectionType;
+use super::{SectionNode, SectionType};
 
 #[derive(Debug, Copy, Clone, thiserror::Error)]
 #[error("unknown storage class value ({0})")]
@@ -119,6 +119,11 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     /// node.
     pub fn references(&self) -> &EdgeList<'arena, RelocationEdge<'arena, 'data>, IncomingEdges> {
         &self.relocation_edges
+    }
+
+    /// Returns an iterator over the symbols that reference this symbol.
+    pub fn symbol_references(&self) -> SymbolReferencesIter<'arena, 'data> {
+        SymbolReferencesIter::new(self.references().iter())
     }
 
     /// Returns the list of adjacent outgoing import edges for this symbol
@@ -411,4 +416,129 @@ pub enum SymbolNodeType {
 
     /// A defined symbol type value.
     Value(u16),
+}
+
+/// Iterator for symbol references.
+///
+/// This will return the section symbol with the reference before other symbols.
+pub struct SymbolReferencesIter<'arena, 'data> {
+    /// The incoming relocation edge references for the symbol.
+    reference_iter: EdgeListIter<'arena, RelocationEdge<'arena, 'data>, IncomingEdges>,
+
+    /// Queue with the list of references for the visited section.
+    queue: VecDeque<SymbolReference<'arena, 'data>>,
+}
+
+impl<'arena, 'data> SymbolReferencesIter<'arena, 'data> {
+    pub fn new(
+        references: EdgeListIter<'arena, RelocationEdge<'arena, 'data>, IncomingEdges>,
+    ) -> Self {
+        let queue = VecDeque::with_capacity(3);
+
+        Self {
+            reference_iter: references,
+            queue,
+        }
+    }
+
+    /// Consumes the iterator and returns the remaining number of references.
+    pub fn remaining(self) -> usize {
+        self.reference_iter.count()
+    }
+}
+
+impl<'arena, 'data> Iterator for SymbolReferencesIter<'arena, 'data> {
+    type Item = SymbolReference<'arena, 'data>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(reference) = self.queue.pop_front() {
+            return Some(reference);
+        }
+
+        while self.queue.is_empty() {
+            // Get the next reference for the symbol from the iterator.
+            let reference = self.reference_iter.next()?;
+
+            // Get the section
+            let section = reference.source();
+
+            // Get the symbols and labels defined in this section ordered by
+            // virtual address.
+            let mut symbol_defs = BTreeMap::new();
+            let mut label_defs = BTreeMap::new();
+            for definition in section.definitions().iter() {
+                let ref_symbol = definition.source();
+
+                if ref_symbol.is_section_symbol() {
+                    self.queue.push_back(SymbolReference {
+                        source_definition: definition,
+                        referent_relocation: reference,
+                    });
+                } else if ref_symbol.is_label() {
+                    label_defs.insert(definition.weight().address(), definition);
+                } else {
+                    symbol_defs.insert(definition.weight().address(), definition);
+                }
+            }
+
+            if let Some((_, reference_definition)) = symbol_defs
+                .range(0..=reference.weight().address())
+                .next_back()
+            {
+                self.queue.push_back(SymbolReference {
+                    source_definition: reference_definition,
+                    referent_relocation: reference,
+                });
+
+                // Include any associated labels
+                for (_, label_definition) in label_defs
+                    .range(reference_definition.weight().address()..=reference.weight().address())
+                {
+                    self.queue.push_back(SymbolReference {
+                        source_definition: label_definition,
+                        referent_relocation: reference,
+                    });
+                }
+            }
+        }
+
+        self.queue.pop_front()
+    }
+}
+
+/// A symbol that references another symbol.
+pub struct SymbolReference<'arena, 'data> {
+    /// The definition edge of the source symbol.
+    source_definition: &'arena DefinitionEdge<'arena, 'data>,
+
+    /// The relocation which references the target symbol.
+    referent_relocation: &'arena RelocationEdge<'arena, 'data>,
+}
+
+impl<'arena, 'data> SymbolReference<'arena, 'data> {
+    /// Returns the definition for the  symbol which references the referent
+    /// symbol.
+    pub fn definition(&self) -> &'arena DefinitionEdge<'arena, 'data> {
+        self.source_definition
+    }
+
+    /// Returns the relocation for the referenced target symbol.
+    pub fn relocation(&self) -> &'arena RelocationEdge<'arena, 'data> {
+        self.referent_relocation
+    }
+
+    /// Returns the target symbol for the reference.
+    pub fn target_symbol(&self) -> &'arena SymbolNode<'arena, 'data> {
+        self.referent_relocation.target()
+    }
+
+    /// Returns the source symbol for the reference.
+    pub fn source_symbol(&self) -> &'arena SymbolNode<'arena, 'data> {
+        self.source_definition.source()
+    }
+
+    /// Returns the section that references the symbol.
+    pub fn section(&self) -> &'arena SectionNode<'arena, 'data> {
+        self.referent_relocation.source()
+    }
 }
