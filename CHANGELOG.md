@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2025-07-14
+
+### Fixed
+
+- Parsing error when attempting to parse `DATA` imports from legacy MinGW import libraries (#25).
+
+### Added
+
+- Include git commit short hash of built binary in `--version` string (0be92f1).
+- Support for demangling C++ symbol names in diagnostic output messages (#24).
+- `--warn-unresolved-symbols` flag for reporting unresolved symbols as warnings instead of errors.
+  These will show up as regular undefined symbols in the output COFF without any library prefix added (#26).
+- `--ignore-unresolved-symbol` flag for allowing select symbols to remain undefined (#27).
+
 ## [0.3.1] - 2025-06-28
 
 ### Fixed
@@ -58,7 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release
 
-[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.3.1...HEAD
+[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/MEhrn00/boflink/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/MEhrn00/boflink/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/MEhrn00/boflink/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MEhrn00/boflink/compare/v0.1.1...v0.2.0
