@@ -2,7 +2,7 @@ use std::{cell::Cell, marker::PhantomData};
 
 use crate::graph::node::{LibraryNode, SectionNode, SymbolNode};
 
-use super::node::{SymbolName, SymbolReferencesIter};
+use super::node::{BorrowedSymbolName, SymbolReferencesIter};
 
 use __private::SealedTrait;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
@@ -377,19 +377,21 @@ pub type RelocationEdge<'arena, 'data> =
 /// The weight for an import edge.
 pub struct ImportEdgeWeight<'data> {
     /// The name to import the symbol as.
-    import_name: SymbolName<'data>,
+    import_name: BorrowedSymbolName<'data>,
 }
 
 impl<'data> ImportEdgeWeight<'data> {
     #[inline]
-    pub(super) fn new(import_name: impl Into<SymbolName<'data>>) -> ImportEdgeWeight<'data> {
+    pub(super) fn new(
+        import_name: impl Into<BorrowedSymbolName<'data>>,
+    ) -> ImportEdgeWeight<'data> {
         Self {
             import_name: import_name.into(),
         }
     }
 
     #[inline]
-    pub fn import_name(&self) -> &SymbolName<'data> {
+    pub fn import_name(&self) -> &BorrowedSymbolName<'data> {
         &self.import_name
     }
 }

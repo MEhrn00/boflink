@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use crate::{
     api::ApiSymbolsError,
-    graph::{LinkGraphAddError, LinkGraphLinkError, SymbolError, node::SymbolNode},
+    graph::{
+        LinkGraphAddError, LinkGraphLinkError, SymbolError,
+        node::{OwnedSymbolName, SymbolNode},
+    },
     libsearch::LibsearchError,
     linkobject::archive::{ArchiveParseError, LinkArchiveParseError, MemberParseErrorKind},
 };
@@ -176,10 +179,9 @@ impl LinkerSymbolErrors {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("{kind}: {demangled}{}", .display_demangled_context(kind))]
+#[error("{kind}: {}{}", .name.quoted_demangle(), .display_demangled_context(kind))]
 pub struct LinkerSymbolError {
-    pub name: String,
-    pub demangled: String,
+    pub name: OwnedSymbolName,
     pub kind: LinkerSymbolErrorKind,
 }
 
@@ -190,8 +192,7 @@ impl From<SymbolError<'_, '_>> for LinkerSymbolError {
                 let symbol = duplicate_error.symbol();
 
                 Self {
-                    name: symbol.name().to_string(),
-                    demangled: symbol.name().demangle().to_string(),
+                    name: symbol.name().into_owned(),
                     kind: LinkerSymbolErrorKind::Duplicate(SymbolDefinitionsContext::new(symbol)),
                 }
             }
@@ -199,8 +200,7 @@ impl From<SymbolError<'_, '_>> for LinkerSymbolError {
                 let symbol = undefined_error.symbol();
 
                 Self {
-                    name: symbol.name().to_string(),
-                    demangled: symbol.name().demangle().to_string(),
+                    name: symbol.name().into_owned(),
                     kind: LinkerSymbolErrorKind::Undefined(SymbolReferencesContext::new(symbol)),
                 }
             }
@@ -208,8 +208,7 @@ impl From<SymbolError<'_, '_>> for LinkerSymbolError {
                 let symbol = multiply_defined_error.symbol();
 
                 Self {
-                    name: symbol.name().to_string(),
-                    demangled: symbol.name().demangle().to_string(),
+                    name: symbol.name().into_owned(),
                     kind: LinkerSymbolErrorKind::MultiplyDefined(SymbolDefinitionsContext::new(
                         symbol,
                     )),
@@ -340,7 +339,11 @@ impl SymbolReferencesContext {
             } else {
                 references.push(SymbolReference {
                     coff_path: coff.to_string(),
-                    reference: reference.source_symbol().name().demangle().to_string(),
+                    reference: reference
+                        .source_symbol()
+                        .name()
+                        .quoted_demangle()
+                        .to_string(),
                 });
             }
         }

@@ -129,7 +129,7 @@ impl<'arena, 'data> UndefinedSymbolError<'arena, 'data> {
 
 impl std::fmt::Display for UndefinedSymbolError<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0.name().demangle())?;
+        write!(f, "{}", self.0.name().quoted_demangle())?;
 
         let mut reference_iter = self.0.symbol_references().peekable();
         let mut logged_references = 0;
@@ -160,7 +160,7 @@ impl std::fmt::Display for UndefinedSymbolError<'_, '_> {
                 write!(
                     f,
                     "\n>>> referenced by {coff}:({})",
-                    reference.source_symbol().name().demangle()
+                    reference.source_symbol().name().quoted_demangle()
                 )?;
                 logged_references += 1;
             }
@@ -194,7 +194,7 @@ fn display_symbol_definitions<'arena, 'data>(
     f: &mut std::fmt::Formatter<'_>,
     symbol: &'arena SymbolNode<'arena, 'data>,
 ) -> std::fmt::Result {
-    write!(f, "{}", symbol.name().demangle())?;
+    write!(f, "{}", symbol.name().quoted_demangle())?;
 
     let definitions = symbol.definitions();
     if !definitions.is_empty() {

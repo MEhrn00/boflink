@@ -1,6 +1,7 @@
 use std::{
     cell::{Cell, OnceCell},
     collections::{BTreeMap, HashSet, VecDeque},
+    ops::Deref,
 };
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
@@ -55,7 +56,7 @@ pub struct SymbolNode<'arena, 'data> {
     output_name: OnceCell<object::write::coff::Name>,
 
     /// The name of the symbol.
-    name: SymbolName<'arena>,
+    name: BorrowedSymbolName<'arena>,
 
     /// The storage class of the symbol.
     storage_class: SymbolNodeStorageClass,
@@ -70,7 +71,7 @@ pub struct SymbolNode<'arena, 'data> {
 impl<'arena, 'data> SymbolNode<'arena, 'data> {
     #[inline]
     pub fn new(
-        name: impl Into<SymbolName<'arena>>,
+        name: impl Into<BorrowedSymbolName<'arena>>,
         storage_class: SymbolNodeStorageClass,
         section: bool,
         typ: SymbolNodeType,
@@ -89,7 +90,7 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     }
 
     pub fn try_from_symbol<'file, C: CoffHeader>(
-        name: impl Into<SymbolName<'arena>>,
+        name: impl Into<BorrowedSymbolName<'arena>>,
         coff_symbol: &'arena C::ImageSymbol,
     ) -> Result<SymbolNode<'arena, 'data>, TryFromSymbolError> {
         Ok(Self {
@@ -133,7 +134,7 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     }
 
     /// Returns the name of the symbol.
-    pub fn name(&self) -> &SymbolName<'arena> {
+    pub fn name(&self) -> &BorrowedSymbolName<'arena> {
         &self.name
     }
 
@@ -287,30 +288,32 @@ impl std::fmt::Debug for SymbolNode<'_, '_> {
     }
 }
 
-/// A symbol name.
+/// A generic symbol name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SymbolName<'data> {
-    name: &'data str,
+pub struct SymbolName<T: Deref<Target = str>> {
+    name: T,
     i386: bool,
 }
 
-impl<'data> SymbolName<'data> {
-    pub fn new(name: &'data str, i386: bool) -> SymbolName<'data> {
+impl<T: Deref<Target = str>> SymbolName<T> {
+    pub fn new(name: T, i386: bool) -> SymbolName<T> {
         Self { name, i386 }
     }
 
-    pub fn as_str(&self) -> &'data str {
-        self.name
+    /// Returns a [`SymbolNameDemangler`] for demangling the name of the symbol.
+    pub fn demangle(&self) -> SymbolNameDemangler<'_, T> {
+        SymbolNameDemangler(self)
     }
 
-    /// Returns a [`SymbolNameDemangler`] for demangling the name of the symbol.
-    pub fn demangle(&self) -> SymbolNameDemangler<'_, 'data> {
-        SymbolNameDemangler(self)
+    /// Returns a formatter for formatting the demangled symbol name with the
+    /// mangled name in quotes.
+    pub fn quoted_demangle(&self) -> QuotedSymbolNameDemangler<'_, T> {
+        QuotedSymbolNameDemangler(self)
     }
 
     /// Returns the symbol name but without the `__declspec(dllimport)` prefix
     /// if it exists.
-    pub fn strip_dllimport(&self) -> Option<&'data str> {
+    pub fn strip_dllimport(&self) -> Option<&str> {
         self.name.strip_prefix("__imp_")
     }
 
@@ -324,25 +327,54 @@ impl<'data> SymbolName<'data> {
     pub fn is_i386(&self) -> bool {
         self.i386
     }
+
+    /// Returns `true` if this is mangled C++ symbol.
+    pub fn is_cxx_mangled(&self) -> bool {
+        let name = self.name.trim_start_matches("__imp_");
+
+        #[cfg(windows)]
+        if name.starts_with('?') {
+            return true;
+        }
+
+        (self.is_i386() && name.starts_with("__Z")) || name.starts_with("_Z")
+    }
+
+    /// Converts the symbol name into an [`OwnedSymbolName`].
+    pub fn into_owned(&self) -> OwnedSymbolName {
+        SymbolName {
+            i386: self.i386,
+            name: self.name.to_owned(),
+        }
+    }
 }
 
-impl std::fmt::Display for SymbolName<'_> {
+impl<'a> SymbolName<&'a str> {
+    pub fn as_str(&self) -> &'a str {
+        self.name
+    }
+}
+
+impl<T: Deref<Target = str>> std::fmt::Display for SymbolName<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.name.fmt(f)
     }
 }
 
+pub type BorrowedSymbolName<'a> = SymbolName<&'a str>;
+pub type OwnedSymbolName = SymbolName<String>;
+
 /// Wrapper around a [`SymbolName`] for demangling the name string.
 #[derive(Debug, Clone, Copy)]
-pub struct SymbolNameDemangler<'a, 'data>(&'a SymbolName<'data>);
+pub struct SymbolNameDemangler<'a, T: Deref<Target = str>>(&'a SymbolName<T>);
 
-impl std::fmt::Display for SymbolNameDemangler<'_, '_> {
+impl<T: Deref<Target = str>> std::fmt::Display for SymbolNameDemangler<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let symbol_name = if let Some(unprefixed) = self.0.strip_dllimport() {
             write!(f, "__declspec(dllimport) ")?;
             unprefixed
         } else {
-            self.0.name
+            &self.0.name
         };
 
         #[cfg(windows)]
@@ -368,6 +400,21 @@ impl std::fmt::Display for SymbolNameDemangler<'_, '_> {
         }
 
         write!(f, "{symbol_name}")
+    }
+}
+
+/// Formatter for formatting a demangled [`SymbolName`] along with the mangled
+/// name in quotes
+pub struct QuotedSymbolNameDemangler<'a, T: Deref<Target = str>>(&'a SymbolName<T>);
+
+impl<T: Deref<Target = str>> std::fmt::Display for QuotedSymbolNameDemangler<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", SymbolNameDemangler(self.0))?;
+        if self.0.is_cxx_mangled() {
+            write!(f, " \"{}\"", self.0)?;
+        }
+
+        Ok(())
     }
 }
 
