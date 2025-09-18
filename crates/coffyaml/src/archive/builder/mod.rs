@@ -21,7 +21,11 @@ trait MemberSize {
 
     fn member_size(&self) -> usize {
         let size = std::mem::size_of::<object::archive::Header>() + self.member_data_size();
-        if size % 2 != 0 { size + 1 } else { size }
+        if !size.is_multiple_of(2) {
+            size + 1
+        } else {
+            size
+        }
     }
 }
 
@@ -121,7 +125,7 @@ impl ArchiveMemberBuilder {
     fn build(mut self) -> Vec<u8> {
         let mut buffer = make_archive_member_buffer(&self.name, &self.meta, &self);
         buffer.append(&mut self.data);
-        if buffer.len() % 2 != 0 {
+        if !buffer.len().is_multiple_of(2) {
             buffer.push(b'\n');
         }
 

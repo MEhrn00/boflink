@@ -81,7 +81,7 @@ impl<const DELIM: u8> ArchiveLongNamesBuilder<DELIM> {
         buffer.append(&mut self.longnames.into_vec());
 
         // Padding
-        if buffer.len() % 2 != 0 {
+        if !buffer.len().is_multiple_of(2) {
             buffer.push(b'\n');
         }
 
@@ -101,7 +101,11 @@ impl<const DELIM: u8> MemberSize for ArchiveLongNamesBuilder<DELIM> {
         }
 
         let size = std::mem::size_of::<object::archive::Header>() + self.member_data_size();
-        if size % 2 != 0 { size + 1 } else { size }
+        if !size.is_multiple_of(2) {
+            size + 1
+        } else {
+            size
+        }
     }
 }
 
@@ -228,7 +232,7 @@ mod tests {
 
         // The test name should have an even length
         assert!(
-            name.len() % 2 == 0,
+            name.len().is_multiple_of(2),
             "test string '{name}' length should be even"
         );
 
@@ -251,7 +255,7 @@ mod tests {
 
         // The test name should have an odd length
         assert!(
-            name.len() % 2 != 0,
+            !name.len().is_multiple_of(2),
             "test string '{name}' length should be odd"
         );
 

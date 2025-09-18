@@ -87,7 +87,7 @@ impl SortedArchiveMapBuilder {
         }
 
         // Padding
-        if buffer.len() % 2 != 0 {
+        if !buffer.len().is_multiple_of(2) {
             buffer.push(b'\n');
         }
 

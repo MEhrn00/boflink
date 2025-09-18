@@ -52,7 +52,7 @@ impl ArchiveMapBuilder {
         buffer.append(&mut self.string_table.into_vec());
 
         // Padding
-        if buffer.len() % 2 != 0 {
+        if !buffer.len().is_multiple_of(2) {
             buffer.push(b'\n');
         }
 
