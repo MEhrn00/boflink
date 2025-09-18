@@ -237,16 +237,16 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
 
         let mut drectve_queue: VecDeque<((&Path, &Path), &str)> = VecDeque::new();
 
-        let undefined_count = graph.undefined_symbols().count();
-        let mut symbol_search_buffer = VecDeque::with_capacity(undefined_count);
-        let mut undefined_symbols: IndexSet<&str> = IndexSet::with_capacity(undefined_count);
+        let resolve_count = graph.archive_resolvable_externals().count();
+        let mut symbol_search_buffer = VecDeque::with_capacity(resolve_count);
+        let mut undefined_symbols: IndexSet<&str> = IndexSet::with_capacity(resolve_count);
 
         // Resolve symbols
         loop {
             // Get the list of undefined symbols to search for
             symbol_search_buffer.extend(
                 graph
-                    .undefined_symbols()
+                    .archive_resolvable_externals()
                     .filter(|symbol| !undefined_symbols.contains(symbol)),
             );
 

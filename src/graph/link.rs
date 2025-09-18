@@ -15,7 +15,10 @@ use object::{
 };
 
 use crate::{
-    graph::node::SymbolName,
+    graph::{
+        edge::{TryFromWeakDefaultSearch, WeakDefaultEdgeWeight, WeakDefaultSearch},
+        node::{SymbolName, SymbolNodeType},
+    },
     linker::LinkerTargetArch,
     linkobject::import::{ImportMember, ImportName},
 };
@@ -85,6 +88,21 @@ pub enum LinkGraphAddError {
     MissingComdatAssociativeSection {
         symbol: String,
         associative_index: SectionIndex,
+    },
+
+    #[error(
+        "weak external symbol '{symbol}' auxiliary record tag index {tag_index} references an invalid symbol"
+    )]
+    WeakTagIndex {
+        symbol: String,
+        tag_index: SymbolIndex,
+    },
+
+    #[error("could not parse symbol '{symbol}' at table index {index}: {error}")]
+    WeakCharacteristics {
+        symbol: String,
+        index: SymbolIndex,
+        error: TryFromWeakDefaultSearch,
     },
 
     #[error("{0}")]
@@ -441,6 +459,8 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                         common_section.definitions().push_back(definition_edge);
                     } else if symbol.is_local() {
                         self.extraneous_symbols.push_back(graph_symbol);
+                    } else if coff_symbol.has_aux_weak_external() {
+                        self.cache.add_weak_external(symbol.index());
                     }
 
                     continue;
@@ -538,6 +558,43 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
             graph_section.definitions().push_back(definition_edge);
         }
 
+        for symbol_idx in self.cache.iter_weak_externals() {
+            let graph_symbol = self
+                .cache
+                .get_symbol(symbol_idx)
+                .unwrap_or_else(|| unreachable!());
+
+            let weak_aux = symbol_table
+                .aux_weak_external(symbol_idx)
+                .unwrap_or_else(|_| unreachable!());
+
+            let default_symbol = self
+                .cache
+                .get_symbol(weak_aux.default_symbol())
+                .ok_or_else(|| LinkGraphAddError::WeakTagIndex {
+                    symbol: graph_symbol.name().to_string(),
+                    tag_index: weak_aux.default_symbol(),
+                })?;
+
+            let weak_search =
+                WeakDefaultSearch::try_from(weak_aux.weak_search_type.get(object::LittleEndian))
+                    .map_err(|e| LinkGraphAddError::WeakCharacteristics {
+                        symbol: graph_symbol.name().to_string(),
+                        index: symbol_idx,
+                        error: e,
+                    })?;
+
+            let default_edge = self.arena.alloc_with(|| {
+                Edge::new(
+                    graph_symbol,
+                    default_symbol,
+                    WeakDefaultEdgeWeight::new(weak_search),
+                )
+            });
+
+            graph_symbol.weak_defaults().push_back(&*default_edge);
+        }
+
         for section in coff.sections() {
             let graph_section = self
                 .cache
@@ -605,11 +662,14 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
             .filter_map(|(name, symbol)| symbol.is_defined().then_some(*name))
     }
 
-    /// Returns an iterator over the names of the undefined symbols
-    pub fn undefined_symbols(&self) -> impl Iterator<Item = &'data str> + use<'_, 'data, 'arena> {
+    /// Returns an iterator over the names of the symbols which should be searched
+    /// during archive symbol resolution
+    pub fn archive_resolvable_externals(
+        &self,
+    ) -> impl Iterator<Item = &'data str> + use<'_, 'data, 'arena> {
         self.external_symbols
             .iter()
-            .filter_map(|(name, symbol)| symbol.is_undefined().then_some(*name))
+            .filter_map(|(name, symbol)| symbol.is_archive_visible().then_some(*name))
     }
 
     /// Associates `symbol` as an API imported symbol with metadata from the
@@ -792,7 +852,7 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
 
         let mut section_flags = String::new();
 
-        // Write out the section nodes and the neighboring symbol nodes.
+        // Write out the section nodes and neighboring static symbol nodes.
         for section in self
             .section_nodes
             .iter()
@@ -826,51 +886,56 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                 section_flags,
             )?;
 
-            for reloc in section.relocations().iter() {
-                let target_symbol = reloc.target();
+            for symbol in section
+                .relocations()
+                .iter()
+                .map(|edge| edge.target())
+                .chain(section.definitions().iter().map(|edge| edge.source()))
+                .filter(|symbol| !symbol.is_external())
+            {
                 let mut h = DefaultHasher::new();
-                std::ptr::hash(target_symbol, &mut h);
+                std::ptr::hash(symbol, &mut h);
                 let hid = h.finish();
 
                 if let hash_map::Entry::Vacant(e) = node_ids.entry(hid) {
                     let symbol_idx = idx_val;
                     idx_val += 1;
 
-                    write!(w, "{pad}{symbol_idx} [ label=\"{}\"", target_symbol.name())?;
-
-                    if target_symbol.is_undefined() || target_symbol.is_duplicate() {
-                        write!(w, " color=red")?;
-                    }
-
-                    writeln!(w, " ]")?;
-
+                    writeln!(w, "{pad}{symbol_idx} [ label=\"{}\" ]", symbol.name())?;
                     e.insert(symbol_idx);
                 }
             }
+        }
 
-            for definition in section.definitions().iter() {
-                let target_symbol = definition.source();
-                let mut h = DefaultHasher::new();
-                std::ptr::hash(target_symbol, &mut h);
-                let hid = h.finish();
-                if let hash_map::Entry::Vacant(e) = node_ids.entry(hid) {
-                    let symbol_idx = idx_val;
-                    idx_val += 1;
+        let mut weak_default_edges = LinkedList::new();
 
-                    write!(w, "{pad}{symbol_idx} [ label=\"{}\"", target_symbol.name())?;
+        // Write out external symbols.
+        for symbol in self.external_symbols.values().copied() {
+            let mut h = DefaultHasher::new();
+            std::ptr::hash(symbol, &mut h);
+            let hid = h.finish();
 
-                    if target_symbol.is_undefined()
-                        || target_symbol.is_duplicate()
-                        || target_symbol.is_multiply_defined()
-                    {
-                        write!(w, " color=red")?;
-                    }
+            if let hash_map::Entry::Vacant(e) = node_ids.entry(hid) {
+                let symbol_idx = idx_val;
+                idx_val += 1;
 
-                    writeln!(w, " ]")?;
+                write!(w, "{pad}{symbol_idx} [ label=\"{}\"", symbol.name())?;
 
-                    e.insert(symbol_idx);
+                if !(matches!(symbol.typ(), SymbolNodeType::Absolute(_))
+                    || matches!(symbol.typ(), SymbolNodeType::Debug))
+                    && (symbol.is_undefined()
+                        || symbol.is_duplicate()
+                        || symbol.is_multiply_defined())
+                {
+                    write!(w, " color=red")?;
                 }
+
+                writeln!(w, " ]")?;
+
+                e.insert(symbol_idx);
             }
+
+            weak_default_edges.extend(symbol.weak_defaults().iter());
         }
 
         // Write out unreferenced extraneous symbols.
@@ -992,6 +1057,27 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                     "{pad}{section_idx} -> {target_idx} [ label=\"associative\" ]"
                 )?;
             }
+        }
+
+        // Write out weak external default edges.
+        for weak_edge in weak_default_edges {
+            let source_symbol = weak_edge.source();
+            let mut h = DefaultHasher::new();
+            std::ptr::hash(source_symbol, &mut h);
+            let hid = h.finish();
+            let source_idx = node_ids.get(&hid).copied().unwrap();
+
+            let target_symbol = weak_edge.target();
+            let mut h = DefaultHasher::new();
+            std::ptr::hash(target_symbol, &mut h);
+            let hid = h.finish();
+            let target_idx = node_ids.get(&hid).copied().unwrap();
+
+            writeln!(
+                w,
+                "{pad}{source_idx} -> {target_idx} [ label=\"weak default ({:?})\" ]",
+                weak_edge.weight().search()
+            )?;
         }
 
         // Write out API import edges.

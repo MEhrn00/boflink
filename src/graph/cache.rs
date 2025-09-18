@@ -21,6 +21,9 @@ pub struct LinkGraphCache<'arena, 'data> {
 
     /// Cached selection and section symbol values for COMDAT symbols.
     comdat_selections: HashMap<SectionIndex, ComdatSelection>,
+
+    /// List of symbols with weak external auxiliary records.
+    weak_symbols: Vec<SymbolIndex>,
 }
 
 impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
@@ -31,6 +34,7 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
             sections: HashMap::new(),
             comdat_selections: HashMap::new(),
             code_sections: IndexMap::new(),
+            weak_symbols: Vec::new(),
         }
     }
 
@@ -41,6 +45,7 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
             sections: HashMap::with_capacity(sections),
             code_sections: IndexMap::new(),
             comdat_selections: HashMap::new(),
+            weak_symbols: Vec::new(),
         }
     }
 
@@ -50,6 +55,7 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
         self.sections.clear();
         self.comdat_selections.clear();
         self.code_sections.clear();
+        self.weak_symbols.clear();
     }
 
     #[inline]
@@ -95,6 +101,10 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
         let _ = self.code_sections.insert(idx, section);
     }
 
+    pub fn add_weak_external(&mut self, idx: SymbolIndex) {
+        self.weak_symbols.push(idx);
+    }
+
     #[inline]
     pub fn get_symbol(&self, idx: SymbolIndex) -> Option<&'arena SymbolNode<'arena, 'data>> {
         self.symbols.get(&idx).copied()
@@ -113,5 +123,9 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
     #[inline]
     pub fn iter_code_sections(&self) -> impl Iterator<Item = &'arena SectionNode<'arena, 'data>> {
         self.code_sections.values().copied()
+    }
+
+    pub fn iter_weak_externals(&self) -> impl Iterator<Item = SymbolIndex> {
+        self.weak_symbols.iter().copied()
     }
 }

@@ -173,65 +173,79 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
             let mut reloc_count = 0usize;
 
             for section_node in &output_section.nodes {
-                for reloc in section_node.relocations() {
+                'next_reloc: for reloc in section_node.relocations() {
                     let symbol = reloc.target();
+                    let mut definition_count = 0usize;
 
-                    // Relocation to an imported or undefined symbol.
-                    if symbol.definitions().is_empty() && symbol.imports().is_empty() {
-                        local_undefined.insert(symbol.name().as_str(), symbol);
-                    } else if let Some(definition) = symbol
+                    for definition in symbol
                         .definitions()
                         .iter()
-                        .find(|definition| !definition.target().is_discarded())
+                        .chain(symbol.weak_default_definitions())
                     {
-                        let target_section = definition.target();
+                        definition_count += 1;
 
-                        if output_section
+                        if definition.target().is_discarded() {
+                            continue;
+                        }
+
+                        let target_section = definition.target();
+                        if !output_section
                             .nodes
                             .iter()
                             .any(|section| std::ptr::eq(*section, target_section))
                         {
-                            continue;
+                            reloc_count += 1;
                         }
-                    } else if symbol.imports().is_empty() {
-                        // Symbol has no imports and all definitions are in
-                        // discarded sections. Return an error.
 
-                        let coff_name = section_node.coff().to_string();
-
-                        let symbol_defs = BTreeMap::from_iter(
-                            section_node.definitions().iter().filter_map(|definition| {
-                                let ref_symbol = definition.source();
-                                if ref_symbol.is_section_symbol() || ref_symbol.is_label() {
-                                    None
-                                } else {
-                                    Some((definition.weight().address(), ref_symbol.name()))
-                                }
-                            }),
-                        );
-
-                        if let Some(reference_symbol) =
-                            symbol_defs.range(0..=reloc.weight().address()).next_back()
-                        {
-                            return Err(LinkGraphLinkError::DiscardedSection {
-                                coff_name,
-                                reference: reference_symbol.1.demangle().to_string(),
-                                symbol: symbol.name().demangle().to_string(),
-                            });
-                        } else {
-                            return Err(LinkGraphLinkError::DiscardedSection {
-                                coff_name,
-                                reference: format!(
-                                    "{}+{:#x}",
-                                    section_node.name(),
-                                    reloc.weight().address()
-                                ),
-                                symbol: symbol.name().demangle().to_string(),
-                            });
-                        }
+                        continue 'next_reloc;
                     }
 
-                    reloc_count += 1;
+                    // Relocation to an imported or undefined symbol.
+                    if !symbol.imports().is_empty() || definition_count == 0 {
+                        // Local undefined symbol
+                        if symbol.imports().is_empty() {
+                            local_undefined.insert(symbol.name().as_str(), symbol);
+                        }
+
+                        reloc_count += 1;
+                        continue;
+                    }
+
+                    // Symbol has no imports and all definitions are in
+                    // discarded sections. Return an error.
+
+                    let coff_name = section_node.coff().to_string();
+
+                    let symbol_defs = BTreeMap::from_iter(
+                        section_node.definitions().iter().filter_map(|definition| {
+                            let ref_symbol = definition.source();
+                            if ref_symbol.is_section_symbol() || ref_symbol.is_label() {
+                                None
+                            } else {
+                                Some((definition.weight().address(), ref_symbol.name()))
+                            }
+                        }),
+                    );
+
+                    if let Some(reference_symbol) =
+                        symbol_defs.range(0..=reloc.weight().address()).next_back()
+                    {
+                        return Err(LinkGraphLinkError::DiscardedSection {
+                            coff_name,
+                            reference: reference_symbol.1.demangle().to_string(),
+                            symbol: symbol.name().demangle().to_string(),
+                        });
+                    }
+
+                    return Err(LinkGraphLinkError::DiscardedSection {
+                        coff_name,
+                        reference: format!(
+                            "{}+{:#x}",
+                            section_node.name(),
+                            reloc.weight().address()
+                        ),
+                        symbol: symbol.name().demangle().to_string(),
+                    });
                 }
             }
 
@@ -435,29 +449,31 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
             for section_node in &output_section.nodes {
                 for reloc in section_node.relocations() {
                     let target_symbol = reloc.target();
+                    let mut linked_symbol = target_symbol;
 
-                    if let Some(symbol_definition) = target_symbol
+                    if let Some(definition) = target_symbol
                         .definitions()
                         .iter()
+                        .chain(target_symbol.weak_default_definitions())
                         .find(|definition| !definition.target().is_discarded())
                     {
-                        let target_section = symbol_definition.target();
-
                         if output_section
                             .nodes
                             .iter()
-                            .any(|section| std::ptr::eq(*section, target_section))
+                            .any(|section| std::ptr::eq(*section, definition.target()))
                         {
                             continue;
                         }
+
+                        linked_symbol = definition.source();
                     }
 
                     coff_writer.write_relocation(Relocation {
                         virtual_address: section_node.virtual_address() + reloc.weight().address(),
-                        symbol: target_symbol.table_index().unwrap_or_else(|| {
+                        symbol: linked_symbol.table_index().unwrap_or_else(|| {
                             panic!(
                                 "symbol {} was never assigned a symbol table index",
-                                target_symbol.name().demangle()
+                                linked_symbol.name().demangle()
                             )
                         }),
                         typ: reloc.weight().typ(),
@@ -596,6 +612,7 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
                     let symbol_definition = match target_symbol
                         .definitions()
                         .iter()
+                        .chain(target_symbol.weak_default_definitions())
                         .find(|definition| !definition.target().is_discarded())
                     {
                         Some(definition) => definition,

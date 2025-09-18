@@ -9,6 +9,8 @@ use num_enum::{IntoPrimitive, TryFromPrimitive};
 use object::pe::{
     IMAGE_COMDAT_SELECT_ANY, IMAGE_COMDAT_SELECT_ASSOCIATIVE, IMAGE_COMDAT_SELECT_EXACT_MATCH,
     IMAGE_COMDAT_SELECT_LARGEST, IMAGE_COMDAT_SELECT_NODUPLICATES, IMAGE_COMDAT_SELECT_SAME_SIZE,
+    IMAGE_WEAK_EXTERN_SEARCH_ALIAS, IMAGE_WEAK_EXTERN_SEARCH_LIBRARY,
+    IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY,
 };
 
 pub trait EdgeListTraversal: SealedTrait {}
@@ -408,6 +410,42 @@ pub type AssociativeEdge<'arena, 'data> = Edge<
     SectionNode<'arena, 'data>,
     AssociativeSectionEdgeWeight,
 >;
+
+#[derive(Debug, Copy, Clone, thiserror::Error)]
+#[error("invalid weak external auxiliary record characteristics ({0})")]
+pub struct TryFromWeakDefaultSearch(u32);
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
+#[num_enum(
+    error_type(
+        name = TryFromWeakDefaultSearch,
+        constructor = TryFromWeakDefaultSearch,
+    )
+)]
+#[repr(u32)]
+pub enum WeakDefaultSearch {
+    NoLibrary = IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY,
+    Library = IMAGE_WEAK_EXTERN_SEARCH_LIBRARY,
+    Alias = IMAGE_WEAK_EXTERN_SEARCH_ALIAS,
+}
+
+/// The weight for an edge to a weak symbol's default definition.
+pub struct WeakDefaultEdgeWeight {
+    search: WeakDefaultSearch,
+}
+
+impl WeakDefaultEdgeWeight {
+    pub fn new(search: WeakDefaultSearch) -> WeakDefaultEdgeWeight {
+        Self { search }
+    }
+
+    pub fn search(&self) -> WeakDefaultSearch {
+        self.search
+    }
+}
+
+pub type WeakDefaultEdge<'arena, 'data> =
+    Edge<'arena, SymbolNode<'arena, 'data>, SymbolNode<'arena, 'data>, WeakDefaultEdgeWeight>;
 
 mod __private {
     pub trait SealedTrait {}
