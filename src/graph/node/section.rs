@@ -388,17 +388,24 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
     /// connection
     /// - section node -> associative edge -> section node
     ///
-    /// Or a "next-hop" connection through a symbol node
+    /// A "next-hop" connection through a symbol node
     /// - section node -> relocation edge -> symbol node -> definition edge -> section node.
+    ///
+    /// A "next-hop" connection through a symbol's weak default definition
+    /// - "section node" -> relocation edge -> symbol node -> weak default edge
+    ///   -> symbol node -> section node.
     pub fn adjacent_sections(&self) -> impl Iterator<Item = &'arena SectionNode<'arena, 'data>> {
         self.associative_edges()
             .iter()
             .map(|associative_edge| associative_edge.target())
             .chain(self.relocations().iter().flat_map(|relocation_edge| {
-                relocation_edge
-                    .target()
+                let symbol = relocation_edge.target();
+
+                symbol
                     .definitions()
                     .iter()
+                    .chain(symbol.weak_default_definitions())
+                    .take(1)
                     .map(|definition_edge| definition_edge.target())
             }))
     }

@@ -23,7 +23,7 @@ use object::{
 
 use crate::graph::edge::{
     ComdatSelection, DefinitionEdge, EdgeList, EdgeListIter, ImportEdge, IncomingEdges,
-    OutgoingEdges, RelocationEdge,
+    OutgoingEdges, RelocationEdge, WeakDefaultEdge, WeakDefaultSearch,
 };
 
 use super::{SectionNode, SectionType};
@@ -48,6 +48,9 @@ pub struct SymbolNode<'arena, 'data> {
 
     /// The incoming relocation edges for this symbol.
     relocation_edges: EdgeList<'arena, RelocationEdge<'arena, 'data>, IncomingEdges>,
+
+    /// The list of outgoing weak external default edges for this symbol.
+    weak_default_edges: EdgeList<'arena, WeakDefaultEdge<'arena, 'data>, OutgoingEdges>,
 
     /// The symbol table index when inserted into the output COFF.
     table_index: OnceCell<u32>,
@@ -80,6 +83,7 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
             definition_edges: EdgeList::new(),
             import_edges: EdgeList::new(),
             relocation_edges: EdgeList::new(),
+            weak_default_edges: EdgeList::new(),
             table_index: OnceCell::new(),
             output_name: OnceCell::new(),
             name: name.into(),
@@ -97,6 +101,7 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
             definition_edges: EdgeList::new(),
             import_edges: EdgeList::new(),
             relocation_edges: EdgeList::new(),
+            weak_default_edges: EdgeList::new(),
             table_index: OnceCell::new(),
             output_name: OnceCell::new(),
             name: name.into(),
@@ -133,6 +138,24 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
         &self.import_edges
     }
 
+    /// Returns the list of adjacent outgoing weak external default edges for
+    /// this symbol.
+    pub fn weak_defaults(
+        &self,
+    ) -> &EdgeList<'arena, WeakDefaultEdge<'arena, 'data>, OutgoingEdges> {
+        &self.weak_default_edges
+    }
+
+    /// Returns an iterator over the definition edges associated with weak default
+    /// symbols.
+    pub fn weak_default_definitions(
+        &self,
+    ) -> impl Iterator<Item = &'arena DefinitionEdge<'arena, 'data>> {
+        self.weak_default_edges
+            .iter()
+            .flat_map(|edge| edge.target().definitions().iter())
+    }
+
     /// Returns the name of the symbol.
     pub fn name(&self) -> &BorrowedSymbolName<'arena> {
         &self.name
@@ -148,6 +171,12 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     #[inline]
     pub fn is_section_symbol(&self) -> bool {
         self.section
+    }
+
+    /// Returns `true` if this symbol is externally visible.
+    pub fn is_external(&self) -> bool {
+        self.storage_class == SymbolNodeStorageClass::External
+            || self.storage_class == SymbolNodeStorageClass::WeakExternal
     }
 
     /// Returns `true` if this symbol is a label.
@@ -182,14 +211,31 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
                 .all(|reloc| reloc.source().is_discarded())
     }
 
-    /// Returns `true` if this symbol is undefined.
-    pub fn is_undefined(&self) -> bool {
-        self.imports().is_empty() && self.definitions().is_empty()
+    /// Returns `true` if this symbol has a strong definition.
+    ///
+    /// A strongly defined symbol is a symbol that has at least one definition
+    /// or import edge.
+    pub fn is_strong_defined(&self) -> bool {
+        !self.definitions().is_empty() || !self.imports().is_empty()
     }
 
-    /// Returns `true` if this symbol is defined.
+    /// Returns `true` if this symbol has a weak definition.
+    ///
+    /// A weakly defined symbol is a weak symbol with an associated default
+    /// symbol that is strongly defined.
+    pub fn is_weak_defined(&self) -> bool {
+        self.weak_default_definitions().next().is_some()
+    }
+
+    /// Returns `true` if this symbol is either [`SymbolNode::is_strong_defined()`]
+    /// or [`SymbolNode::is_weakly_defined()`].
     pub fn is_defined(&self) -> bool {
-        !self.is_undefined()
+        self.is_strong_defined() || self.is_weak_defined()
+    }
+
+    /// Returns `true` if this symbol is not defined.
+    pub fn is_undefined(&self) -> bool {
+        !self.is_defined()
     }
 
     /// Returns `true` if this symbol has multiple non-COMDAT definitions.
@@ -238,6 +284,45 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
         (noduplicates && self.definitions().len() > 1)
             || (samesize && sizes.len() > 1)
             || (exact_match && checksums.len() > 1)
+    }
+
+    /// Returns `true` if this symbol is a weak symbol.
+    pub fn is_weak(&self) -> bool {
+        !self.weak_default_edges.is_empty()
+    }
+
+    /// Returns `true` if this symbol should be visible during archive searches.
+    ///
+    /// An archive visible symbol is a symbol that is external ([`SymbolNode::is_external()`])
+    /// and undefined (see [`SymbolNode::is_undefined()`]).
+    ///
+    /// If this is a weak undefined symbol, it will be visible if any of the
+    /// [`SymbolNode::weak_defaults()`] have a search characteristic value of
+    /// [`WeakDefaultSearch::Library`].
+    pub fn is_archive_visible(&self) -> bool {
+        if !self.is_external() {
+            return false;
+        }
+
+        if self.is_strong_defined() {
+            return false;
+        }
+
+        if !self.is_weak() {
+            return true;
+        }
+
+        let mut has_weak_library_search = false;
+
+        for weak_edge in self.weak_defaults() {
+            if weak_edge.target().is_strong_defined() {
+                return false;
+            } else if weak_edge.weight().search() == WeakDefaultSearch::Library {
+                has_weak_library_search = true;
+            }
+        }
+
+        has_weak_library_search
     }
 
     /// Returns the type associated with this symbol.
