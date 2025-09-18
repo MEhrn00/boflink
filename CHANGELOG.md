@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2025-09-18
+
+### Added
+
+- Support for handling COFF `IMAGE_SYM_CLASS_WEAK_EXTERNAL` symbols (#30).
+
+### Changed
+
+- Demangled C++ symbols in log messages also include the mangled name (1ef0007).
+
 ## [0.4.0] - 2025-07-14
 
 ### Fixed
@@ -72,7 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release
 
-[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.4.0...HEAD
+[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/MEhrn00/boflink/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MEhrn00/boflink/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/MEhrn00/boflink/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/MEhrn00/boflink/compare/v0.2.0...v0.3.0
