@@ -178,7 +178,7 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
 
         // Add COFFs
         for (coff_path, coff) in &input_processor.coffs {
-            for library_name in drectve::parse_drectve_libraries_normalized(coff)
+            for library_name in drectve::parse_defaultlibs_normalized(coff)
                 .into_iter()
                 .flatten()
             {
@@ -339,10 +339,9 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
                         LinkArchiveMemberVariant::Coff(coff) => {
                             // Add any .drectve link libraries from linked in COFFs
                             // to the drectve queue
-                            for drectve_library in
-                                drectve::parse_drectve_libraries_normalized(&coff)
-                                    .into_iter()
-                                    .flatten()
+                            for drectve_library in drectve::parse_defaultlibs_normalized(&coff)
+                                .into_iter()
+                                .flatten()
                             {
                                 if !input_processor
                                     .opened_library_names
