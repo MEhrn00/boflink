@@ -477,11 +477,12 @@ impl<T: Deref<Target = str>> std::fmt::Display for SymbolNameDemangler<'_, T> {
             }
         }
 
-        if (self.0.is_i386() && symbol_name.starts_with("__Z")) || symbol_name.starts_with("_Z") {
-            if let Ok(demangled) = cpp_demangle::Symbol::new(symbol_name) {
-                write!(f, "{demangled}")?;
-                return Ok(());
-            }
+        if ((self.0.is_i386() && symbol_name.starts_with("__Z")) || symbol_name.starts_with("_Z"))
+            && let Ok(cpp_symbol) = cpp_demangle::Symbol::new(symbol_name)
+            && let Ok(demangled) = cpp_symbol.demangle()
+        {
+            write!(f, "{demangled}")?;
+            return Ok(());
         }
 
         write!(f, "{symbol_name}")
