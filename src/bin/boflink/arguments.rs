@@ -292,25 +292,6 @@ impl From<TargetEmulation> for LinkerTargetArch {
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DumpGraphState {
-    #[value(name = "linked")]
-    Linked,
-
-    #[value(name = "merged")]
-    Merged,
-}
-
-impl std::fmt::Display for DumpGraphState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(v) = self.to_possible_value() {
-            write!(f, "{}", v.get_name())?
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorOption {
     #[value(name = "never")]
     Never,
