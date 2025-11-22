@@ -3,7 +3,7 @@ use std::{borrow::Cow, io::ErrorKind, path::PathBuf};
 use indexmap::IndexSet;
 use log::debug;
 
-use crate::pathed_item::PathedItem;
+use crate::linker::PathedItem;
 
 pub trait LibraryFind {
     fn find_library(&self, name: impl AsRef<str>) -> Result<FoundLibrary, LibsearchError>;
