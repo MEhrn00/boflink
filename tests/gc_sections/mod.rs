@@ -1,4 +1,4 @@
-use boflink::linker::{LinkerTargetArch, error::LinkError};
+use boflink::linker::{LinkError, LinkerTargetArch};
 
 use crate::setup_linker;
 

@@ -6,7 +6,7 @@ use log::{debug, error, info};
 
 use boflink::{
     libsearch::LibrarySearcher,
-    linker::{LinkerBuilder, error::LinkError},
+    linker::{LinkError, LinkerBuilder},
 };
 
 mod arguments;

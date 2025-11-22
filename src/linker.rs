@@ -6,28 +6,664 @@ use std::{
 
 use indexmap::{IndexMap, IndexSet};
 use log::warn;
-use object::{Object, ObjectSymbol, coff::CoffFile};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+use object::{
+    Object, ObjectSymbol,
+    coff::CoffFile,
+    pe::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386},
+};
 use typed_arena::Arena;
 
 use crate::{
-    api::ApiSymbols,
+    api::{ApiSymbols, ApiSymbolsError},
     drectve,
-    graph::SpecLinkGraph,
-    libsearch::LibraryFind,
-    linker::error::{DrectveLibsearchError, LinkerSymbolErrors},
+    graph::{
+        LinkGraphAddError, LinkGraphLinkError, SpecLinkGraph, SymbolError,
+        node::{OwnedSymbolName, SymbolNode},
+    },
+    libsearch::{LibraryFind, LibrarySearcher, LibsearchError},
     linkobject::archive::{
-        ArchiveMemberError, ExtractSymbolError, LinkArchive, LinkArchiveMemberVariant,
+        ArchiveMemberError, ArchiveParseError, ExtractSymbolError, LinkArchive,
+        LinkArchiveMemberVariant, LinkArchiveParseError, MemberParseErrorKind,
     },
     pathed_item::PathedItem,
 };
 
-use super::{
-    LinkImpl, LinkInput, LinkInputItem, LinkerBuilder, LinkerTargetArch,
-    error::{
-        ApiSetupError, LinkError, LinkerPathErrorKind, LinkerSetupError, LinkerSetupErrors,
-        LinkerSetupPathError,
+pub trait LinkImpl {
+    fn link(&mut self) -> Result<Vec<u8>, LinkError>;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
+#[repr(u16)]
+pub enum LinkerTargetArch {
+    Amd64 = IMAGE_FILE_MACHINE_AMD64,
+    I386 = IMAGE_FILE_MACHINE_I386,
+}
+
+impl From<LinkerTargetArch> for object::Architecture {
+    fn from(value: LinkerTargetArch) -> Self {
+        match value {
+            LinkerTargetArch::Amd64 => object::Architecture::X86_64,
+            LinkerTargetArch::I386 => object::Architecture::I386,
+        }
+    }
+}
+
+impl TryFrom<object::Architecture> for LinkerTargetArch {
+    type Error = object::Architecture;
+
+    fn try_from(value: object::Architecture) -> Result<Self, Self::Error> {
+        Ok(match value {
+            object::Architecture::X86_64 => Self::Amd64,
+            object::Architecture::I386 => Self::I386,
+            _ => return Err(value),
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LinkError {
+    #[error("{0}")]
+    Setup(LinkerSetupErrors),
+
+    #[error("{0}")]
+    Symbol(LinkerSymbolErrors),
+
+    #[error("{0}")]
+    Graph(#[from] LinkGraphLinkError),
+
+    #[error("--gc-sections requires a defined --entry symbol or set of GC roots")]
+    EmptyGcRoots,
+
+    #[error("no input files")]
+    NoInput,
+
+    #[error("could not detect architecture")]
+    ArchitectureDetect,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{}", display_vec(.0))]
+pub struct LinkerSetupErrors(pub(super) Vec<LinkerSetupError>);
+
+impl LinkerSetupErrors {
+    pub fn errors(&self) -> &[LinkerSetupError] {
+        &self.0
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LinkerSetupError {
+    #[error("{0}")]
+    Path(LinkerSetupPathError),
+
+    #[error("{0}")]
+    Library(LibsearchError),
+
+    #[error("{0}")]
+    Api(ApiSetupError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApiSetupError {
+    #[error("{}: could not open custom API: {error}", .path.display())]
+    Io {
+        path: PathBuf,
+        error: std::io::Error,
     },
-};
+
+    #[error("unable to find custom API '{0}'")]
+    NotFound(String),
+
+    #[error("{}: {error}", .path.display())]
+    Parse {
+        path: PathBuf,
+        error: LinkArchiveParseError,
+    },
+
+    #[error("{}: {error}", .path.display())]
+    ApiSymbols {
+        path: PathBuf,
+        error: ApiSymbolsError,
+    },
+}
+
+impl From<LibsearchError> for ApiSetupError {
+    fn from(value: LibsearchError) -> Self {
+        match value {
+            LibsearchError::NotFound(name) => Self::NotFound(name),
+            LibsearchError::Io { path, error } => Self::Io { path, error },
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{}{}: {error}",
+    .path.display(),
+    .member.as_ref().map(|p| format!("({})", p.display())).unwrap_or_default()
+)]
+pub struct LinkerSetupPathError {
+    pub path: PathBuf,
+    pub member: Option<PathBuf>,
+    pub error: LinkerPathErrorKind,
+}
+
+impl LinkerSetupPathError {
+    pub fn new<P: Into<PathBuf>>(
+        path: impl Into<PathBuf>,
+        member: Option<P>,
+        error: impl Into<LinkerPathErrorKind>,
+    ) -> LinkerSetupPathError {
+        Self {
+            path: path.into(),
+            member: member.map(Into::into),
+            error: error.into(),
+        }
+    }
+
+    pub fn nomember(
+        path: impl Into<PathBuf>,
+        error: impl Into<LinkerPathErrorKind>,
+    ) -> LinkerSetupPathError {
+        Self {
+            path: path.into(),
+            member: None,
+            error: error.into(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LinkerPathErrorKind {
+    #[error("{0}")]
+    DrectveLibrary(#[from] DrectveLibsearchError),
+
+    #[error("{0}")]
+    LinkArchive(#[from] LinkArchiveParseError),
+
+    #[error("{0}")]
+    ArchiveParse(#[from] ArchiveParseError),
+
+    #[error("{0}")]
+    ArchiveMember(#[from] MemberParseErrorKind),
+
+    #[error("{0}")]
+    GraphAdd(#[from] LinkGraphAddError),
+
+    #[error("{0}")]
+    Object(#[from] object::Error),
+
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DrectveLibsearchError {
+    #[error("unable to find library {0}")]
+    NotFound(String),
+
+    #[error("could not open link library {}: {error}", .path.display())]
+    Io {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+}
+
+impl From<LibsearchError> for DrectveLibsearchError {
+    fn from(value: LibsearchError) -> Self {
+        match value {
+            LibsearchError::Io { path, error } => Self::Io { path, error },
+            LibsearchError::NotFound(name) => Self::NotFound(name),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{}", display_vec(.0))]
+pub struct LinkerSymbolErrors(pub(super) Vec<LinkerSymbolError>);
+
+impl LinkerSymbolErrors {
+    pub fn errors(&self) -> &[LinkerSymbolError] {
+        &self.0
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{kind}: {}{}", .name.quoted_demangle(), .display_demangled_context(kind))]
+pub struct LinkerSymbolError {
+    pub name: OwnedSymbolName,
+    pub kind: LinkerSymbolErrorKind,
+}
+
+impl From<SymbolError<'_, '_>> for LinkerSymbolError {
+    fn from(value: SymbolError<'_, '_>) -> Self {
+        match value {
+            SymbolError::Duplicate(duplicate_error) => {
+                let symbol = duplicate_error.symbol();
+
+                Self {
+                    name: symbol.name().into_owned(),
+                    kind: LinkerSymbolErrorKind::Duplicate(SymbolDefinitionsContext::new(symbol)),
+                }
+            }
+            SymbolError::Undefined(undefined_error) => {
+                let symbol = undefined_error.symbol();
+
+                Self {
+                    name: symbol.name().into_owned(),
+                    kind: LinkerSymbolErrorKind::Undefined(SymbolReferencesContext::new(symbol)),
+                }
+            }
+            SymbolError::MultiplyDefined(multiply_defined_error) => {
+                let symbol = multiply_defined_error.symbol();
+
+                Self {
+                    name: symbol.name().into_owned(),
+                    kind: LinkerSymbolErrorKind::MultiplyDefined(SymbolDefinitionsContext::new(
+                        symbol,
+                    )),
+                }
+            }
+        }
+    }
+}
+
+fn display_demangled_context(kind: &LinkerSymbolErrorKind) -> String {
+    if !kind.context_is_empty() {
+        format!("\n{}", kind.display_context())
+    } else {
+        Default::default()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LinkerSymbolErrorKind {
+    #[error("duplicate symbol")]
+    Duplicate(SymbolDefinitionsContext),
+
+    #[error("undefined symbol")]
+    Undefined(SymbolReferencesContext),
+
+    #[error("multiply defined symbol")]
+    MultiplyDefined(SymbolDefinitionsContext),
+}
+
+impl LinkerSymbolErrorKind {
+    pub fn display_context(&self) -> &dyn std::fmt::Display {
+        match self {
+            LinkerSymbolErrorKind::Duplicate(ctx) => ctx as &dyn std::fmt::Display,
+            LinkerSymbolErrorKind::Undefined(ctx) => ctx as &dyn std::fmt::Display,
+            LinkerSymbolErrorKind::MultiplyDefined(ctx) => ctx as &dyn std::fmt::Display,
+        }
+    }
+
+    pub fn context_is_empty(&self) -> bool {
+        match self {
+            LinkerSymbolErrorKind::Duplicate(ctx) => ctx.definitions.is_empty(),
+            LinkerSymbolErrorKind::Undefined(ctx) => ctx.references.is_empty(),
+            LinkerSymbolErrorKind::MultiplyDefined(ctx) => ctx.definitions.is_empty(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{}{}",
+    display_vec(.definitions),
+    display_remaining_definitions(.remaining)
+)]
+pub struct SymbolDefinitionsContext {
+    pub definitions: Vec<SymbolDefinition>,
+    pub remaining: usize,
+}
+
+impl SymbolDefinitionsContext {
+    pub fn new(symbol: &SymbolNode<'_, '_>) -> SymbolDefinitionsContext {
+        let mut definition_iter = symbol.definitions().iter();
+        let mut definitions = Vec::with_capacity(5);
+
+        for definition in definition_iter.by_ref().take(5) {
+            definitions.push(SymbolDefinition {
+                coff_path: definition.target().coff().to_string(),
+            });
+        }
+
+        let remaining = definition_iter.count();
+        Self {
+            definitions,
+            remaining,
+        }
+    }
+}
+
+fn display_remaining_definitions(remaining: &usize) -> String {
+    if *remaining != 0 {
+        format!("\n>>> defined {remaining} more times")
+    } else {
+        Default::default()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(">>> defined at {coff_path}")]
+pub struct SymbolDefinition {
+    pub coff_path: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{}{}",
+    display_vec(.references),
+    display_remaining_references(.remaining),
+)]
+pub struct SymbolReferencesContext {
+    pub references: Vec<SymbolReference>,
+    pub remaining: usize,
+}
+
+impl SymbolReferencesContext {
+    pub fn new(symbol: &SymbolNode<'_, '_>) -> SymbolReferencesContext {
+        let mut reference_iter = symbol.symbol_references().peekable();
+
+        let mut references = Vec::with_capacity(5);
+
+        while references.len() < 5 {
+            let reference = match reference_iter.next() {
+                Some(reference) => reference,
+                None => break,
+            };
+
+            let reloc = reference.relocation();
+            let section = reference.section();
+            let coff = section.coff();
+
+            if reference.source_symbol().is_section_symbol() {
+                if reference_iter.peek().is_some_and(|next_reference| {
+                    next_reference.source_symbol().is_section_symbol()
+                }) {
+                    references.push(SymbolReference {
+                        coff_path: coff.to_string(),
+                        reference: format!("{}+{:#x}", section.name(), reloc.weight().address()),
+                    });
+                }
+            } else {
+                references.push(SymbolReference {
+                    coff_path: coff.to_string(),
+                    reference: reference
+                        .source_symbol()
+                        .name()
+                        .quoted_demangle()
+                        .to_string(),
+                });
+            }
+        }
+
+        SymbolReferencesContext {
+            remaining: symbol.references().len().saturating_sub(references.len()),
+            references,
+        }
+    }
+}
+
+fn display_remaining_references(remaining: &usize) -> String {
+    if *remaining != 0 {
+        format!("\n>>> referenced {remaining} more times")
+    } else {
+        Default::default()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(">>> referenced by {coff_path}:({reference})")]
+pub struct SymbolReference {
+    pub coff_path: String,
+    pub reference: String,
+}
+
+struct DisplayVec<'a, T: std::fmt::Display>(&'a Vec<T>);
+
+impl<'a, T: std::fmt::Display> std::fmt::Display for DisplayVec<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut value_iter = self.0.iter();
+
+        let first_value = match value_iter.next() {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+
+        first_value.fmt(f)?;
+
+        for val in value_iter {
+            write!(f, "\n{val}")?;
+        }
+
+        Ok(())
+    }
+}
+
+fn display_vec<T: std::fmt::Display>(errors: &Vec<T>) -> DisplayVec<'_, T> {
+    DisplayVec(errors)
+}
+
+/// The linker input types.
+#[derive(PartialEq, Eq, Hash)]
+pub(crate) enum LinkInput {
+    /// A file path passed on the command line.
+    File(PathBuf),
+
+    /// A link library passed on the command line.
+    Library(String),
+}
+
+/// The input attributes.
+#[derive(Default)]
+pub(crate) struct LinkInputItem {
+    /// An already opened buffer associated with the input.
+    pub buffer: Option<Vec<u8>>,
+
+    /// If the input is a static archive, include all the members as inputs
+    pub whole: bool,
+}
+
+/// Sets up inputs and configures a [`super::Linker`].
+#[derive(Default)]
+pub struct LinkerBuilder<L: LibraryFind + 'static> {
+    /// The target architecture.
+    pub(super) target_arch: Option<LinkerTargetArch>,
+
+    /// The ordered link inputs and attributes.
+    pub(super) inputs: IndexMap<LinkInput, LinkInputItem>,
+
+    /// The name of the entrypoint symbol.
+    pub(super) entrypoint: Option<String>,
+
+    /// The custom BOF API library.
+    pub(super) custom_api: Option<String>,
+
+    /// Whether to merge the .bss section with the .data section.
+    pub(super) merge_bss: bool,
+
+    /// Merge grouped sections.
+    pub(super) merge_grouped_sections: bool,
+
+    /// Searcher for finding link libraries.
+    pub(super) library_searcher: Option<L>,
+
+    /// Output path for dumping the link graph.
+    pub(super) link_graph_output: Option<PathBuf>,
+
+    /// Perform GC sections.
+    pub(super) gc_sections: bool,
+
+    /// Keep the specified symbols during GC sections.
+    pub(super) gc_keep_symbols: IndexSet<String>,
+
+    /// Print sections discarded during GC sections.
+    pub(super) print_gc_sections: bool,
+
+    /// Report unresolved symbols as warnings.
+    pub(super) warn_unresolved: bool,
+
+    /// List of ignored unresolved symbols.
+    pub(super) ignored_unresolved_symbols: HashSet<String>,
+}
+
+impl<L: LibraryFind + 'static> LinkerBuilder<L> {
+    /// Creates a new [`LinkerBuilder`] with the defaults.
+    pub fn new() -> Self {
+        Self {
+            target_arch: Default::default(),
+            inputs: Default::default(),
+            entrypoint: Default::default(),
+            merge_bss: false,
+            merge_grouped_sections: false,
+            library_searcher: None,
+            link_graph_output: None,
+            custom_api: None,
+            gc_sections: false,
+            gc_keep_symbols: Default::default(),
+            print_gc_sections: false,
+            warn_unresolved: false,
+            ignored_unresolved_symbols: HashSet::new(),
+        }
+    }
+
+    /// Sets the target architecture for the linker.
+    ///
+    /// This is not needed if the linker can parse the target architecture
+    /// from the input files.
+    pub fn architecture(mut self, arch: LinkerTargetArch) -> Self {
+        self.target_arch = Some(arch);
+        self
+    }
+
+    /// Set the output path for dumping the link graph.
+    pub fn link_graph_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.link_graph_output = Some(path.into());
+        self
+    }
+
+    /// Merge the .bss section with the .data section.
+    pub fn merge_bss(mut self, val: bool) -> Self {
+        self.merge_bss = val;
+        self
+    }
+
+    /// Merge grouped sections.
+    pub fn merge_grouped_sections(mut self, val: bool) -> Self {
+        self.merge_grouped_sections = val;
+        self
+    }
+
+    /// Set the name of the entrypoint symbol.
+    pub fn entrypoint(mut self, name: impl Into<String>) -> Self {
+        self.entrypoint = Some(name.into());
+        self
+    }
+
+    /// Custom BOF API to use instead of the Beacon API.
+    pub fn custom_api(mut self, api: impl Into<String>) -> Self {
+        self.custom_api = Some(api.into());
+        self
+    }
+
+    /// Set the library searcher to use for finding link libraries.
+    pub fn library_searcher(mut self, searcher: L) -> Self {
+        self.library_searcher = Some(searcher);
+        self
+    }
+
+    /// Enable GC sections.
+    pub fn gc_sections(mut self, val: bool) -> Self {
+        self.gc_sections = val;
+        self
+    }
+
+    /// Print sections discarded during GC sections.
+    pub fn print_gc_sections(mut self, val: bool) -> Self {
+        self.print_gc_sections = val;
+        self
+    }
+
+    /// Report unresolved symbols as warnings.
+    pub fn warn_unresolved(mut self, val: bool) -> Self {
+        self.warn_unresolved = val;
+        self
+    }
+
+    /// Add a file path to link
+    pub fn add_file_path(&mut self, path: impl Into<PathBuf>) {
+        self.inputs.entry(LinkInput::File(path.into())).or_default();
+    }
+
+    /// Add a file path to link
+    pub fn add_whole_file_path(&mut self, path: impl Into<PathBuf>) {
+        let entry = self.inputs.entry(LinkInput::File(path.into())).or_default();
+        entry.whole = true;
+    }
+
+    /// Add a file from memory to link
+    pub fn add_file_memory(&mut self, path: impl Into<PathBuf>, buffer: impl Into<Vec<u8>>) {
+        let entry = self.inputs.entry(LinkInput::File(path.into())).or_default();
+        entry.buffer = Some(buffer.into());
+    }
+
+    /// Add a link library to the linker.
+    pub fn add_library(&mut self, name: impl Into<String>) {
+        self.inputs
+            .entry(LinkInput::Library(name.into()))
+            .or_default();
+    }
+
+    /// Add a link library to the linker.
+    pub fn add_whole_library(&mut self, name: impl Into<String>) {
+        let entry = self
+            .inputs
+            .entry(LinkInput::Library(name.into()))
+            .or_default();
+        entry.whole = true;
+    }
+
+    /// Add a set of link libraries to the linker.
+    pub fn add_libraries<S: Into<String>, I: IntoIterator<Item = S>>(&mut self, names: I) {
+        names.into_iter().for_each(|name| self.add_library(name));
+    }
+
+    /// Add the specified symbol to keep during GC sections.
+    pub fn add_gc_keep_symbol(mut self, symbol: impl Into<String>) -> Self {
+        self.gc_keep_symbols.insert(symbol.into());
+        self
+    }
+
+    /// Adds the list of symbols to keep during GC sections.
+    pub fn add_gc_keep_symbols<S: Into<String>, I: IntoIterator<Item = S>>(
+        mut self,
+        symbols: I,
+    ) -> Self {
+        self.gc_keep_symbols
+            .extend(symbols.into_iter().map(Into::into));
+        self
+    }
+
+    /// Add ignored unresolved symbols.
+    pub fn add_ignored_unresolved_symbols<S: Into<String>, I: IntoIterator<Item = S>>(
+        &mut self,
+        symbols: I,
+    ) {
+        self.ignored_unresolved_symbols
+            .extend(symbols.into_iter().map(Into::into));
+    }
+
+    /// Finishes configuring the linker.
+    pub fn build(mut self) -> Box<dyn LinkImpl> {
+        if let Some(library_searcher) = self.library_searcher.take() {
+            Box::new(ConfiguredLinker::with_opts(self, library_searcher))
+        } else {
+            Box::new(ConfiguredLinker::with_opts(self, LibrarySearcher::new()))
+        }
+    }
+}
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct CoffPath<'a> {

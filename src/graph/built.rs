@@ -9,7 +9,7 @@ use object::pe::{IMAGE_REL_AMD64_REL32, IMAGE_REL_I386_DIR32};
 
 use crate::{
     graph::node::SymbolName,
-    linker::{LinkerTargetArch, error::LinkError},
+    linker::{LinkError, LinkerTargetArch},
 };
 
 use super::{
