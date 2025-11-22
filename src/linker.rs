@@ -445,65 +445,6 @@ fn display_vec<T: std::fmt::Display>(errors: &Vec<T>) -> DisplayVec<'_, T> {
     DisplayVec(errors)
 }
 
-/// An item with an associated path.
-pub struct PathedItem<P: AsRef<Path>, T> {
-    path: P,
-    item: T,
-}
-
-impl<P: AsRef<Path>, T> std::hash::Hash for PathedItem<P, T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.path.as_ref().hash(state);
-    }
-}
-
-impl<P: AsRef<Path>, T> std::cmp::PartialEq for PathedItem<P, T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.path.as_ref().eq(other.path.as_ref())
-    }
-}
-
-impl<P: AsRef<Path>, T> std::cmp::Eq for PathedItem<P, T> {}
-
-impl<P: AsRef<Path>, T> PathedItem<P, T> {
-    /// Creates a new [`PathedItem`] with the specified values.
-    pub fn new(path: P, item: T) -> PathedItem<P, T> {
-        Self { path, item }
-    }
-
-    /// Returns the [`Path`] associated with the item.
-    pub fn path(&self) -> &P {
-        &self.path
-    }
-
-    /// Returns a mutable reference to the [`Path`] associated with the item.
-    pub fn path_mut(&mut self) -> &mut P {
-        &mut self.path
-    }
-
-    /// Converts the item into a `Box<T>`.
-    pub fn into_boxed_item(self) -> PathedItem<P, Box<T>> {
-        PathedItem {
-            path: self.path,
-            item: Box::new(self.item),
-        }
-    }
-}
-
-impl<P: AsRef<Path>, T> std::ops::Deref for PathedItem<P, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.item
-    }
-}
-
-impl<P: AsRef<Path>, T> std::ops::DerefMut for PathedItem<P, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.item
-    }
-}
-
 /// The linker input types.
 #[derive(PartialEq, Eq, Hash)]
 pub(crate) enum LinkInput {
@@ -802,7 +743,7 @@ impl<L: LibraryFind> ConfiguredLinker<L> {
 impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
     fn link(&mut self) -> Result<Vec<u8>, LinkError> {
         // Buffer arena
-        let buffer_arena = Arena::with_capacity(self.inputs.len());
+        let buffer_arena: Arena<(PathBuf, Vec<u8>)> = Arena::with_capacity(self.inputs.len());
 
         let mut input_processor = LinkInputProcessor::with_capacity(
             &buffer_arena,
@@ -877,7 +818,10 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
                 .flatten()
             {
                 if !input_processor.opened_library_names.contains(library_name) {
-                    let library = match self.library_searcher.find_library(library_name) {
+                    let (library_path, library_buffer) = match self
+                        .library_searcher
+                        .find_library(library_name)
+                    {
                         Ok(found) => found,
                         Err(e) => {
                             setup_errors.push(LinkerSetupError::Path(LinkerSetupPathError::new(
@@ -895,14 +839,15 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
 
                     if !input_processor
                         .link_libraries
-                        .contains_key(library.path().as_path())
+                        .contains_key(library_path.as_path())
                     {
-                        let library = input_processor.arena.alloc(library);
-                        let archive = match LinkArchive::parse(library.as_slice()) {
+                        let (library_path, library_buffer) =
+                            input_processor.arena.alloc((library_path, library_buffer));
+                        let archive = match LinkArchive::parse(library_buffer.as_slice()) {
                             Ok(parsed) => parsed,
                             Err(e) => {
                                 setup_errors.push(LinkerSetupError::Path(
-                                    LinkerSetupPathError::nomember(library.path(), e),
+                                    LinkerSetupPathError::nomember(library_path.as_path(), e),
                                 ));
                                 continue;
                             }
@@ -910,7 +855,7 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
 
                         input_processor
                             .link_libraries
-                            .insert(library.path().as_path(), archive);
+                            .insert(library_path.as_path(), archive);
                     }
                 }
             }
@@ -977,18 +922,18 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
                                     .opened_library_names
                                     .insert(drectve_library.to_string());
 
-                                let found = buffer_arena.alloc(found);
+                                let (library_path, library_buffer) = buffer_arena.alloc(found);
 
-                                match LinkArchive::parse(found.as_slice()) {
+                                match LinkArchive::parse(library_buffer.as_slice()) {
                                     Ok(parsed) => {
                                         input_processor
                                             .link_libraries
-                                            .insert(found.path().as_path(), parsed);
+                                            .insert(library_path.as_path(), parsed);
                                     }
                                     Err(e) => {
                                         setup_errors.push(LinkerSetupError::Path(
                                             LinkerSetupPathError::new(
-                                                library_path,
+                                                library_path.as_path(),
                                                 Some(coff_path),
                                                 e,
                                             ),
@@ -1134,7 +1079,7 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
 /// Process the linker inputs
 struct LinkInputProcessor<'b, 'a, L: LibraryFind> {
     /// Arena for holding opened files
-    arena: &'a Arena<PathedItem<PathBuf, Vec<u8>>>,
+    arena: &'a Arena<(PathBuf, Vec<u8>)>,
 
     /// Used for finding link libraries
     library_searcher: &'b L,
@@ -1154,7 +1099,7 @@ struct LinkInputProcessor<'b, 'a, L: LibraryFind> {
 
 impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
     pub fn with_capacity(
-        arena: &'a Arena<PathedItem<PathBuf, Vec<u8>>>,
+        arena: &'a Arena<(PathBuf, Vec<u8>)>,
         library_searcher: &'b L,
         capacity: usize,
     ) -> LinkInputProcessor<'b, 'a, L> {
@@ -1175,34 +1120,39 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
     ) -> Result<(), LinkerSetupError> {
         match input {
             LinkInput::File(file_path) => {
-                let buffer = if let Some(existing_buffer) = item.buffer.take() {
-                    self.arena
-                        .alloc(PathedItem::new(file_path, existing_buffer))
+                let (file_path, buffer) = if let Some(existing_buffer) = item.buffer.take() {
+                    self.arena.alloc((file_path, existing_buffer))
                 } else {
                     let buffer = std::fs::read(&file_path).map_err(|e| {
                         LinkerSetupError::Path(LinkerSetupPathError::nomember(&file_path, e))
                     })?;
-                    self.arena.alloc(PathedItem::new(file_path, buffer))
+                    self.arena.alloc((file_path, buffer))
                 };
 
                 if object_is_archive(buffer.as_slice()) {
                     let library = LinkArchive::parse(buffer.as_slice()).map_err(|e| {
-                        LinkerSetupError::Path(LinkerSetupPathError::nomember(buffer.path(), e))
+                        LinkerSetupError::Path(LinkerSetupPathError::nomember(
+                            file_path.as_path(),
+                            e,
+                        ))
                     })?;
 
                     if item.whole {
-                        self.add_archive_members(buffer.path().as_path(), library)
+                        self.add_archive_members(file_path.as_path(), library)
                             .map_err(LinkerSetupError::Path)?;
-                    } else if !self.link_libraries.contains_key(&buffer.path().as_path()) {
-                        self.link_libraries.insert(buffer.path().as_path(), library);
+                    } else if !self.link_libraries.contains_key(file_path.as_path()) {
+                        self.link_libraries.insert(file_path.as_path(), library);
                     }
                 } else {
                     let coff: CoffFile = CoffFile::parse(buffer.as_slice()).map_err(|e| {
-                        LinkerSetupError::Path(LinkerSetupPathError::nomember(buffer.path(), e))
+                        LinkerSetupError::Path(LinkerSetupPathError::nomember(
+                            file_path.as_path(),
+                            e,
+                        ))
                     })?;
 
                     if let indexmap::map::Entry::Vacant(coff_entry) = self.coffs.entry(CoffPath {
-                        file_path: buffer.path().as_path(),
+                        file_path: file_path.as_path(),
                         member_path: None,
                     }) {
                         self.spec.add_coff(&coff);
@@ -1212,7 +1162,7 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
             }
             LinkInput::Library(library_name) => {
                 if !self.opened_library_names.contains(&library_name) {
-                    let library = self
+                    let (library_path, library_buffer) = self
                         .library_searcher
                         .find_library(&library_name)
                         .map_err(LinkerSetupError::Library)?;
@@ -1220,27 +1170,30 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
                     self.opened_library_names.insert(library_name);
 
                     if item.whole {
-                        let library = self.arena.alloc(library);
-                        let archive = LinkArchive::parse(library.as_slice()).map_err(|e| {
-                            LinkerSetupError::Path(LinkerSetupPathError::nomember(
-                                library.path(),
-                                e,
-                            ))
-                        })?;
+                        let (library_path, library_buffer) =
+                            self.arena.alloc((library_path, library_buffer));
+                        let archive =
+                            LinkArchive::parse(library_buffer.as_slice()).map_err(|e| {
+                                LinkerSetupError::Path(LinkerSetupPathError::nomember(
+                                    library_path.as_path(),
+                                    e,
+                                ))
+                            })?;
 
-                        self.add_archive_members(library.path().as_path(), archive)
+                        self.add_archive_members(library_path.as_path(), archive)
                             .map_err(LinkerSetupError::Path)?;
-                    } else if !self.link_libraries.contains_key(library.path().as_path()) {
-                        let library = self.arena.alloc(library);
-                        let archive = LinkArchive::parse(library.as_slice()).map_err(|e| {
-                            LinkerSetupError::Path(LinkerSetupPathError::nomember(
-                                library.path(),
-                                e,
-                            ))
-                        })?;
+                    } else if !self.link_libraries.contains_key(library_path.as_path()) {
+                        let (library_path, library_buffer) =
+                            self.arena.alloc((library_path, library_buffer));
+                        let archive =
+                            LinkArchive::parse(library_buffer.as_slice()).map_err(|e| {
+                                LinkerSetupError::Path(LinkerSetupPathError::nomember(
+                                    library_path.as_path(),
+                                    e,
+                                ))
+                            })?;
 
-                        self.link_libraries
-                            .insert(library.path().as_path(), archive);
+                        self.link_libraries.insert(library_path.as_path(), archive);
                     }
                 }
             }
@@ -1278,7 +1231,7 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
 
     fn open_custom_api(&mut self, library: String) -> Result<ApiSymbols<'a>, ApiSetupError> {
         let custom_api = match std::fs::read(&library) {
-            Ok(buffer) => PathedItem::new(PathBuf::from(library), buffer),
+            Ok(buffer) => (PathBuf::from(library), buffer),
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 match self.library_searcher.find_library(&library) {
                     Ok(found) => {
@@ -1296,19 +1249,17 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
             }
         };
 
-        let custom_api = self.arena.alloc(custom_api);
+        let (api_path, api_buffer) = self.arena.alloc(custom_api);
 
         let api_archive =
-            LinkArchive::parse(custom_api.as_slice()).map_err(|e| ApiSetupError::Parse {
-                path: custom_api.path().to_path_buf(),
+            LinkArchive::parse(api_buffer.as_slice()).map_err(|e| ApiSetupError::Parse {
+                path: api_path.clone(),
                 error: e,
             })?;
 
-        ApiSymbols::new(custom_api.path().as_path(), api_archive).map_err(|e| {
-            ApiSetupError::ApiSymbols {
-                path: custom_api.path().to_path_buf(),
-                error: e,
-            }
+        ApiSymbols::new(api_path.as_path(), api_archive).map_err(|e| ApiSetupError::ApiSymbols {
+            path: api_path.clone(),
+            error: e,
         })
     }
 

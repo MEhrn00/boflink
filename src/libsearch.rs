@@ -3,10 +3,8 @@ use std::{borrow::Cow, io::ErrorKind, path::PathBuf};
 use indexmap::IndexSet;
 use log::debug;
 
-use crate::linker::PathedItem;
-
 pub trait LibraryFind {
-    fn find_library(&self, name: impl AsRef<str>) -> Result<FoundLibrary, LibsearchError>;
+    fn find_library(&self, name: impl AsRef<str>) -> Result<(PathBuf, Vec<u8>), LibsearchError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -47,9 +45,6 @@ impl std::fmt::Display for SearchLibraryName<'_> {
     }
 }
 
-/// A read in link library found from the [`LibrarySearcher`].
-pub type FoundLibrary = PathedItem<PathBuf, Vec<u8>>;
-
 /// Used for finding link libraries.
 #[derive(Debug, Default)]
 pub struct LibrarySearcher {
@@ -72,7 +67,7 @@ impl LibrarySearcher {
 }
 
 impl LibraryFind for LibrarySearcher {
-    fn find_library(&self, name: impl AsRef<str>) -> Result<FoundLibrary, LibsearchError> {
+    fn find_library(&self, name: impl AsRef<str>) -> Result<(PathBuf, Vec<u8>), LibsearchError> {
         if self.search_paths.is_empty() {
             return Err(LibsearchError::NotFound(name.as_ref().to_string()));
         }
@@ -99,7 +94,7 @@ impl LibraryFind for LibrarySearcher {
                 let full_path = search_path.join(filename.as_ref());
                 match std::fs::read(&full_path) {
                     Ok(data) => {
-                        return Ok(FoundLibrary::new(full_path, data));
+                        return Ok((full_path, data));
                     }
                     Err(e) if e.kind() != ErrorKind::NotFound => {
                         return Err(LibsearchError::Io {
