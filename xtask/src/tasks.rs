@@ -39,6 +39,11 @@ pub const TASKLIST: &[Task] = &[
         help: "Run ci workflow",
         run: ci,
     },
+    Task {
+        name: "docs",
+        help: "Build documentation (requires pandoc executable)",
+        run: docs,
+    },
     #[cfg(feature = "dist")]
     Task {
         name: "dist",
@@ -133,6 +138,20 @@ pub fn ci() -> Result<(), Box<dyn Error>> {
     lint()?;
     test()?;
     Ok(())
+}
+
+pub fn docs() -> Result<(), Box<dyn Error>> {
+    Ok(utils::shell::run_echo_projdir(
+        "pandoc",
+        [
+            "docs/boflink.1.md",
+            "-s",
+            "-t",
+            "man",
+            "-o",
+            "docs/boflink.1",
+        ],
+    )?)
 }
 
 #[cfg(feature = "dist")]
