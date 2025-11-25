@@ -1,0 +1,19 @@
+[package]
+name = "moduledef"
+version = "0.1.0"
+authors = ["Matt Ehrnschwender <matthewe2020@gmail.com>"]
+edition = "2024"
+description = "Parser for Windows Module-Definition (.def) Files."
+readme = "README.md"
+homepage = "https://github.com/MEhrn00/boflink/tree/main/crates/moduledef"
+repository = "https://github.com/MEhrn00/boflink"
+publish = false
+
+[dependencies]
+bitflags = "2.10.0"
+nom = "8.0.0"
+nom_locate = "5.0.0"
+thiserror = "2.0.17"
+
+[lints.rust]
+unsafe_code = "forbid"

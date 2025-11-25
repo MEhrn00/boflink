@@ -1,0 +1,6 @@
+LIBRARY basic
+EXPORTS
+  BasicExport1
+  BasicExport2
+; Comment
+  BasicExport3
