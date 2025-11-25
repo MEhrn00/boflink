@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2025-11-25
+
+### Added
+
+- The new `BeaconDownload` API symbol released in CS 4.12 is now included in the list of
+  builtin Beacon API symbols during symbol resolution. [#34](https://github.com/MEhrn00/boflink/pull/34)
+
+- Basic man page with command line option descriptions.
+  This requires the [pandoc](https://pandoc.org/) executable to build. Can be built by running `cargo xtask docs-man`. (71908bd)
+
+### Changed
+
+- Version updates for external dependencies.
+  - cpp_demangle 0.4.4 -> 0.5.0 [#31](https://github.com/MEhrn00/boflink/pull/31)
+  - zip 5.0.0 -> 6.0.0 [#32](https://github.com/MEhrn00/boflink/pull/32)
+  - object 0.37.4 -> 0.38.0 [#33](https://github.com/MEhrn00/boflink/pull/33)
+
+
 ## [0.5.0] - 2025-09-18
 
 ### Added
@@ -82,7 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release
 
-[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.5.0...HEAD
+[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/MEhrn00/boflink/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/MEhrn00/boflink/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MEhrn00/boflink/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/MEhrn00/boflink/compare/v0.3.0...v0.3.1

@@ -4,7 +4,7 @@ exclude = ["crates/undname/sys"]
 
 [package]
 name = "boflink"
-version = "0.5.0"
+version = "0.6.0"
 authors = ["Matt Ehrnschwender <matthewe2020@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
