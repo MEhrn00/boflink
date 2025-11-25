@@ -40,9 +40,9 @@ pub const TASKLIST: &[Task] = &[
         run: ci,
     },
     Task {
-        name: "docs",
-        help: "Build documentation (requires pandoc executable)",
-        run: docs,
+        name: "docs-man",
+        help: "Build the man page documentation (requires pandoc executable)",
+        run: docs_man,
     },
     #[cfg(feature = "dist")]
     Task {
@@ -140,7 +140,7 @@ pub fn ci() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub fn docs() -> Result<(), Box<dyn Error>> {
+pub fn docs_man() -> Result<(), Box<dyn Error>> {
     Ok(utils::shell::run_echo_projdir(
         "pandoc",
         [
