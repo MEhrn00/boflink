@@ -598,6 +598,11 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
 
         // Fixup relocations
         for output_section in &self.output_sections {
+            // Skip output sections that do not contain any data
+            if output_section.pointer_to_raw_data == 0 || output_section.size_of_raw_data == 0 {
+                continue;
+            }
+
             let section_data_base = output_section.pointer_to_raw_data as usize;
 
             for section_node in &output_section.nodes {
