@@ -531,163 +531,15 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
         }
     }
 
-    /// Links the graph components together and merges grouped sections.
-    pub fn link_merge_groups(mut self) -> Result<Vec<u8>, LinkGraphLinkError> {
-        self.prelink();
-
+    /// Creates the output sections without merging section groups
+    fn build_output_sections(&mut self) -> Vec<OutputSection<'arena, 'data>> {
         let section_count = self
             .section_nodes
             .values()
             .fold(0, |acc, section_nodes| acc + section_nodes.len());
 
         // Build the list of output sections
-        let mut output_sections: Vec<OutputSection> = Vec::with_capacity(section_count);
-
-        // Add the code sections
-        let code_sections = self
-            .section_nodes
-            .remove(&SectionCategory::Standard(SectionType::Code));
-
-        let mut code_output_section = OutputSection::new(
-            SectionName::from(".text"),
-            SectionNodeCharacteristics::CntCode
-                | SectionNodeCharacteristics::MemExecute
-                | SectionNodeCharacteristics::MemRead,
-            Vec::new(),
-        );
-
-        let mut section_groups: BTreeMap<&str, Vec<&SectionNode>> = BTreeMap::new();
-        for section in code_sections.into_iter().flatten() {
-            if section.is_discarded() {
-                continue;
-            }
-
-            let group_entry = section_groups
-                .entry(section.name().group_ordering().unwrap_or_default())
-                .or_default();
-            group_entry.push(section);
-        }
-
-        code_output_section
-            .nodes
-            .extend(section_groups.into_values().flatten());
-        output_sections.push(code_output_section);
-
-        // Add the data sections
-        let data_sections = self
-            .section_nodes
-            .remove(&SectionCategory::Standard(SectionType::InitializedData));
-
-        let mut data_output_section = OutputSection::new(
-            SectionName::from(".data"),
-            SectionNodeCharacteristics::CntInitializedData
-                | SectionNodeCharacteristics::MemRead
-                | SectionNodeCharacteristics::MemWrite,
-            Vec::new(),
-        );
-
-        let mut section_groups: BTreeMap<&str, Vec<&SectionNode>> = BTreeMap::new();
-        for section in data_sections.into_iter().flatten() {
-            if section.is_discarded() {
-                continue;
-            }
-
-            let group_entry = section_groups
-                .entry(section.name().group_ordering().unwrap_or_default())
-                .or_default();
-            group_entry.push(section);
-        }
-
-        data_output_section
-            .nodes
-            .extend(section_groups.into_values().flatten());
-        output_sections.push(data_output_section);
-
-        // Add the uninitialized data sections
-        let uninitialized_data_sections = self
-            .section_nodes
-            .remove(&SectionCategory::Standard(SectionType::UninitializedData));
-
-        let mut uninitialized_data_output_section = OutputSection::new(
-            SectionName::from(".bss"),
-            SectionNodeCharacteristics::CntUninitializedData
-                | SectionNodeCharacteristics::MemRead
-                | SectionNodeCharacteristics::MemWrite,
-            Vec::new(),
-        );
-
-        let mut section_groups: BTreeMap<&str, Vec<&SectionNode>> = BTreeMap::new();
-        for section in uninitialized_data_sections.into_iter().flatten() {
-            if section.is_discarded() {
-                continue;
-            }
-
-            let group_entry = section_groups
-                .entry(section.name().group_ordering().unwrap_or_default())
-                .or_default();
-            group_entry.push(section);
-        }
-
-        uninitialized_data_output_section
-            .nodes
-            .extend(section_groups.into_values().flatten());
-        output_sections.push(uninitialized_data_output_section);
-
-        // Add the remaining sections
-        for section_nodes in self.section_nodes.values_mut() {
-            let mut section_map: IndexMap<&str, BTreeMap<&str, Vec<&SectionNode>>> =
-                IndexMap::new();
-            for section in std::mem::take(section_nodes) {
-                if section.is_discarded() {
-                    continue;
-                }
-
-                let group_entry = section_map.entry(section.name().group_name()).or_default();
-                let ordering_entry = group_entry
-                    .entry(section.name().group_ordering().unwrap_or_default())
-                    .or_default();
-                ordering_entry.push(section);
-            }
-
-            for (section_name, sections) in section_map.iter_mut() {
-                let mut output_section = match sections.first_entry() {
-                    Some(section_entry) => {
-                        let first_section = match section_entry.get().first() {
-                            Some(section) => section,
-                            None => continue,
-                        };
-
-                        OutputSection::new(
-                            SectionName::from(*section_name),
-                            first_section.characteristics(),
-                            Vec::with_capacity(sections.len()),
-                        )
-                    }
-                    None => continue,
-                };
-
-                for section_group in sections.values_mut() {
-                    output_section.nodes.append(section_group);
-                }
-
-                output_sections.push(output_section);
-            }
-        }
-
-        self.link_final(output_sections)
-    }
-
-    /// Links the graph components together and builds the final COFF.
-    pub fn link(mut self) -> Result<Vec<u8>, LinkGraphLinkError> {
-        self.prelink();
-
-        let section_count = self
-            .section_nodes
-            .values()
-            .fold(0, |acc, section_nodes| acc + section_nodes.len());
-
-        // Build the list of output sections
-        let mut output_sections: Vec<OutputSection> = Vec::with_capacity(section_count);
+        let mut output_sections = Vec::with_capacity(section_count);
 
         // Add the code sections
         let code_sections = self
@@ -863,7 +715,165 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
             }
         }
 
-        self.link_final(output_sections)
+        output_sections
+    }
+
+    /// Creates the output sections and merges section groups
+    fn build_merged_output_sections(&mut self) -> Vec<OutputSection<'arena, 'data>> {
+        let section_count = self
+            .section_nodes
+            .values()
+            .fold(0, |acc, section_nodes| acc + section_nodes.len());
+
+        // Build the list of output sections
+        let mut output_sections = Vec::with_capacity(section_count);
+
+        // Add the code sections
+        let code_sections = self
+            .section_nodes
+            .remove(&SectionCategory::Standard(SectionType::Code));
+
+        let mut code_output_section = OutputSection::new(
+            SectionName::from(".text"),
+            SectionNodeCharacteristics::CntCode
+                | SectionNodeCharacteristics::MemExecute
+                | SectionNodeCharacteristics::MemRead,
+            Vec::new(),
+        );
+
+        let mut section_groups: BTreeMap<&str, Vec<&SectionNode>> = BTreeMap::new();
+        for section in code_sections.into_iter().flatten() {
+            if section.is_discarded() {
+                continue;
+            }
+
+            let group_entry = section_groups
+                .entry(section.name().group_ordering().unwrap_or_default())
+                .or_default();
+            group_entry.push(section);
+        }
+
+        code_output_section
+            .nodes
+            .extend(section_groups.into_values().flatten());
+        output_sections.push(code_output_section);
+
+        // Add the data sections
+        let data_sections = self
+            .section_nodes
+            .remove(&SectionCategory::Standard(SectionType::InitializedData));
+
+        let mut data_output_section = OutputSection::new(
+            SectionName::from(".data"),
+            SectionNodeCharacteristics::CntInitializedData
+                | SectionNodeCharacteristics::MemRead
+                | SectionNodeCharacteristics::MemWrite,
+            Vec::new(),
+        );
+
+        let mut section_groups: BTreeMap<&str, Vec<&SectionNode>> = BTreeMap::new();
+        for section in data_sections.into_iter().flatten() {
+            if section.is_discarded() {
+                continue;
+            }
+
+            let group_entry = section_groups
+                .entry(section.name().group_ordering().unwrap_or_default())
+                .or_default();
+            group_entry.push(section);
+        }
+
+        data_output_section
+            .nodes
+            .extend(section_groups.into_values().flatten());
+        output_sections.push(data_output_section);
+
+        // Add the uninitialized data sections
+        let uninitialized_data_sections = self
+            .section_nodes
+            .remove(&SectionCategory::Standard(SectionType::UninitializedData));
+
+        let mut uninitialized_data_output_section = OutputSection::new(
+            SectionName::from(".bss"),
+            SectionNodeCharacteristics::CntUninitializedData
+                | SectionNodeCharacteristics::MemRead
+                | SectionNodeCharacteristics::MemWrite,
+            Vec::new(),
+        );
+
+        let mut section_groups: BTreeMap<&str, Vec<&SectionNode>> = BTreeMap::new();
+        for section in uninitialized_data_sections.into_iter().flatten() {
+            if section.is_discarded() {
+                continue;
+            }
+
+            let group_entry = section_groups
+                .entry(section.name().group_ordering().unwrap_or_default())
+                .or_default();
+            group_entry.push(section);
+        }
+
+        uninitialized_data_output_section
+            .nodes
+            .extend(section_groups.into_values().flatten());
+        output_sections.push(uninitialized_data_output_section);
+
+        // Add the remaining sections
+        for section_nodes in self.section_nodes.values_mut() {
+            let mut section_map: IndexMap<&str, BTreeMap<&str, Vec<&SectionNode>>> =
+                IndexMap::new();
+            for section in std::mem::take(section_nodes) {
+                if section.is_discarded() {
+                    continue;
+                }
+
+                let group_entry = section_map.entry(section.name().group_name()).or_default();
+                let ordering_entry = group_entry
+                    .entry(section.name().group_ordering().unwrap_or_default())
+                    .or_default();
+                ordering_entry.push(section);
+            }
+
+            for (section_name, sections) in section_map.iter_mut() {
+                let mut output_section = match sections.first_entry() {
+                    Some(section_entry) => {
+                        let first_section = match section_entry.get().first() {
+                            Some(section) => section,
+                            None => continue,
+                        };
+
+                        OutputSection::new(
+                            SectionName::from(*section_name),
+                            first_section.characteristics(),
+                            Vec::with_capacity(sections.len()),
+                        )
+                    }
+                    None => continue,
+                };
+
+                for section_group in sections.values_mut() {
+                    output_section.nodes.append(section_group);
+                }
+
+                output_sections.push(output_section);
+            }
+        }
+
+        output_sections
+    }
+
+    /// Links the graph components together and merges grouped sections.
+    pub fn link_merge_groups(mut self) -> Result<Vec<u8>, LinkGraphLinkError> {
+        self.prelink();
+        let outputs = self.build_merged_output_sections();
+        self.link_final(outputs)
+    }
+
+    /// Links the graph components together and builds the final COFF.
+    pub fn link(mut self) -> Result<Vec<u8>, LinkGraphLinkError> {
+        self.prelink();
+        let outputs = self.build_output_sections();
+        self.link_final(outputs)
     }
 
     fn prelink(&mut self) {
