@@ -449,42 +449,43 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
         }
     }
 
-    /// Handles discarding/keeping sections for COMDAT symbols
-    fn handle_comdats(&self) {
-        for symbol in self.external_symbols.values() {
-            let mut definition_iter = symbol.definitions().iter().peekable();
+    /// Handles deduplicating definitions for COMDAT leaders
+    fn handle_comdat_leaders(&self) {
+        for &section in self.section_nodes.values().flatten() {
+            if section.is_discarded() || !section.is_comdat() {
+                continue;
+            }
 
-            let first_definition = match definition_iter.peek() {
-                Some(definition) => definition,
-                None => continue,
-            };
-
-            let selection = match first_definition.weight().selection {
-                Some(sel) => sel,
-                None => continue,
+            let Some((leader, selection)) = section.definitions().iter().find_map(|definition| {
+                definition
+                    .weight()
+                    .selection
+                    .map(|selection| (definition.source(), selection))
+            }) else {
+                continue;
             };
 
             if selection == ComdatSelection::Any
                 || selection == ComdatSelection::SameSize
                 || selection == ComdatSelection::ExactMatch
             {
-                // Keep the first section but discard the rest.
+                // Keep the first seen definition and discard the other sections
+                let mut definition_iter = leader.definitions().iter();
                 let _ = definition_iter.next();
-
                 for remaining in definition_iter {
-                    let section = remaining.target();
+                    let discarded_section = remaining.target();
                     debug!(
                         "{}: discarding COMDAT {} ({selection:?})",
-                        section.coff(),
-                        section.name(),
+                        discarded_section.coff(),
+                        discarded_section.name(),
                     );
-                    section.discard();
+                    discarded_section.discard();
                 }
             } else if selection == ComdatSelection::Largest {
                 // Find the largest size and discard the rest.
                 let mut largest_section: Option<&'arena SectionNode<'arena, 'data>> = None;
 
-                for definition in definition_iter {
+                for definition in leader.definitions() {
                     let section = definition.target();
 
                     if let Some(largest) = &mut largest_section {
@@ -501,19 +502,14 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
                         largest_section = Some(section);
                     }
                 }
-            } else if selection == ComdatSelection::Associative {
-                // Associative COMDAT symbols are handled by traversing the
-                // root of the COMDAT chain.
-                continue;
             }
 
-            for definition in symbol.definitions() {
+            // Handle associative sections
+            for definition in leader.definitions() {
                 let root_section = definition.target();
-
-                // Discard or keep the associated sections depending on if
-                // the root section was kept or discarded.
                 let root_discarded = root_section.is_discarded();
 
+                // Keep/discard associated sections based on the root selection
                 for associative_section in root_section.associative_bfs() {
                     if !associative_section.is_discarded() && root_discarded {
                         debug!(
@@ -877,7 +873,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
     }
 
     fn prelink(&mut self) {
-        self.handle_comdats();
+        self.handle_comdat_leaders();
         self.apply_import_thunks();
         self.allocate_commons();
     }

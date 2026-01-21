@@ -20,7 +20,7 @@ pub struct LinkGraphCache<'arena, 'data> {
     code_sections: IndexMap<SectionIndex, &'arena SectionNode<'arena, 'data>>,
 
     /// Cached selection and section symbol values for COMDAT symbols.
-    comdat_selections: HashMap<SectionIndex, ComdatSelection>,
+    comdat_selections: HashMap<SectionIndex, Option<ComdatSelection>>,
 
     /// List of symbols with weak external auxiliary records.
     weak_symbols: Vec<SymbolIndex>,
@@ -88,8 +88,12 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
     }
 
     #[inline]
-    pub fn insert_comdat_selection(&mut self, idx: SectionIndex, selection: ComdatSelection) {
-        let _ = self.comdat_selections.insert(idx, selection);
+    pub fn insert_comdat_leader_selection(
+        &mut self,
+        idx: SectionIndex,
+        selection: ComdatSelection,
+    ) {
+        let _ = self.comdat_selections.insert(idx, Some(selection));
     }
 
     #[inline]
@@ -115,9 +119,18 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
         self.sections.get(&idx).copied()
     }
 
-    #[inline]
-    pub fn get_comdat_selection(&self, idx: SectionIndex) -> Option<ComdatSelection> {
-        self.comdat_selections.get(&idx).copied()
+    /// Returns a reference to the COMDAT selection entry for the specified section
+    /// index.
+    ///
+    /// Returns `None` if a COMDAT selection was never added for the section index.
+    ///
+    /// If the returned value is `&mut None`, this means that the COMDAT leader
+    /// has already been handled.
+    pub fn get_comdat_leader_selection(
+        &mut self,
+        idx: SectionIndex,
+    ) -> Option<&mut Option<ComdatSelection>> {
+        self.comdat_selections.get_mut(&idx)
     }
 
     #[inline]

@@ -519,10 +519,12 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                                     AssociativeSectionEdgeWeight,
                                 )
                             }));
+                    } else {
+                        // Store the selection value for the leader symbol to
+                        // handle
+                        self.cache
+                            .insert_comdat_leader_selection(section_idx, selection);
                     }
-
-                    // Store the selection value for this section.
-                    self.cache.insert_comdat_selection(section_idx, selection);
                 }
 
                 // Calculate the checksum value for the .rdata$zzz section since
@@ -537,16 +539,31 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                 }
 
                 graph_section.replace_checksum(checksum);
-            } else if graph_section.is_comdat() {
-                // Add the selection to the COMDAT symbol definition.
-                let selection = self
+            } else if symbol.is_global() && graph_section.is_comdat() {
+                // This symbol is possibly the COMDAT leader for the section.
+                // If the COMDAT section has no auxiliary section symbol, issue
+                // an error.
+                // If the entry is present but `None`, the leader was already
+                // handled and this is a regular definition for the section.
+                let selection_entry = self
                     .cache
-                    .get_comdat_selection(section_idx)
+                    .get_comdat_leader_selection(section_idx)
                     .ok_or_else(|| {
                         LinkGraphAddError::MissingComdatSectionSymbol(symbol_name.to_string())
                     })?;
 
-                definition_edge.weight_mut().selection = Some(selection);
+                if let Some(selection) = selection_entry {
+                    // Associative COMDATs are only for sections and not leader
+                    // symbols
+                    if *selection != ComdatSelection::Associative {
+                        // Add the COMDAT selection to the leader symbol's definition
+                        // edge
+                        definition_edge.weight_mut().selection = Some(*selection);
+                    }
+
+                    // Set the entry to `None` for marking the COMDAT as handled
+                    *selection_entry = None;
+                }
             }
 
             let definition_edge = self.arena.alloc(definition_edge);
