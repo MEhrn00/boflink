@@ -47,6 +47,14 @@ pub enum LinkGraphLinkError {
         section: String,
         address: u32,
     },
+
+    #[error("{coff_name}: unsupported relocation type '{typ:#x}' at '{section}+{address:#x}'.")]
+    UnsupportedRelocation {
+        coff_name: String,
+        section: String,
+        address: u32,
+        typ: u16,
+    },
 }
 
 /// Section categories for partitioning sections

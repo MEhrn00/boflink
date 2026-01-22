@@ -4,7 +4,11 @@ use indexmap::IndexMap;
 use log::debug;
 use object::{
     pe::{
-        IMAGE_FILE_LINE_NUMS_STRIPPED, IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_STATIC,
+        IMAGE_FILE_LINE_NUMS_STRIPPED, IMAGE_REL_AMD64_ADDR32, IMAGE_REL_AMD64_ADDR32NB,
+        IMAGE_REL_AMD64_ADDR64, IMAGE_REL_AMD64_REL32, IMAGE_REL_AMD64_REL32_5,
+        IMAGE_REL_AMD64_SECREL, IMAGE_REL_AMD64_SECTION, IMAGE_REL_I386_ABSOLUTE,
+        IMAGE_REL_I386_DIR32, IMAGE_REL_I386_DIR32NB, IMAGE_REL_I386_REL32, IMAGE_REL_I386_SECREL,
+        IMAGE_REL_I386_SECTION, IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_STATIC,
         IMAGE_SYM_TYPE_NULL,
     },
     write::coff::{Relocation, Writer},
@@ -170,87 +174,82 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
 
         // Reserve relocations skipping relocations to the same output section
         for output_section in self.output_sections.iter_mut() {
-            let mut reloc_count = 0usize;
+            for &section_node in &output_section.nodes {
+                let mut pending_relocs = 0;
 
-            for section_node in &output_section.nodes {
-                'next_reloc: for reloc in section_node.relocations() {
+                section_node.relocations().try_retain(|reloc| {
                     let symbol = reloc.target();
-                    let mut definition_count = 0usize;
 
-                    for definition in symbol
+                    // Discard definition edges to unused sections
+                    let mut has_discards = false;
+                    symbol.definitions().retain(|definition| {
+                        has_discards |= definition.target().is_discarded();
+                        !definition.target().is_discarded()
+                    });
+
+                    // Select the definition that should be used
+                    let selected = symbol
                         .definitions()
                         .iter()
                         .chain(symbol.weak_default_definitions())
-                    {
-                        definition_count += 1;
+                        .find(|definition| !definition.target().is_discarded());
 
-                        if definition.target().is_discarded() {
-                            continue;
+                    if let Some(selected) = selected {
+                        // Record this relocation as pending if it is a relative
+                        // relocation to the same output section
+                        if !reloc.weight().is_vabased(self.machine) {
+                            let is_intrasection =
+                                output_section.nodes.iter().any(|&check_section| {
+                                    std::ptr::eq(check_section, selected.target())
+                                });
+
+                            if is_intrasection {
+                                pending_relocs += 1;
+                            }
                         }
 
-                        let target_section = definition.target();
-                        if !output_section
-                            .nodes
-                            .iter()
-                            .any(|section| std::ptr::eq(*section, target_section))
-                        {
-                            reloc_count += 1;
-                        }
-
-                        continue 'next_reloc;
-                    }
-
-                    // Relocation to an imported or undefined symbol.
-                    if !symbol.imports().is_empty() || definition_count == 0 {
-                        // Local undefined symbol
-                        if symbol.imports().is_empty() {
-                            local_undefined.insert(symbol.name().as_str(), symbol);
-                        }
-
-                        reloc_count += 1;
-                        continue;
+                        return Ok(true);
+                    } else if !symbol.imports().is_empty() {
+                        return Ok(true);
+                    } else if !has_discards {
+                        local_undefined.insert(symbol.name().as_str(), symbol);
+                        return Ok(true);
                     }
 
                     // Symbol has no imports and all definitions are in
                     // discarded sections. Return an error.
-
-                    let coff_name = section_node.coff().to_string();
-
-                    let symbol_defs = BTreeMap::from_iter(
-                        section_node.definitions().iter().filter_map(|definition| {
-                            let ref_symbol = definition.source();
-                            if ref_symbol.is_section_symbol() || ref_symbol.is_label() {
+                    let sorted_definitions = section_node
+                        .definitions()
+                        .iter()
+                        .filter_map(|definition| {
+                            let symbol = definition.source();
+                            if symbol.is_section_symbol() || symbol.is_label() {
                                 None
                             } else {
-                                Some((definition.weight().address(), ref_symbol.name()))
+                                Some((definition.weight().address(), symbol.name()))
                             }
-                        }),
-                    );
+                        })
+                        .collect::<BTreeMap<_, _>>();
 
-                    if let Some(reference_symbol) =
-                        symbol_defs.range(0..=reloc.weight().address()).next_back()
-                    {
-                        return Err(LinkGraphLinkError::DiscardedSection {
-                            coff_name,
-                            reference: reference_symbol.1.demangle().to_string(),
-                            symbol: symbol.name().demangle().to_string(),
-                        });
-                    }
-
-                    return Err(LinkGraphLinkError::DiscardedSection {
-                        coff_name,
-                        reference: format!(
-                            "{}+{:#x}",
-                            section_node.name(),
-                            reloc.weight().address()
-                        ),
+                    Err(LinkGraphLinkError::DiscardedSection {
+                        coff_name: section_node.coff().to_string(),
+                        reference: sorted_definitions
+                            .range(0..=reloc.weight().address())
+                            .next_back()
+                            .map(|(_, name)| name.demangle().to_string())
+                            .unwrap_or_else(|| {
+                                format!("{}+{:#x}", section_node.name(), reloc.weight().address())
+                            }),
                         symbol: symbol.name().demangle().to_string(),
-                    });
-                }
+                    })
+                })?;
+
+                let kept_relocs = section_node.relocations().len() - pending_relocs;
+                output_section.number_of_relocations += u32::try_from(kept_relocs).unwrap();
             }
 
-            output_section.number_of_relocations = reloc_count.try_into().unwrap();
-            output_section.pointer_to_relocations = coff_writer.reserve_relocations(reloc_count);
+            output_section.pointer_to_relocations =
+                coff_writer.reserve_relocations(output_section.number_of_relocations as usize);
         }
 
         // Reserve symbols defined in sections
@@ -444,28 +443,30 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
             }
         }
 
-        // Write out the relocations skipping relocations to the same section
+        // Write out the relocations
         for output_section in &self.output_sections {
-            for section_node in &output_section.nodes {
+            for &section_node in &output_section.nodes {
                 for reloc in section_node.relocations() {
                     let target_symbol = reloc.target();
-                    let mut linked_symbol = target_symbol;
+                    let mut linked_symbol = reloc.target();
+                    let definition = linked_symbol.definitions().front().or_else(|| {
+                        target_symbol
+                            .weak_default_definitions()
+                            .find(|definition| !definition.target().is_discarded())
+                    });
 
-                    if let Some(definition) = target_symbol
-                        .definitions()
-                        .iter()
-                        .chain(target_symbol.weak_default_definitions())
-                        .find(|definition| !definition.target().is_discarded())
-                    {
-                        if output_section
-                            .nodes
-                            .iter()
-                            .any(|section| std::ptr::eq(*section, definition.target()))
-                        {
+                    if let Some(definition) = definition {
+                        linked_symbol = definition.source();
+
+                        let is_intrasection = || {
+                            output_section.nodes.iter().any(|&check_section| {
+                                std::ptr::eq(check_section, definition.target())
+                            })
+                        };
+
+                        if !reloc.weight().is_vabased(self.machine) && is_intrasection() {
                             continue;
                         }
-
-                        linked_symbol = definition.source();
                     }
 
                     coff_writer.write_relocation(Relocation {
@@ -604,113 +605,224 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
             }
 
             let section_data_base = output_section.pointer_to_raw_data as usize;
+            let data_range =
+                section_data_base..section_data_base + output_section.size_of_raw_data as usize;
+            let section_data = &mut built_coff[data_range];
 
-            for section_node in &output_section.nodes {
-                let section_data_ptr = section_data_base + section_node.virtual_address() as usize;
-
-                let section_data =
-                    &mut built_coff[section_data_ptr..section_data_ptr + section_node.data().len()];
-
+            for &section_node in &output_section.nodes {
                 for reloc_edge in section_node.relocations() {
                     let target_symbol = reloc_edge.target();
+                    let definition = target_symbol.definitions().front().or_else(|| {
+                        target_symbol
+                            .weak_default_definitions()
+                            .find(|definition| !definition.target().is_discarded())
+                    });
 
-                    let symbol_definition = match target_symbol
-                        .definitions()
-                        .iter()
-                        .chain(target_symbol.weak_default_definitions())
-                        .find(|definition| !definition.target().is_discarded())
-                    {
-                        Some(definition) => definition,
-                        None => continue,
-                    };
-
-                    let target_section = symbol_definition.target();
-                    let reloc = reloc_edge.weight();
-
-                    // Return an error if the relocation is out of bounds.
-                    if reloc.virtual_address + 4 > section_node.data().len() as u32 {
-                        return Err(LinkGraphLinkError::RelocationBounds {
-                            coff_name: section_node.coff().to_string(),
-                            section: section_node.name().to_string(),
-                            address: reloc.virtual_address,
-                            size: section_node.data().len() as u32,
-                        });
-                    }
-
-                    // The relocation bounds check above checks the relocation
-                    // in the graph. This indexes into the built COFF after
-                    // everything is merged. The slice index should always
-                    // be in bounds but if it is not, there is some logic
-                    // error above. Panic with a verbose error message if that
-                    // is the case.
-
-                    let reloc_data: [u8; 4] = section_data
-                        .get(reloc.address() as usize..reloc.address() as usize + 4)
-                        .map(|data| data.try_into().unwrap_or_else(|_| unreachable!()))
-                        .unwrap_or_else(|| {
-                            unreachable!(
-                                "relocation in section '{}' is out of bounds",
-                                section_node.name()
-                            )
-                        });
-
-                    // Update relocations
-                    let relocated_val = if target_symbol.is_section_symbol()
-                        && !output_section
-                            .nodes
-                            .iter()
-                            .any(|section| std::ptr::eq(*section, target_section))
-                    {
-                        // Target symbol is a section symbol. Relocations need to
-                        // be adjusted to account for the section shift.
-                        let reloc_val = u32::from_le_bytes(reloc_data);
-
-                        reloc_val
-                            .checked_add(target_section.virtual_address())
-                            .ok_or_else(|| LinkGraphLinkError::RelocationOverflow {
-                                coff_name: section_node.coff().to_string(),
-                                section: section_node.name().to_string(),
-                                address: reloc.address(),
-                            })?
-                    } else if section_node.name().group_name() == target_section.name().group_name()
-                    {
-                        // Relocation targets a symbol defined in the same section.
-                        // Apply the relocation to the symbol address.
-
-                        let reloc_addr = reloc.address() + section_node.virtual_address();
-                        let symbol_addr =
-                            symbol_definition.weight().address() + target_section.virtual_address();
-
-                        let reloc_val = u32::from_be_bytes(reloc_data);
-                        let delta = symbol_addr.wrapping_sub(reloc_addr + 4);
-                        reloc_val.wrapping_add(delta)
-                    } else if target_symbol.is_label() {
-                        // Old relocation target symbol is a label. The current
-                        // relocation points to the section symbol and the label
-                        // was discarded.
-                        // Handle this like a section symbol relocation but
-                        // shift it to point to the label's virtual address in
-                        // the section.
-                        let reloc_val = u32::from_le_bytes(reloc_data);
-                        let symbol_addr = symbol_definition.weight().address();
-
-                        reloc_val
-                            .checked_add(target_section.virtual_address())
-                            .and_then(|reloc_val| reloc_val.checked_add(symbol_addr))
-                            .ok_or_else(|| LinkGraphLinkError::RelocationOverflow {
-                                coff_name: section_node.coff().to_string(),
-                                section: section_node.name().to_string(),
-                                address: reloc.address(),
-                            })?
-                    } else {
-                        // Relocation target is symbolic and does not need
-                        // updating
+                    let Some(definition) = definition else {
                         continue;
                     };
 
-                    // Write the new reloc
-                    section_data[reloc.address() as usize..reloc.address() as usize + 4]
-                        .copy_from_slice(&relocated_val.to_le_bytes());
+                    let target_symbol = definition.source();
+                    let target_section = definition.target();
+                    let reloc = reloc_edge.weight();
+                    let reloc_addr = section_node.virtual_address() + reloc.address();
+                    let target_addr = definition.weight().address() as u64
+                        + target_section.virtual_address() as u64;
+
+                    let read32le = |data: &[u8]| {
+                        type V = u32;
+                        data.get(..std::mem::size_of::<V>())
+                            .map(|data| {
+                                <[u8; std::mem::size_of::<V>()]>::try_from(data)
+                                    .unwrap_or_else(|_| unreachable!())
+                            })
+                            .map(V::from_le_bytes)
+                            .ok_or_else(|| LinkGraphLinkError::RelocationBounds {
+                                coff_name: section_node.coff().to_string(),
+                                section: section_node.name().to_string(),
+                                address: reloc.address(),
+                                size: section_node.data().len() as u32,
+                            })
+                    };
+
+                    let read64le = |data: &[u8]| {
+                        type V = u64;
+                        data.get(..std::mem::size_of::<V>())
+                            .map(|data| {
+                                <[u8; std::mem::size_of::<V>()]>::try_from(data)
+                                    .unwrap_or_else(|_| unreachable!())
+                            })
+                            .map(V::from_le_bytes)
+                            .ok_or_else(|| LinkGraphLinkError::RelocationBounds {
+                                coff_name: section_node.coff().to_string(),
+                                section: section_node.name().to_string(),
+                                address: reloc.address(),
+                                size: section_node.data().len() as u32,
+                            })
+                    };
+
+                    let write32le = |data: &mut [u8], val: u32| {
+                        type V = u32;
+                        data.get_mut(..std::mem::size_of::<V>())
+                            .ok_or_else(|| LinkGraphLinkError::RelocationBounds {
+                                coff_name: section_node.coff().to_string(),
+                                section: section_node.name().to_string(),
+                                address: reloc.address(),
+                                size: section_node.data().len() as u32,
+                            })?
+                            .copy_from_slice(&val.to_le_bytes());
+                        Ok(())
+                    };
+
+                    let write64le = |data: &mut [u8], val: u64| {
+                        type V = u64;
+                        data.get_mut(..std::mem::size_of::<V>())
+                            .ok_or_else(|| LinkGraphLinkError::RelocationBounds {
+                                coff_name: section_node.coff().to_string(),
+                                section: section_node.name().to_string(),
+                                address: reloc.address(),
+                                size: section_node.data().len() as u32,
+                            })?
+                            .copy_from_slice(&val.to_le_bytes());
+                        Ok(())
+                    };
+
+                    let add32 = |data: &mut [u8], amt| -> Result<(), LinkGraphLinkError> {
+                        write32le(
+                            data,
+                            read32le(data)?.checked_add(amt).ok_or_else(|| {
+                                LinkGraphLinkError::RelocationOverflow {
+                                    coff_name: section_node.coff().to_string(),
+                                    section: section_node.name().to_string(),
+                                    address: reloc.address(),
+                                }
+                            })?,
+                        )
+                    };
+
+                    let add64 = |data: &mut [u8], amt| -> Result<(), LinkGraphLinkError> {
+                        write64le(
+                            data,
+                            read64le(data)?.checked_add(amt).ok_or_else(|| {
+                                LinkGraphLinkError::RelocationOverflow {
+                                    coff_name: section_node.coff().to_string(),
+                                    section: section_node.name().to_string(),
+                                    address: reloc.address(),
+                                }
+                            })?,
+                        )
+                    };
+
+                    let apply_amd64_rel = |data, typ, address: u64, target: u64, base: u64| {
+                        match typ {
+                            IMAGE_REL_AMD64_ADDR32 => {
+                                add32(data, target as u32 + base as u32)?;
+                            }
+                            IMAGE_REL_AMD64_ADDR64 => {
+                                add64(data, target + base)?;
+                            }
+                            IMAGE_REL_AMD64_ADDR32NB => {
+                                add32(data, target as u32)?;
+                            }
+                            IMAGE_REL_AMD64_REL32..=IMAGE_REL_AMD64_REL32_5 => {
+                                let addend = typ;
+                                add32(
+                                    data,
+                                    target.wrapping_sub(address).wrapping_sub(addend.into()) as u32,
+                                )?;
+                            }
+                            IMAGE_REL_AMD64_SECTION | IMAGE_REL_AMD64_SECREL => {
+                                // These types of relocations do not make sense
+                                // to process since debug info is not supported
+                            }
+                            _ => {
+                                return Err(LinkGraphLinkError::UnsupportedRelocation {
+                                    coff_name: section_node.coff().to_string(),
+                                    section: section_node.name().to_string(),
+                                    address: reloc.address(),
+                                    typ,
+                                });
+                            }
+                        }
+                        Ok(())
+                    };
+
+                    let apply_i386_rel = |data, typ, address: u32, target: u32, base: u32| {
+                        match typ {
+                            IMAGE_REL_I386_ABSOLUTE => (),
+                            IMAGE_REL_I386_DIR32 => {
+                                add32(data, target + base)?;
+                            }
+                            IMAGE_REL_I386_DIR32NB => {
+                                add32(data, target)?;
+                            }
+                            IMAGE_REL_I386_REL32 => {
+                                add32(data, target - address - 4)?;
+                            }
+                            IMAGE_REL_I386_SECTION | IMAGE_REL_I386_SECREL => {
+                                // These types of relocations do not make sense
+                                // to process since debug info is not supported
+                            }
+                            _ => {
+                                return Err(LinkGraphLinkError::UnsupportedRelocation {
+                                    coff_name: section_node.coff().to_string(),
+                                    section: section_node.name().to_string(),
+                                    address: reloc.address(),
+                                    typ,
+                                });
+                            }
+                        }
+                        Ok(())
+                    };
+
+                    let reloc_data =
+                        section_data.get_mut(reloc_addr as usize..).ok_or_else(|| {
+                            LinkGraphLinkError::RelocationBounds {
+                                coff_name: section_node.coff().to_string(),
+                                section: section_node.name().to_string(),
+                                address: reloc.address(),
+                                size: section_node.data().len() as u32,
+                            }
+                        })?;
+
+                    // If the relocation is relative to a symbol defined in
+                    // the same section, fully apply it.
+                    // If the relocation not symbolic, adjust it by the amount
+                    // that the target symbol has shifted
+                    let is_intrasection = || {
+                        output_section
+                            .nodes
+                            .iter()
+                            .any(|&check_section| std::ptr::eq(check_section, target_section))
+                    };
+
+                    if !reloc.is_vabased(self.machine) && is_intrasection() {
+                        if self.machine == LinkerTargetArch::Amd64 {
+                            apply_amd64_rel(
+                                reloc_data,
+                                reloc.typ(),
+                                reloc_addr as u64,
+                                target_addr,
+                                0,
+                            )?;
+                        } else {
+                            apply_i386_rel(
+                                reloc_data,
+                                reloc.typ(),
+                                reloc_addr,
+                                target_addr as u32,
+                                0,
+                            )?;
+                        }
+                    } else if target_symbol.is_section_symbol() || target_symbol.is_label() {
+                        if self.machine == LinkerTargetArch::Amd64
+                            && reloc.typ() == IMAGE_REL_AMD64_ADDR64
+                        {
+                            add64(reloc_data, target_addr)?;
+                        } else {
+                            add32(reloc_data, target_addr as u32)?;
+                        }
+                    }
                 }
             }
         }

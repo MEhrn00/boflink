@@ -1,6 +1,9 @@
 use std::{cell::Cell, marker::PhantomData};
 
-use crate::graph::node::{LibraryNode, SectionNode, SymbolNode};
+use crate::{
+    graph::node::{LibraryNode, SectionNode, SymbolNode},
+    linker::LinkerTargetArch,
+};
 
 use super::node::{BorrowedSymbolName, SymbolReferencesIter};
 
@@ -9,6 +12,7 @@ use num_enum::{IntoPrimitive, TryFromPrimitive};
 use object::pe::{
     IMAGE_COMDAT_SELECT_ANY, IMAGE_COMDAT_SELECT_ASSOCIATIVE, IMAGE_COMDAT_SELECT_EXACT_MATCH,
     IMAGE_COMDAT_SELECT_LARGEST, IMAGE_COMDAT_SELECT_NODUPLICATES, IMAGE_COMDAT_SELECT_SAME_SIZE,
+    IMAGE_REL_AMD64_ADDR32, IMAGE_REL_AMD64_ADDR64, IMAGE_REL_I386_DIR32,
     IMAGE_WEAK_EXTERN_SEARCH_ALIAS, IMAGE_WEAK_EXTERN_SEARCH_LIBRARY,
     IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY,
 };
@@ -131,6 +135,36 @@ where
         // Post-condition asserting that pop_front() removed all of the edges
         // correctly
         debug_assert!(self.is_empty());
+    }
+
+    pub(super) fn retain(&self, mut f: impl FnMut(&'arena Edge<'arena, S, T, W>) -> bool) {
+        let mut curr = &self.head;
+        while let Some(edge) = curr.get() {
+            if f(edge) {
+                self.tail.set(Some(edge));
+            } else {
+                self.size.set(self.size.get().saturating_sub(1));
+                curr.set(edge.next_node().get());
+            }
+            curr = edge.next_node();
+        }
+    }
+
+    pub(super) fn try_retain<E>(
+        &self,
+        mut f: impl FnMut(&'arena Edge<'arena, S, T, W>) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let mut curr = &self.head;
+        while let Some(edge) = curr.get() {
+            if f(edge)? {
+                self.tail.set(Some(edge));
+            } else {
+                self.size.set(self.size.get().saturating_sub(1));
+                curr.set(edge.next_node().get());
+            }
+            curr = edge.next_node();
+        }
+        Ok(())
     }
 }
 
@@ -370,6 +404,15 @@ impl RelocationEdgeWeight {
     #[inline]
     pub fn typ(&self) -> u16 {
         self.typ
+    }
+
+    pub fn is_vabased(&self, arch: LinkerTargetArch) -> bool {
+        let typ = self.typ();
+        if arch == LinkerTargetArch::Amd64 {
+            typ == IMAGE_REL_AMD64_ADDR64 || typ == IMAGE_REL_AMD64_ADDR32
+        } else {
+            typ == IMAGE_REL_I386_DIR32
+        }
     }
 }
 

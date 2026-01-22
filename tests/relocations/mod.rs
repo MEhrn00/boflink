@@ -2,6 +2,7 @@ use boflink::linker::LinkerTargetArch;
 use object::{
     Object, ObjectSection, ObjectSymbol,
     coff::{CoffFile, ImageSymbol},
+    pe::IMAGE_REL_AMD64_ADDR64,
 };
 
 use crate::link_yaml;
@@ -177,4 +178,66 @@ fn same_section_symbol_flattened() {
         found_reloc_val, expected_reloc_val,
         "Relocation value in the 'source2_function' that references the other did not get adjusted correctly"
     );
+}
+
+#[test]
+fn addr_intrasection() {
+    let linked = link_yaml!("addr_intrasection.yaml", LinkerTargetArch::Amd64);
+
+    let coff: CoffFile = CoffFile::parse(linked.as_slice()).expect("Could not parse linked COFF");
+
+    let text_section = coff
+        .section_by_name(".text")
+        .expect("Could not find .text section in linked COFF");
+
+    let text_section_data = text_section
+        .data()
+        .expect("Could not get .text section data");
+
+    let tests = [
+        (IMAGE_REL_AMD64_ADDR64, 0, 0),
+        (IMAGE_REL_AMD64_ADDR64, 8, 48),
+        (IMAGE_REL_AMD64_ADDR64, 16, 0),
+        (IMAGE_REL_AMD64_ADDR64, 24, 0),
+        (IMAGE_REL_AMD64_ADDR64, 32, 48),
+        (IMAGE_REL_AMD64_ADDR64, 48, 48),
+        (IMAGE_REL_AMD64_ADDR64, 56, 0),
+    ];
+
+    for (idx, (reloc, (typ, addr, value))) in text_section
+        .coff_relocations()
+        .expect("Could not get COFF relocations")
+        .iter()
+        .zip(tests)
+        .enumerate()
+    {
+        assert_eq!(
+            reloc.typ.get(object::LittleEndian),
+            typ,
+            "{}: expected reloc type = {}, found = {}",
+            idx + 1,
+            typ,
+            reloc.typ.get(object::LittleEndian),
+        );
+        assert_eq!(
+            reloc.virtual_address.get(object::LittleEndian),
+            addr,
+            "{}: expected virtual address = {}, found = {}",
+            idx + 1,
+            addr,
+            reloc.virtual_address.get(object::LittleEndian),
+        );
+
+        let addr = addr as usize;
+
+        let reloc_value = u64::from_le_bytes(text_section_data[addr..addr + 8].try_into().unwrap());
+        assert_eq!(
+            reloc_value,
+            value,
+            "{}: expected reloc value = {}, found = {}",
+            idx + 1,
+            value,
+            reloc_value,
+        );
+    }
 }
