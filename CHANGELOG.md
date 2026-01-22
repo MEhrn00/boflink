@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-01-22
+
+### Fixed
+
+- Panic at `src/graph/output.rs:607` that would trigger if the size of the output `.bss` section
+  was larger than the total size of the output file. (#38)
+- CI built release binaries should now include the proper git short hash in `--version` messages
+  instead of the placeholder `(unknown)` string. (#39)
+- Typo in the `BeaconEnableBeaconGate` embedded Beacon API symbol caused it to not get resolved. (#40)
+- COMDAT leaders are now assigned to the correct symbol instead of making all following
+  definitions leaders for the group. (2f73fe9)
+- Virtual address based relocations were being incorrectly applied as relative relocations
+  when appearing in the same section as the target symbol. (00ac4ed)
+
 ## [0.6.0] - 2025-11-25
 
 ### Added
@@ -100,7 +114,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release
 
-[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.6.0...HEAD
+[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/MEhrn00/boflink/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/MEhrn00/boflink/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/MEhrn00/boflink/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MEhrn00/boflink/compare/v0.3.1...v0.4.0
