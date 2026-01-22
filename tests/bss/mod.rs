@@ -100,8 +100,7 @@ fn merged_bss_data() {
 
 #[test]
 fn commons_sorted() {
-    let linker =
-        setup_linker!("commons_sorted.yaml", LinkerTargetArch::Amd64).link_graph_path("graph.dot");
+    let linker = setup_linker!("commons_sorted.yaml", LinkerTargetArch::Amd64);
 
     let linked = linker.build().link().expect("Could not link files");
 
