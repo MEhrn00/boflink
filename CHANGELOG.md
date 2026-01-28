@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-01-28
+
+### Fixed
+
+- Handling of DLL imported symbols from i386 COFFs. (#45)
+  - The i386 underscore '_' prefix should now be added in the proper location.
+  - Imports from MinGW now include the stdcall suffix in the symbol name.
+
 ## [0.6.1] - 2026-01-22
 
 ### Fixed
@@ -114,7 +122,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release
 
-[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.6.1...HEAD
+[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/MEhrn00/boflink/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/MEhrn00/boflink/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/MEhrn00/boflink/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/MEhrn00/boflink/compare/v0.4.0...v0.5.0
