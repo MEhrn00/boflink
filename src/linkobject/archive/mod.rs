@@ -6,7 +6,6 @@ use std::{
 
 use indexmap::IndexMap;
 use object::{
-    Object,
     coff::{CoffFile, ImportFile},
     read::archive::{
         ArchiveFile, ArchiveMember, ArchiveMemberIterator, ArchiveOffset, ArchiveSymbolIterator,
@@ -203,11 +202,14 @@ impl<'a> LinkArchive<'a> {
     ) -> Result<ImportMember<'a>, MemberParseError> {
         let member_path = Path::new(member_name);
 
-        let symbol_member = LegacyImportSymbolMember::parse(coff)
+        // Parse this COFF as a symbol member
+        let mut symbol_member = LegacyImportSymbolMember::parse(coff)
             .map_err(|e| MemberParseError::new(member_path, e))?;
 
+        // Attach the DLL name to the import member. If the DLL name does
+        // not exist in the cache, search for it in the archive.
         let mut imports_cache = self.legacy_imports.borrow_mut();
-        let dll = match imports_cache.entry(symbol_member.head_symbol) {
+        symbol_member.import.dll = match imports_cache.entry(symbol_member.head_symbol) {
             std::collections::btree_map::Entry::Occupied(dll_entry) => *dll_entry.get(),
             std::collections::btree_map::Entry::Vacant(dll_entry) => {
                 // Get the head COFF for this symbol import member
@@ -286,13 +288,7 @@ impl<'a> LinkArchive<'a> {
             }
         };
 
-        Ok(ImportMember {
-            architecture: coff.architecture(),
-            symbol: symbol_member.public_symbol,
-            dll,
-            import: symbol_member.import_name,
-            typ: symbol_member.typ,
-        })
+        Ok(symbol_member.import)
     }
 
     /// Extracts the [`ArchiveMember`] that contains a definition for `symbol`.

@@ -59,6 +59,7 @@ impl From<object::read::coff::ImportType> for ImportType {
 }
 
 /// A short import COFF member from import libraries.
+#[derive(Debug, Clone)]
 pub struct ImportMember<'a> {
     /// The architecture for the import.
     pub(crate) architecture: Architecture,
@@ -73,8 +74,19 @@ pub struct ImportMember<'a> {
     pub(crate) import: ImportName<'a>,
 
     /// The type of import.
-    #[allow(unused)]
     pub(crate) typ: ImportType,
+}
+
+impl<'a> std::default::Default for ImportMember<'a> {
+    fn default() -> Self {
+        Self {
+            architecture: Architecture::Unknown,
+            symbol: "",
+            dll: "",
+            import: ImportName::Ordinal(0),
+            typ: ImportType::Code,
+        }
+    }
 }
 
 impl<'a> TryFrom<object::read::coff::ImportFile<'a>> for ImportMember<'a> {

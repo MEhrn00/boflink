@@ -1,35 +1,26 @@
 use std::ffi::CStr;
 
 use object::{
-    Object, ObjectSection, ObjectSymbol,
-    coff::{CoffFile, ImageSymbol},
-    pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, IMAGE_SYM_CLASS_EXTERNAL},
+    Architecture, Object, ObjectSection, ObjectSymbol, SymbolSection, coff::CoffFile,
+    pe::IMAGE_SCN_CNT_CODE,
 };
 
-use crate::linkobject::import::{ImportName, ImportType};
+use crate::linkobject::import::{ImportMember, ImportName, ImportType};
 
 use super::error::{
     LegacyImportHeadMemberParseError, LegacyImportSymbolMemberParseError,
     LegacyImportTailMemberParseError,
 };
 
-const ILT64_ORDINAL_BIT_SHIFT: u64 = 63;
-const ILT32_ORDINAL_BIT_SHIFT: u32 = 31;
-
-const ILT_ORDINAL_NUMBER_MASK: u64 = 0xffff;
-
 /// A parsed legacy import library member for a symbol.
 pub struct LegacyImportSymbolMember<'a> {
-    /// The public symbol name.
-    pub public_symbol: &'a str,
+    /// The partiall built import file member.
+    ///
+    /// The dll portion is missing and lookup for the import tail
+    pub import: ImportMember<'a>,
 
-    /// The name to import the symbol as.
-    pub import_name: ImportName<'a>,
-
-    /// The type of import.
-    pub typ: ImportType,
-
-    /// The name of the head symbol.
+    /// The name of the head symbol which links this legacy import library
+    /// symbol member to the import directory entry.
     pub head_symbol: &'a str,
 }
 
@@ -41,133 +32,91 @@ impl<'a> LegacyImportSymbolMember<'a> {
             return Err(LegacyImportSymbolMemberParseError::Invalid);
         }
 
-        // This is the first '.idata' section after the .text, .data and .bss
-        // sections. Use this as a smoke test to check if the COFF is valid.
-        if coff.section_by_name(".idata$7").is_none() {
+        // Check for IAT (.idata$5) and Hint/Name table (.idata$6)
+        let mut have_iat_section = false;
+        let mut have_hintname_section = false;
+        for section in coff.sections() {
+            let name = section.name()?;
+            if name == ".idata$5" {
+                have_iat_section = true;
+            } else if name == ".idata$6" {
+                have_hintname_section = true;
+            }
+        }
+
+        // If there is no IAT and Hint/Name table, this is not an import COFF
+        if !(have_iat_section && have_hintname_section) {
             return Err(LegacyImportSymbolMemberParseError::Invalid);
         }
 
-        // Get the ILT for the import.
-        let ilt_section = coff
-            .section_by_name(".idata$4")
-            .ok_or(LegacyImportSymbolMemberParseError::IltMissing)?;
+        let mut thunk_entry = None;
+        let mut import_symbol = None;
+        let mut head_symbol = None;
 
-        let ilt_data = ilt_section.data()?;
-
-        let ilt = if coff.is_64() {
-            u64::from_le_bytes(
-                ilt_data[..8]
-                    .try_into()
-                    .map_err(|_| LegacyImportSymbolMemberParseError::IltMalformed)?,
-            )
-        } else {
-            u32::from_le_bytes(
-                ilt_data[..4]
-                    .try_into()
-                    .map_err(|_| LegacyImportSymbolMemberParseError::IltMalformed)?,
-            )
-            .into()
-        };
-
-        // Extract out the import name from the ILT
-        let import_name = if (coff.is_64() && (ilt & (1 << ILT64_ORDINAL_BIT_SHIFT) != 0))
-            || (!coff.is_64() && (ilt & (1 << ILT32_ORDINAL_BIT_SHIFT) != 0))
-        {
-            ImportName::Ordinal((ilt & ILT_ORDINAL_NUMBER_MASK) as u16)
-        } else {
-            let name_section = coff
-                .section_by_name(".idata$6")
-                .ok_or(LegacyImportSymbolMemberParseError::MissingIltNameSection)?;
-            let name_data = name_section.data()?;
-
-            let name_bytes = name_data
-                .get(2..)
-                .ok_or(LegacyImportSymbolMemberParseError::IltNameMalformed)?;
-
-            let name = CStr::from_bytes_until_nul(name_bytes)
-                .map(|name| name.to_str())
-                .unwrap_or_else(|_| std::str::from_utf8(name_bytes))
-                .map_err(LegacyImportSymbolMemberParseError::ImportName)?;
-
-            ImportName::Name(name)
-        };
-
-        // Grab the IAT symbol.
-        let iat_symbol = coff
-            .symbols()
-            .filter(|symbol| symbol.coff_symbol().storage_class() == IMAGE_SYM_CLASS_EXTERNAL)
-            .find(|symbol| {
-                symbol
-                    .section_index()
-                    .and_then(|section_idx| coff.section_by_index(section_idx).ok())
-                    .and_then(|section| section.name().ok())
-                    .is_some_and(|section_name| section_name.starts_with(".idata$"))
-            })
-            .ok_or(LegacyImportSymbolMemberParseError::MissingIatSymbol)?;
-
-        let iat_section = coff
-            .section_by_index(
-                iat_symbol
-                    .section_index()
-                    .unwrap_or_else(|| unreachable!("IAT symbol should be defined in a section")),
-            )
-            .unwrap_or_else(|_| unreachable!("IAT symbol section is out of bounds"));
-
-        let public_symbol = iat_symbol.name()?.trim_start_matches("__imp_");
-
-        let mut typ = ImportType::Data;
-
-        // Find the import type by searching for a thunk section with a relocation
-        // to the IAT
-        'sections: for section in coff.sections() {
-            let section_name = match section.name() {
-                Ok(name) => name,
-                Err(_) => continue,
-            };
-
-            if section_name.starts_with(".idata$") {
+        // Scan symbol table for entries
+        for symbol in coff.symbols() {
+            if symbol.is_local() {
                 continue;
             }
 
-            for reloc in section.coff_relocations().into_iter().flatten() {
-                let reloc_symbol = match coff.symbol_by_index(reloc.symbol()) {
-                    Ok(reloc_symbol) => reloc_symbol,
-                    Err(_) => continue,
-                };
+            if symbol.is_undefined() && head_symbol.is_none() {
+                // Head symbol
+                head_symbol = Some(symbol);
+            } else if let SymbolSection::Section(section_index) = symbol.section() {
+                // Either the import symbol or the thunk symbol
+                let section = coff.section_by_index(section_index)?;
+                let section_name = section.name()?;
 
-                if reloc_symbol
-                    .section_index()
-                    .is_some_and(|reloc_section| reloc_section == iat_section.index())
-                {
-                    let characteristics = section
-                        .coff_section()
-                        .characteristics
-                        .get(object::LittleEndian);
-
-                    if characteristics & IMAGE_SCN_CNT_CODE != 0 {
-                        typ = ImportType::Code;
-                    } else if characteristics & IMAGE_SCN_MEM_READ != 0
-                        && characteristics & IMAGE_SCN_MEM_WRITE == 0
-                    {
-                        typ = ImportType::Const;
-                    }
-
-                    break 'sections;
+                // Import symbol for the IAT entry
+                if section_name == ".idata$5" && import_symbol.is_none() {
+                    import_symbol = Some(symbol);
+                } else if thunk_entry.is_none() {
+                    // Symbol for the import thunk
+                    thunk_entry = Some((symbol, section));
                 }
             }
         }
 
-        let head_symbol = coff
-            .symbols()
-            .filter(|symbol| symbol.coff_symbol().storage_class() == IMAGE_SYM_CLASS_EXTERNAL)
-            .find_map(|symbol| symbol.is_undefined().then(|| symbol.name().ok()).flatten())
-            .ok_or(LegacyImportSymbolMemberParseError::MissingHeadSymbol)?;
+        let import_symbol = import_symbol.ok_or(LegacyImportSymbolMemberParseError::Iat)?;
+
+        let mut import = ImportMember {
+            architecture: coff.architecture(),
+            typ: ImportType::Data,
+            ..Default::default()
+        };
+
+        if let Some((thunk_symbol, thunk_section)) = thunk_entry {
+            // Use the thunk symbol as the public symbol name if found
+            import.symbol = thunk_symbol.name()?;
+
+            // Check if the thunk section is a code section and set the import
+            // type
+            let characteristics = thunk_section
+                .coff_section()
+                .characteristics
+                .get(object::LittleEndian);
+            if characteristics & IMAGE_SCN_CNT_CODE != 0 {
+                import.typ = ImportType::Code;
+            }
+        } else {
+            // If no thunk was found, use the stripped `__imp_` prefixed import
+            // symbol
+            import.symbol = import_symbol.name()?;
+        }
+
+        // Set the import name to the public symbol name. Remove the i386
+        // mangling prefix if the COFF is i386
+        import.import = if coff.architecture() == Architecture::I386 {
+            ImportName::Name(import.symbol.trim_start_matches('_'))
+        } else {
+            ImportName::Name(import.symbol)
+        };
 
         Ok(LegacyImportSymbolMember {
-            public_symbol,
-            typ,
-            import_name,
-            head_symbol,
+            import,
+            head_symbol: head_symbol
+                .ok_or(LegacyImportSymbolMemberParseError::MissingHeadSymbol)?
+                .name()?,
         })
     }
 }

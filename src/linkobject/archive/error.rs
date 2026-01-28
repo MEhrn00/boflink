@@ -104,23 +104,8 @@ pub enum LegacyImportSymbolMemberParseError {
     #[error("'_head_*' symbol is missing")]
     MissingHeadSymbol,
 
-    #[error("import lookup table is missing")]
-    IltMissing,
-
-    #[error("import lookup table data is malformed")]
-    IltMalformed,
-
-    #[error("import lookup table is missing the name table section")]
-    MissingIltNameSection,
-
-    #[error("import lookup table name section is malformed")]
-    IltNameMalformed,
-
-    #[error("import address table symbol is missing")]
-    MissingIatSymbol,
-
-    #[error("name string from the import lookup table name table could not be parsed: {0}")]
-    ImportName(std::str::Utf8Error),
+    #[error("import address table entry is missing or malformed")]
+    Iat,
 
     #[error("{0}")]
     Object(#[from] object::read::Error),
