@@ -751,7 +751,11 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                 warn!(
                     "found ordinal import value '{o}' for symbol \"{symbol}\". Linking public symbol name."
                 );
-                import.symbol
+                if import.architecture == Architecture::I386 {
+                    import.symbol.trim_start_matches('_')
+                } else {
+                    import.symbol
+                }
             }
         };
 

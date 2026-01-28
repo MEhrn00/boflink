@@ -345,9 +345,14 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
                 let symbol = import.source();
 
                 let name = self.arena.alloc_str(&format!(
-                    "__imp_{}${}",
-                    library.name().trim_dll_suffix(),
-                    import.weight().import_name()
+                    "__imp_{mangling_prefix}{library_name}${symbol_name}",
+                    mangling_prefix = if self.machine == LinkerTargetArch::I386 {
+                        "_"
+                    } else {
+                        ""
+                    },
+                    library_name = library.name().trim_dll_suffix(),
+                    symbol_name = import.weight().import_name(),
                 ));
 
                 let _ = symbol
