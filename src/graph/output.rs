@@ -303,14 +303,25 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
             }
         }
 
+        let mangling_prefix = if self.machine == LinkerTargetArch::I386 {
+            "_"
+        } else {
+            ""
+        };
+
         // Reserve API imported symbols
         if let Some(api_node) = self.api_node {
             for import in api_node.imports() {
                 let symbol = import.source();
 
+                let name = self.arena.alloc_str(&format!(
+                    "__imp_{mangling_prefix}{symbol_name}",
+                    symbol_name = import.weight().import_name(),
+                ));
+
                 let _ = symbol
                     .output_name()
-                    .get_or_init(|| coff_writer.add_name(symbol.name().as_str().as_bytes()));
+                    .get_or_init(|| coff_writer.add_name(name.as_bytes()));
 
                 symbol
                     .assign_table_index(coff_writer.reserve_symbol_index())
