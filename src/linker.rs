@@ -787,6 +787,7 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
             }
         };
 
+        let string_arena = Arena::new();
         let api_symbols = match self.custom_api.take() {
             Some(custom_api) => match input_processor.open_custom_api(custom_api) {
                 Ok(api_symbols) => api_symbols,
@@ -795,7 +796,7 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
                     return Err(LinkError::Setup(LinkerSetupErrors(setup_errors)));
                 }
             },
-            None => ApiSymbols::beacon(target_arch),
+            None => ApiSymbols::beacon(&string_arena, target_arch),
         };
 
         // Check errors

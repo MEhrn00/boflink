@@ -2,6 +2,8 @@ mod beaconapi;
 
 use std::{collections::HashMap, path::Path};
 
+use typed_arena::Arena;
+
 use crate::{
     linker::LinkerTargetArch,
     linkobject::{
@@ -29,10 +31,10 @@ pub struct ApiSymbols<'a> {
 
 impl<'a> ApiSymbols<'a> {
     /// Creates a new [`ApiSymbols`] but using the Beacon API symbols.
-    pub fn beacon(architecture: LinkerTargetArch) -> ApiSymbols<'a> {
+    pub fn beacon(strings: &'a Arena<u8>, architecture: LinkerTargetArch) -> ApiSymbols<'a> {
         ApiSymbols {
             archive_path: Path::new("BEACONAPI"),
-            symbols: beaconapi::symbols(architecture),
+            symbols: beaconapi::symbols(strings, architecture),
         }
     }
 
