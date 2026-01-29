@@ -1,15 +1,18 @@
-use std::process::Command;
+use std::{path::PathBuf, process::Command};
 
 use anyhow::{Result, anyhow, bail};
-use log::{debug, error, info};
+use log::{error, info};
 
 use arguments::{ParsedCliArgs, ParsedCliInput};
 use libsearch::LibrarySearcher;
 use linker::{LinkError, LinkerBuilder};
 
+use crate::arguments::CliOptionArgs;
+
 mod api;
 mod arguments;
 mod drectve;
+mod fsutils;
 mod graph;
 mod libsearch;
 mod linker;
@@ -84,51 +87,7 @@ fn run_linker(args: &mut ParsedCliArgs) -> anyhow::Result<()> {
         }
     }
 
-    let mingwbin = if args.options.mingw64 {
-        Some("x86_64-w64-mingw32-gcc")
-    } else if args.options.mingw32 {
-        Some("i686-w64-mingw32-gcc")
-    } else if args.options.ucrt64 {
-        Some("x86_64-w64-mingw32ucrt-gcc")
-    } else if args.options.ucrt32 {
-        Some("i686-w64-mingw32ucrt-gcc")
-    } else {
-        None
-    };
-
-    if let Some(mingwbin) = mingwbin {
-        let query = Command::new(mingwbin)
-            .arg("--print-search-dirs")
-            .output()
-            .map_err(|e| anyhow!("could not query {mingwbin} ({e})"))?;
-
-        if !query.status.success() {
-            if let Some(code) = query.status.code() {
-                bail!("{mingwbin} returned a non-zero exit code {code}");
-            } else {
-                bail!("{mingwbin} exited abruptly");
-            }
-        }
-
-        let stdout = std::str::from_utf8(&query.stdout)
-            .map_err(|e| anyhow!("could not decode {mingwbin} output ({e})"))?;
-
-        for line in stdout.lines() {
-            if let Some(line) = line.strip_prefix("libraries: ") {
-                let line = line.trim_start_matches("=");
-
-                if log::log_enabled!(log::Level::Debug) {
-                    let search_paths = std::env::split_paths(line).collect::<Vec<_>>();
-                    debug!("search paths from {mingwbin}: {search_paths:?}");
-                    library_searcher.extend_search_paths(search_paths);
-                } else {
-                    library_searcher.extend_search_paths(std::env::split_paths(line));
-                }
-
-                break;
-            }
-        }
-    }
+    library_searcher.extend_search_paths(include_mingw_search_paths(&args.options)?);
 
     let mut linker = LinkerBuilder::new()
         .library_searcher(library_searcher)
@@ -200,4 +159,52 @@ fn run_linker(args: &mut ParsedCliArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn include_mingw_search_paths(options: &CliOptionArgs) -> anyhow::Result<Vec<PathBuf>> {
+    let mut search_paths = Vec::new();
+    if options.mingw64 {
+        search_paths = query_gcc("x86_64-w64-mingw32-gcc")?;
+    } else if options.mingw32 {
+        search_paths = query_gcc("i686-w64-mingw32-gcc")?;
+    } else if options.ucrt64 {
+        search_paths = query_gcc("x86_64-w64-mingw32ucrt-gcc")?;
+    } else if options.ucrt32 {
+        search_paths = query_gcc("i686-w64-mingw32ucrt-gcc")?;
+    }
+
+    Ok(search_paths)
+}
+
+/// Queries the specified MinGW GCC executable for its list of library search
+/// paths.
+fn query_gcc(gcc: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let cmdline = || format!("{gcc} --print-search-dirs");
+
+    let print_search_dirs = Command::new(gcc)
+        .arg("--print-search-dirs")
+        .output()
+        .map_err(|e| anyhow!("cannot run '{}': {e}", cmdline()))?;
+
+    if !print_search_dirs.status.success() {
+        if let Some(code) = print_search_dirs.status.code() {
+            bail!("'{}' returned a non-zero exit code {code}", cmdline());
+        } else {
+            bail!("'{}' exited abruptly", cmdline());
+        }
+    }
+
+    let stdout = std::str::from_utf8(&print_search_dirs.stdout)
+        .map_err(|e| anyhow!("cannot not decode '{}' output: {e}", cmdline()))?;
+
+    let libraries = stdout.lines().find_map(|line| {
+        let line = line.strip_prefix("libraries: ")?;
+        Some(line.trim_start_matches("="))
+    });
+
+    let search_dirs = Vec::from_iter(libraries.into_iter().flat_map(|libraries| {
+        std::env::split_paths(libraries).map(fsutils::lexically_normalize_path)
+    }));
+
+    Ok(search_dirs)
 }
