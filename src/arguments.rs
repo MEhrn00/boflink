@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
 use boflink::linker::LinkerTargetArch;
 use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
+use os_str_bytes::OsStrBytesExt;
 
 use crate::logging::ColorOption;
 
@@ -26,6 +27,14 @@ pub struct CliArgs {
 
 #[derive(Parser, Debug)]
 pub struct CliOptionArgs {
+    /// Use colors in diagnostic messages
+    #[arg(long, value_name = "value", default_value_t = ColorOption::Auto)]
+    pub color_diagnostics: ColorOption,
+
+    /// Deprecated alias for '--color-diagnostics'
+    #[arg(long, value_name = "color", default_value_t = ColorOption::Auto)]
+    pub color: ColorOption,
+
     /// Set the output file name
     #[arg(
         short,
@@ -115,10 +124,6 @@ pub struct CliOptionArgs {
     /// Query i686-w64-mingw32ucrt-gcc for its list of library search paths
     #[arg(long)]
     pub ucrt32: bool,
-
-    /// Print colored output
-    #[arg(long, value_name = "color", default_value_t = ColorOption::Auto)]
-    pub color: ColorOption,
 
     /// Increasing logging verbosity
     #[arg(long, short = 'v', action = clap::ArgAction::Count)]
@@ -350,8 +355,27 @@ pub fn parse_arguments() -> anyhow::Result<ParsedCliArgs> {
         arg
     }));
 
-    let options = CliOptionArgs::from_arg_matches(&matches)?;
+    let mut options = CliOptionArgs::from_arg_matches(&matches)?;
+    if options.color_diagnostics != options.color {
+        let last_color = std::env::args_os().rfind(|arg| {
+            arg == "--color"
+                || arg.starts_with("--color=")
+                || arg == "--color-diagnostics"
+                || arg.starts_with("--color-diagnostics=")
+        });
+
+        if last_color.is_some_and(|val| val == "--color" || val.starts_with("--color=")) {
+            options.color_diagnostics = options.color;
+        }
+    }
+
     setup_logging(&options);
+
+    if std::env::args_os().any(|arg| arg == "--color" || arg.starts_with("--color=")) {
+        log::warn!(
+            "'--color' is a deprecated alias for '--color-diagnostics' and will be removed in the next release"
+        );
+    }
 
     Ok(ParsedCliArgs {
         inputs: CliInputArgs::from_matches(&matches),
@@ -367,6 +391,6 @@ fn setup_logging(options: &CliOptionArgs) {
         max_level = log::Level::Debug;
     }
 
-    crate::logging::init(max_level, options.color, 0)
+    crate::logging::init(max_level, options.color_diagnostics, 0)
         .expect("logging should only be initialized once");
 }
