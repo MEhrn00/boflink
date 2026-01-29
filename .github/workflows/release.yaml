@@ -10,7 +10,6 @@ env:
   CARGO_PROFILE_RELEASE_LTO: fat
   CARGO_PROFILE_RELEASE_STRIP: symbols
   CARGO_BUILD_DEP_INFO_BASEDIR: "."
-  BOFLINK_TEST_CLANG: clang-20
 
 concurrency:
   group: "release"
@@ -25,6 +24,8 @@ jobs:
     env:
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C target-feature=+crt-static
+      BOFLINK_TEST_CLANG: clang-20
+      BOFLINK_TEST_DLLTOOL: llvm-dlltool-20
 
     runs-on: ubuntu-latest
     steps:

@@ -20,17 +20,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  BOFLINK_TEST_CLANG: clang-20
 
 jobs:
-  ci:
-    name: Run CI tasks
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+  ci-linux:
+    runs-on: ubuntu-latest
+    env:
+      BOFLINK_TEST_CLANG: clang-20
+      BOFLINK_TEST_DLLTOOL: llvm-dlltool-20
 
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -40,8 +37,19 @@ jobs:
           rustup component add clippy rustfmt
 
       - name: Install CI deps
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y clang-20 llvm-20
+
+      - run: cargo xtask ci
+
+  ci-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clippy and rustfmt
+        run: |
+          rustup update
+          rustup component add clippy rustfmt
 
       - run: cargo xtask ci
