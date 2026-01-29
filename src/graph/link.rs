@@ -532,9 +532,10 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                 if graph_section.name().as_str() == ".rdata$zzz" && checksum == 0 {
                     // Calculate and set the auxiliary checksum value if needed
                     if let SectionNodeData::Initialized(data) = graph_section.data() {
-                        let mut h = jamcrc::Hasher::new_with_initial(!0);
+                        // JamCRC
+                        let mut h = crc32fast::Hasher::new_with_initial(!0);
                         h.update(data);
-                        checksum = h.finalize();
+                        checksum = !h.finalize();
                     }
                 }
 
