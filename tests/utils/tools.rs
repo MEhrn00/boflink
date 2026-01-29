@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use std::{
     ffi::{OsStr, OsString},
     io::Write,
@@ -7,7 +5,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use tempfile::{Builder, NamedTempFile, TempDir};
+use crate::utils::testfs::TestFs;
 
 #[derive(Debug, Clone)]
 pub struct Clang {
@@ -16,6 +14,7 @@ pub struct Clang {
     flags: Vec<OsString>,
     files: Vec<PathBuf>,
     stdin: String,
+    out_dir: PathBuf,
 }
 
 impl std::default::Default for Clang {
@@ -29,13 +28,20 @@ impl std::default::Default for Clang {
             files: Vec::new(),
             flags: Vec::new(),
             stdin: String::new(),
+            out_dir: PathBuf::new(),
         }
     }
 }
 
+#[allow(unused)]
 impl Clang {
     pub fn target(&mut self, target: &str) -> &mut Clang {
         self.target = target.to_string();
+        self
+    }
+
+    pub fn out_dir(&mut self, path: impl AsRef<Path>) -> &mut Clang {
+        self.out_dir = path.as_ref().to_owned();
         self
     }
 
@@ -66,26 +72,22 @@ impl Clang {
         self
     }
 
-    pub fn compile_objs(&self) -> ToolOutput {
-        let temp_dir = Builder::new()
-            .prefix("boflink-out")
-            .tempdir()
-            .expect("failed creating temporary directory");
+    pub fn compile_objs(&self) -> Vec<PathBuf> {
+        let mut out_paths = Vec::with_capacity(self.files.len());
+        for src_path in self.files.iter() {
+            let mut out_path = PathBuf::new();
+            if !self.out_dir.as_os_str().is_empty() {
+                out_path.push(&self.out_dir);
+                let filename = src_path.file_name().unwrap_or_else(|| {
+                    panic!("{} has not file name component", src_path.display())
+                });
+                out_path.push(filename);
+                out_path.set_extension("o");
+            } else {
+                out_path.push(src_path);
+                out_path.set_extension("o");
+            }
 
-        let out_files = self
-            .files
-            .iter()
-            .map(|file| {
-                let filename = file
-                    .file_name()
-                    .unwrap_or_else(|| panic!("{} has no file name", file.display()));
-                let mut outpath = temp_dir.as_ref().join(filename);
-                outpath.set_extension("o");
-                outpath
-            })
-            .collect::<Vec<_>>();
-
-        for (out_path, src_path) in out_files.iter().zip(self.files.iter()) {
             let mut child = Command::new(&self.exe)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -94,7 +96,7 @@ impl Clang {
                 .args(self.flags.iter())
                 .arg("-c")
                 .arg("-o")
-                .arg(out_path)
+                .arg(&out_path)
                 .arg(src_path)
                 .spawn()
                 .expect("failed running command");
@@ -110,30 +112,19 @@ impl Clang {
                 .expect("failed waiting for child process");
 
             if !output.status.success() {
-                panic!("clang returned non-zero exit code");
+                let stdout = output.stdout;
+                let stderr = output.stderr;
+                panic!(
+                    "clang returned non-zero exit code\nSTDOUT:\n{}\nSTDERR:\n{}\n",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
             }
+
+            out_paths.push(out_path);
         }
 
-        ToolOutput {
-            dir: temp_dir,
-            files: out_files,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct ToolOutput {
-    dir: TempDir,
-    files: Vec<PathBuf>,
-}
-
-impl ToolOutput {
-    pub fn dir(&self) -> &Path {
-        self.dir.as_ref()
-    }
-
-    pub fn paths(&self) -> &[PathBuf] {
-        &self.files
+        out_paths
     }
 }
 
@@ -143,6 +134,7 @@ pub struct Dlltool {
     machine: String,
     dllname: String,
     deffile: PathBuf,
+    libpath: PathBuf,
     flags: Vec<OsString>,
 }
 
@@ -155,11 +147,13 @@ impl std::default::Default for Dlltool {
             machine: "i386:x86-64".into(),
             dllname: String::new(),
             deffile: PathBuf::new(),
+            libpath: PathBuf::new(),
             flags: Vec::new(),
         }
     }
 }
 
+#[allow(unused)]
 impl Dlltool {
     pub fn machine(&mut self, machine: &str) -> &mut Dlltool {
         self.machine = machine.into();
@@ -173,6 +167,11 @@ impl Dlltool {
 
     pub fn def(&mut self, p: impl AsRef<Path>) -> &mut Dlltool {
         self.deffile = p.as_ref().to_owned();
+        self
+    }
+
+    pub fn lib(&mut self, p: impl AsRef<Path>) -> &mut Dlltool {
+        self.libpath = p.as_ref().to_owned();
         self
     }
 
@@ -190,9 +189,7 @@ impl Dlltool {
         self
     }
 
-    pub fn generate_importlib(&self) -> NamedTempFile {
-        let outfile = NamedTempFile::with_suffix(".lib").expect("failed creating tempfile");
-
+    pub fn generate_importlib(&self) -> PathBuf {
         let mut cmd = Command::new(&self.exe);
         cmd.args(["-m", &self.machine]);
         cmd.arg("-d");
@@ -203,7 +200,15 @@ impl Dlltool {
         }
 
         cmd.arg("-l");
-        cmd.arg(outfile.path());
+
+        let mut outpath = PathBuf::new();
+        if !self.libpath.as_os_str().is_empty() {
+            outpath = self.libpath.clone();
+        } else {
+            outpath = self.deffile.clone();
+            outpath.set_extension("lib");
+        }
+        cmd.arg(&outpath);
 
         if !self.flags.is_empty() {
             cmd.args(&self.flags);
@@ -214,48 +219,33 @@ impl Dlltool {
             panic!("llvm-dlltool returned non-zero exit code");
         }
 
-        outfile
+        outpath
     }
 }
 
-pub fn clang() -> Clang {
-    Default::default()
-}
-
-pub fn asm1(src: impl AsRef<str>) -> ToolOutput {
-    let mut srcfile = NamedTempFile::with_suffix(".S").expect("failed creating source tempfile");
-    srcfile
-        .write_all(src.as_ref().as_bytes())
-        .expect("failed writing source contents");
-
-    clang().file(&srcfile).compile_objs()
-}
-
-pub fn asm<I: Iterator>(srcs: I) -> ToolOutput
-where
-    <I as Iterator>::Item: AsRef<str>,
-{
-    let srcdir = Builder::new()
-        .prefix("boflink-src")
-        .tempdir()
-        .expect("failed creating temporary directory");
-
-    let mut c = clang();
-    for (i, src) in srcs.enumerate() {
-        let filename = format!("file{i}.S");
-        let srcpath = srcdir.path().join(filename);
-        std::fs::write(&srcpath, src.as_ref().as_bytes()).expect("failed writing source file");
-        c.file(srcpath);
+pub fn asm<N: AsRef<str>, C: AsRef<str>>(fs: &TestFs) -> impl FnMut(N, C) -> PathBuf {
+    move |name, content| {
+        let mut path = PathBuf::from(name.as_ref());
+        path.set_extension("S");
+        fs.write(&path, content.as_ref().as_bytes())
+            .expect("failed writing source file");
+        Clang::default()
+            .file(fs.join_path(path))
+            .compile_objs()
+            .into_iter()
+            .next()
+            .unwrap()
     }
-
-    c.compile_objs()
 }
 
-pub fn dlltool(def: impl AsRef<str>) -> NamedTempFile {
-    let mut srcfile = NamedTempFile::with_suffix(".def").expect("failed creating def tempfile");
-    srcfile
-        .write_all(def.as_ref().as_bytes())
-        .expect("failed writing def file contents");
-
-    Dlltool::default().def(&srcfile).generate_importlib()
+pub fn dlltool<N: AsRef<str>, C: AsRef<str>>(fs: &TestFs) -> impl FnMut(N, C) -> PathBuf {
+    move |name, content| {
+        let mut path = PathBuf::from(name.as_ref());
+        path.set_extension("def");
+        fs.write(&path, content.as_ref().as_bytes())
+            .expect("failed writing def file");
+        Dlltool::default()
+            .def(fs.join_path(path))
+            .generate_importlib()
+    }
 }

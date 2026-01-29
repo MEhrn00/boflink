@@ -1,14 +1,16 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use object::{Object, ObjectSection, ObjectSymbol, coff::CoffFile};
-use tempfile::NamedTempFile;
 
-use crate::utils::tools::{asm, asm1, dlltool};
+use crate::utils::{
+    testfs::TestFs,
+    tools::{asm, dlltool},
+};
 
 mod utils;
 
 #[test]
 fn bss_resized() {
-    let objs = asm([
+    let srcs = [
         r#"
 .section .bss
 .space 32
@@ -17,23 +19,24 @@ fn bss_resized() {
 .section .bss
 .space 16
 "#,
-    ]
-    .iter());
+    ];
 
-    let out = NamedTempFile::new().expect("failed creating output tempfile");
+    let fs = TestFs::new("bss_resized").unwrap();
+    let out = fs.join_path("a.bof");
+    let mut asm = asm(&fs);
 
     cargo_bin_cmd!()
         .arg("-o")
-        .arg(out.path())
-        .args(objs.paths())
+        .arg(&out)
+        .arg(asm("file1", srcs[0]))
+        .arg(asm("file2", srcs[1]))
         .assert()
         .success();
 
-    let linked = std::fs::read(out.path()).expect("failed reading output");
-    let parsed: CoffFile =
-        CoffFile::parse(linked.as_slice()).expect("failed parsing linked output");
+    let linked = std::fs::read(&out).expect("failed reading output");
+    let coff: CoffFile = CoffFile::parse(linked.as_slice()).expect("failed parsing linked output");
 
-    let bss_section = parsed
+    let bss_section = coff
         .section_by_name(".bss")
         .expect("Could not find .bss section");
 
@@ -49,22 +52,22 @@ fn bss_resized() {
 
 #[test]
 fn commons_sorting() {
-    let obj = asm1(
-        r#"
+    let src = r#"
 .comm small,4
-.comm large,32"#,
-    );
+.comm large,32
+"#;
 
-    let out = NamedTempFile::new().expect("failed creating output tempfile");
+    let fs = TestFs::new("commons_sorting").unwrap();
+    let out = fs.join_path("a.bof");
 
     cargo_bin_cmd!()
         .arg("-o")
-        .arg(out.path())
-        .args(obj.paths())
+        .arg(&out)
+        .arg(asm(&fs)("file1", src))
         .assert()
         .success();
 
-    let linked = std::fs::read(out.path()).expect("failed reading output");
+    let linked = std::fs::read(&out).expect("failed reading output");
     let coff: CoffFile = CoffFile::parse(linked.as_slice()).expect("failed parsing linked output");
 
     let small = coff
@@ -83,7 +86,7 @@ fn commons_sorting() {
 
 #[test]
 fn any_comdat_first_seen() {
-    let objs = asm([
+    let srcs = [
         r#"
 .globl foo
 .section .text$foo,"x",discard,foo
@@ -99,19 +102,21 @@ foo:
   nop
   ret
 "#,
-    ]
-    .iter());
+    ];
 
-    let out = NamedTempFile::new().expect("failed creating output tempfile");
+    let fs = TestFs::new("any_comdat_first_seen").unwrap();
+    let out = fs.join_path("a.bof");
+    let mut asm = asm(&fs);
 
     cargo_bin_cmd!()
         .arg("-o")
-        .arg(out.path())
-        .args(objs.paths())
+        .arg(&out)
+        .arg(asm("file1", srcs[0]))
+        .arg(asm("file2", srcs[1]))
         .assert()
         .success();
 
-    let linked = std::fs::read(out.path()).expect("failed reading output");
+    let linked = std::fs::read(&out).expect("failed reading output");
     let coff: CoffFile = CoffFile::parse(linked.as_slice()).expect("failed parsing linked output");
 
     let code = coff
@@ -126,47 +131,45 @@ foo:
 
 #[test]
 fn fail_no_gc_roots() {
-    let obj = asm1(
-        r#"
+    let src = r#"
 .globl foo
 .text
 foo:
-  ret"#,
-    );
+  ret"#;
 
-    let out = NamedTempFile::new().expect("failed creating output tempfile");
+    let fs = TestFs::new("fail_no_gc_roots").unwrap();
+    let out = fs.join_path("a.bof");
 
     // This should fail since GC roots could not be found
     cargo_bin_cmd!()
         .arg("-o")
-        .arg(out.path())
+        .arg(&out)
         .arg("--gc-sections")
-        .args(obj.paths())
+        .arg(asm(&fs)("file1", src))
         .assert()
         .failure();
 }
 
 #[test]
 fn dfr_prefix() {
-    let obj = asm1(".globl __imp_foo");
-    let importlib = dlltool(
-        r#"
+    let src = ".globl __imp_foo";
+    let importlib = r#"
 LIBRARY foolib.dll
 EXPORTS
-foo"#,
-    );
-
-    let out = NamedTempFile::new().expect("failed creating output tempfile");
+foo
+"#;
+    let fs = TestFs::new("dfr_prefix").unwrap();
+    let out = fs.join_path("a.bof");
 
     cargo_bin_cmd!()
         .arg("-o")
-        .arg(out.path())
-        .args(obj.paths())
-        .arg(importlib.path())
+        .arg(&out)
+        .arg(asm(&fs)("file1", src))
+        .arg(dlltool(&fs)("importlib", importlib))
         .assert()
         .success();
 
-    let linked = std::fs::read(out.path()).expect("failed reading output");
+    let linked = std::fs::read(&out).expect("failed reading output");
     let coff: CoffFile = CoffFile::parse(linked.as_slice()).expect("failed parsing linked output");
 
     // Look for the DFR symbol
@@ -175,8 +178,7 @@ foo"#,
 
 #[test]
 fn dllimport_thunks() {
-    let obj = asm1(
-        r#"
+    let src = r#"
 .globl go, memset
 .text
 go:
@@ -184,27 +186,26 @@ go:
   nop
   nop
   nop
-        "#,
-    );
+"#;
 
-    let importlib = dlltool(
-        r#"
+    let importlib = r#"
 LIBRARY MSVCRT.dll
 EXPORTS
-memset"#,
-    );
+memset
+"#;
 
-    let out = NamedTempFile::new().expect("failed creating output tempfile");
+    let fs = TestFs::new("dllimport_thunks").unwrap();
+    let out = fs.join_path("a.bof");
 
     cargo_bin_cmd!()
         .arg("-o")
-        .arg(out.path())
-        .args(obj.paths())
-        .arg(importlib.path())
+        .arg(&out)
+        .arg(asm(&fs)("file1", src))
+        .arg(dlltool(&fs)("importlib", importlib))
         .assert()
         .success();
 
-    let linked = std::fs::read(out.path()).expect("failed reading output");
+    let linked = std::fs::read(&out).expect("failed reading output");
     let coff: CoffFile = CoffFile::parse(linked.as_slice()).expect("failed parsing linked output");
 
     let code_section = coff
@@ -245,27 +246,27 @@ memset"#,
 
 #[test]
 fn no_merge_groups() {
-    let obj = asm1(
-        r#"
+    let src = r#"
 .section .text$a,"x"
 .quad 0
 .section .text$b,"x"
 .quad 0
 .section .text$c,"x"
-.quad 0"#,
-    );
+.quad 0
+"#;
 
-    let out = NamedTempFile::new().expect("failed creating output tempfile");
+    let fs = TestFs::new("no_merge_groups").unwrap();
+    let out = fs.join_path("a.bof");
 
     cargo_bin_cmd!()
         .arg("-o")
-        .arg(out.path())
+        .arg(&out)
         .arg("--no-merge-groups")
-        .args(obj.paths())
+        .arg(asm(&fs)("file1", src))
         .assert()
         .success();
 
-    let linked = std::fs::read(out.path()).expect("failed reading output");
+    let linked = std::fs::read(&out).expect("failed reading output");
     let coff: CoffFile = CoffFile::parse(linked.as_slice()).expect("failed parsing linked output");
 
     // Grouped sections should not be merged
@@ -276,8 +277,7 @@ fn no_merge_groups() {
 
 #[test]
 fn relative_relocation_flattening() {
-    let obj = asm1(
-        r#"
+    let src = r#"
 .section .text$a,"x"
 call foo
 nop
@@ -285,19 +285,20 @@ nop
 nop
 .section .text$b,"x"
 foo:
-  ret"#,
-    );
+  ret
+"#;
 
-    let out = NamedTempFile::new().expect("failed creating output tempfile");
+    let fs = TestFs::new("relative_relocation_flattening").unwrap();
+    let out = fs.join_path("a.bof");
 
     cargo_bin_cmd!()
         .arg("-o")
-        .arg(out.path())
-        .args(obj.paths())
+        .arg(&out)
+        .arg(asm(&fs)("file1", src))
         .assert()
         .success();
 
-    let linked = std::fs::read(out.path()).expect("failed reading output");
+    let linked = std::fs::read(&out).expect("failed reading output");
     let coff: CoffFile = CoffFile::parse(linked.as_slice()).expect("failed parsing linked output");
 
     let code = coff
@@ -313,26 +314,26 @@ foo:
 
 #[test]
 fn section_symbol_relocations_shift() {
-    let obj = asm1(
-        r#"
+    let src = r#"
 .text
 jmp .rdata$2
 .section .rdata$1,"r"
 .quad 0
 .section .rdata$2,"r"
-.quad 0"#,
-    );
+.quad 0
+"#;
 
-    let out = NamedTempFile::new().expect("failed creating output tempfile");
+    let fs = TestFs::new("section_symbol_relocations_shift").unwrap();
+    let out = fs.join_path("a.bof");
 
     cargo_bin_cmd!()
         .arg("-o")
-        .arg(out.path())
-        .args(obj.paths())
+        .arg(&out)
+        .arg(asm(&fs)("file1", src))
         .assert()
         .success();
 
-    let linked = std::fs::read(out.path()).expect("failed reading output");
+    let linked = std::fs::read(&out).expect("failed reading output");
     let coff: CoffFile = CoffFile::parse(linked.as_slice()).expect("failed parsing linked output");
 
     let code = coff
@@ -347,27 +348,27 @@ jmp .rdata$2
 
 #[test]
 fn local_symbol_relocation_target_no_change() {
-    let obj = asm1(
-        r#"
+    let src = r#"
 .text
 jmp local_data
 .section .rdata$1,"r"
 .quad 0
 .section .rdata$2,"r"
 local_data:
-.quad 0"#,
-    );
+.quad 0
+"#;
 
-    let out = NamedTempFile::new().expect("failed creating output tempfile");
+    let fs = TestFs::new("local_symbol_relocation_target_no_change").unwrap();
+    let out = fs.join_path("a.bof");
 
     cargo_bin_cmd!()
         .arg("-o")
-        .arg(out.path())
-        .args(obj.paths())
+        .arg(&out)
+        .arg(asm(&fs)("file1", src))
         .assert()
         .success();
 
-    let linked = std::fs::read(out.path()).expect("failed reading output");
+    let linked = std::fs::read(&out).expect("failed reading output");
     let coff: CoffFile = CoffFile::parse(linked.as_slice()).expect("failed parsing linked output");
 
     let code = coff
@@ -383,24 +384,24 @@ local_data:
 
 #[test]
 fn intrasection_addr_relocations() {
-    let obj = asm1(
-        r#"
+    let src = r#"
 .section .text$a,"x"
 .quad .text$b
 .section .text$b,"x"
-.quad 0"#,
-    );
+.quad 0
+"#;
 
-    let out = NamedTempFile::new().expect("failed creating output tempfile");
+    let fs = TestFs::new("intrasection_addr_relocations").unwrap();
+    let out = fs.join_path("a.bof");
 
     cargo_bin_cmd!()
         .arg("-o")
-        .arg(out.path())
-        .args(obj.paths())
+        .arg(&out)
+        .arg(asm(&fs)("file1", src))
         .assert()
         .success();
 
-    let linked = std::fs::read(out.path()).expect("failed reading output");
+    let linked = std::fs::read(&out).expect("failed reading output");
     let coff: CoffFile = CoffFile::parse(linked.as_slice()).expect("failed parsing linked output");
 
     let code_section = coff
