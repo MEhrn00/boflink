@@ -28,7 +28,6 @@ indexmap = "2.7.1"
 log = { version = "0.4.26", features = ["std"] }
 nom = "8.0.0"
 num_enum = "0.7.3"
-termcolor = "1.4.1"
 thiserror = "2.0.11"
 typed-arena = "2.0.2"
 

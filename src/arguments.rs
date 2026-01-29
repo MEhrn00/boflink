@@ -3,6 +3,8 @@ use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 use boflink::linker::LinkerTargetArch;
 use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 
+use crate::logging::ColorOption;
+
 #[derive(Parser, Debug)]
 #[command(
     about,
@@ -291,42 +293,6 @@ impl From<TargetEmulation> for LinkerTargetArch {
     }
 }
 
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ColorOption {
-    #[value(name = "never")]
-    Never,
-
-    #[value(name = "auto")]
-    Auto,
-
-    #[value(name = "always")]
-    Always,
-
-    #[value(name = "ansi")]
-    AlwaysAnsi,
-}
-
-impl std::fmt::Display for ColorOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(v) = self.to_possible_value() {
-            write!(f, "{}", v.get_name())?;
-        }
-
-        Ok(())
-    }
-}
-
-impl From<ColorOption> for termcolor::ColorChoice {
-    fn from(val: ColorOption) -> Self {
-        match val {
-            ColorOption::Never => termcolor::ColorChoice::Never,
-            ColorOption::Auto => termcolor::ColorChoice::Auto,
-            ColorOption::Always => termcolor::ColorChoice::Always,
-            ColorOption::AlwaysAnsi => termcolor::ColorChoice::AlwaysAnsi,
-        }
-    }
-}
-
 /// Parses the command line arguments into the [`CliArgs`].
 pub fn parse_arguments() -> anyhow::Result<ParsedCliArgs> {
     let mut legacy_flags = Vec::new();
@@ -385,10 +351,22 @@ pub fn parse_arguments() -> anyhow::Result<ParsedCliArgs> {
     }));
 
     let options = CliOptionArgs::from_arg_matches(&matches)?;
-    crate::logging::setup_logger(&options)?;
+    setup_logging(&options);
 
     Ok(ParsedCliArgs {
         inputs: CliInputArgs::from_matches(&matches),
         options: CliOptionArgs::from_arg_matches(&matches)?,
     })
+}
+
+fn setup_logging(options: &CliOptionArgs) {
+    let mut max_level = log::Level::Info;
+    if options.verbose >= 2 {
+        max_level = log::Level::Trace;
+    } else if options.verbose >= 1 {
+        max_level = log::Level::Debug;
+    }
+
+    crate::logging::init(max_level, options.color, 0)
+        .expect("logging should only be initialized once");
 }
