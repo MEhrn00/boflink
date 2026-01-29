@@ -56,9 +56,8 @@ features = ["archive", "coff", "write", "read"]
 undname = { path = "crates/undname" }
 
 [dev-dependencies]
-coffyaml = { path = "crates/coffyaml" }
-serde = "1"
-serde_yml = "0.0.12"
+assert_cmd = "2.1.2"
+tempfile = "3.24.0"
 
 [lints.rust]
 unsafe_code = "forbid"
