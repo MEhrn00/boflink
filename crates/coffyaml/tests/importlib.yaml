@@ -1,6 +1,0 @@
-Library: KERNEL32.dll
-Exports:
-  - GetLastError
-  - aaa
-  - ExportedSymbol
-  - other_export
