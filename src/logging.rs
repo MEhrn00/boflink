@@ -110,13 +110,13 @@ impl log::Log for Logger {
         }
 
         if record.metadata().level() == log::Level::Error
-            && self.error_count.fetch_add(1, Ordering::SeqCst) + 1 >= self.max_errors
+            && self.error_count.fetch_add(1, Ordering::Relaxed) + 1 >= self.max_errors
         {
             let prepend = self
                 .prepend
                 .lock()
                 .expect("logger internal mutex is poisoned");
-            eprintln!("{prepend}{CARGO_PKG_NAME}: {tag} too many errors emitted, exiting",);
+            eprintln!("{prepend}{CARGO_PKG_NAME}: {tag} too many errors emitted, exiting");
             std::process::exit(1);
         }
     }

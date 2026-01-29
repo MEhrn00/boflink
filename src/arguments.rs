@@ -70,6 +70,11 @@ pub struct CliOptionArgs {
     #[arg(short, long, value_name = "emulation")]
     pub machine: Option<TargetEmulation>,
 
+    /// Maximum number of errors to emit before stopping.
+    /// Use 0 for no limit
+    #[arg(long, value_name = "number", default_value_t = 20)]
+    pub error_limit: usize,
+
     /// Name of the entrypoint
     #[arg(short, long, value_name = "entry", default_value = "go")]
     pub entry: String,
@@ -402,7 +407,7 @@ fn setup_logging(options: &CliOptionArgs) {
         max_level = log::Level::Debug;
     }
 
-    crate::logging::init(max_level, options.color_diagnostics, 0)
+    crate::logging::init(max_level, options.color_diagnostics, options.error_limit)
         .expect("logging should only be initialized once");
 }
 
