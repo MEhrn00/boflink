@@ -1,16 +1,23 @@
 use std::process::Command;
 
 use anyhow::{Result, anyhow, bail};
-use arguments::{ParsedCliArgs, ParsedCliInput};
 use log::{debug, error, info};
 
-use boflink::{
-    libsearch::LibrarySearcher,
-    linker::{LinkError, LinkerBuilder},
-};
+use arguments::{ParsedCliArgs, ParsedCliInput};
+use libsearch::LibrarySearcher;
+use linker::{LinkError, LinkerBuilder};
 
+mod api;
 mod arguments;
+mod drectve;
+mod graph;
+mod libsearch;
+mod linker;
+mod linkobject;
 mod logging;
+
+#[cfg(windows)]
+mod undname;
 
 #[derive(Debug)]
 struct EmptyError;

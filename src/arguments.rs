@@ -4,7 +4,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use boflink::linker::LinkerTargetArch;
+use crate::linker::LinkerTargetArch;
 use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use os_str_bytes::OsStrBytesExt;
 
