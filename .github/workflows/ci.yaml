@@ -3,21 +3,20 @@ name: CI
 on:
   push:
     paths:
-      - '.github/workflows/*.yaml'
-      - '.github/workflows/*.yml'
-      - 'Cargo.toml'
-      - 'crates/**'
-      - 'src/**'
-      - 'tests/**'
-      - 'xtask/**'
+      - ".github/workflows/*.yaml"
+      - ".github/workflows/*.yml"
+      - "Cargo.toml"
+      - "crates/**"
+      - "src/**"
+      - "tests/**"
+      - "xtask/**"
   pull_request:
     paths:
-      - 'Cargo.toml'
-      - 'crates/**'
-      - 'src/**'
-      - 'tests/**'
-      - 'xtask/**'
-
+      - "Cargo.toml"
+      - "crates/**"
+      - "src/**"
+      - "tests/**"
+      - "xtask/**"
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,5 +37,10 @@ jobs:
         run: |
           rustup update
           rustup component add clippy rustfmt
+
+      - name: Install CI deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y clang llvm
 
       - run: cargo xtask ci

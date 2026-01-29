@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - "v[0-9]+.[0-9]+.[0-9]+"
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,7 +25,6 @@ jobs:
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C target-feature=+crt-static
 
-
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +32,7 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y musl musl-dev musl-tools gcc-aarch64-linux-gnu libc6-arm64-cross
+          sudo apt-get install -y musl musl-dev musl-tools gcc-aarch64-linux-gnu libc6-arm64-cross clang llvm
 
       - name: Install rust targets
         run: rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu
