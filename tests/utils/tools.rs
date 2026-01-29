@@ -21,7 +21,7 @@ pub struct Clang {
 impl std::default::Default for Clang {
     fn default() -> Self {
         Self {
-            exe: "clang".into(),
+            exe: option_env!("BOFLINK_TEST_CLANG").unwrap_or("clang").into(),
             #[cfg(windows)]
             target: "x86_64-pc-windows-msvc".into(),
             #[cfg(not(windows))]
@@ -149,7 +149,9 @@ pub struct Dlltool {
 impl std::default::Default for Dlltool {
     fn default() -> Self {
         Self {
-            exe: "llvm-dlltool".into(),
+            exe: option_env!("BOFLINK_TEST_DLLTOOL")
+                .unwrap_or("llvm-dlltool")
+                .into(),
             machine: "i386:x86-64".into(),
             dllname: String::new(),
             deffile: PathBuf::new(),

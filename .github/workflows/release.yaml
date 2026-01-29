@@ -10,6 +10,7 @@ env:
   CARGO_PROFILE_RELEASE_LTO: fat
   CARGO_PROFILE_RELEASE_STRIP: symbols
   CARGO_BUILD_DEP_INFO_BASEDIR: "."
+  BOFLINK_TEST_CLANG: clang-20
 
 concurrency:
   group: "release"
@@ -32,7 +33,7 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y musl musl-dev musl-tools gcc-aarch64-linux-gnu libc6-arm64-cross clang llvm
+          sudo apt-get install -y musl musl-dev musl-tools gcc-aarch64-linux-gnu libc6-arm64-cross clang-20 llvm-20
 
       - name: Install rust targets
         run: rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu

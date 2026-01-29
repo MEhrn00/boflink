@@ -20,6 +20,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  BOFLINK_TEST_CLANG: clang-20
 
 jobs:
   ci:
@@ -41,6 +42,6 @@ jobs:
       - name: Install CI deps
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get install -y clang llvm
+          sudo apt-get install -y clang-20 llvm-20
 
       - run: cargo xtask ci
