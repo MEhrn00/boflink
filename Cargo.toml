@@ -52,6 +52,7 @@ features = ["archive", "coff", "write", "read"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
+  "Win32_System_Console",
   "Win32_System_Diagnostics_Debug"
 ] }
 
