@@ -464,14 +464,14 @@ impl<T: Deref<Target = str>> std::fmt::Display for SymbolNameDemangler<'_, T> {
 
         #[cfg(windows)]
         if symbol_name.starts_with('?') {
-            use undname::UndnameFlags;
+            use crate::undname::UndnameFlags;
 
             let mut flags = UndnameFlags::NoPtr64Expansion;
             if self.0.is_i386() {
                 flags |= UndnameFlags::ThirtyTwoBitDecode;
             }
 
-            if let Ok(demangled) = undname::undname(symbol_name, flags) {
+            if let Ok(demangled) = crate::undname::undname_demangle(symbol_name, flags) {
                 write!(f, "{demangled}")?;
                 return Ok(());
             }

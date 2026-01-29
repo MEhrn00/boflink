@@ -1,6 +1,5 @@
 [workspace]
 members = ["crates/*", "xtask"]
-exclude = ["crates/undname/sys"]
 
 [package]
 name = "boflink"
@@ -53,14 +52,13 @@ default-features = false
 features = ["archive", "coff", "write", "read"]
 
 [target.'cfg(windows)'.dependencies]
-undname = { path = "crates/undname" }
+windows = { version = "0.62.2", features = [
+  "Win32_System_Diagnostics_Debug"
+] }
 
 [dev-dependencies]
 assert_cmd = "2.1.2"
 tempfile = "3.24.0"
-
-[lints.rust]
-unsafe_code = "forbid"
 
 [profile.release]
 debug = 1
