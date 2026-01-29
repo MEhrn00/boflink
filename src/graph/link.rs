@@ -168,7 +168,7 @@ impl std::fmt::Display for UndefinedSymbolError<'_, '_> {
                 }) {
                     write!(
                         f,
-                        "\n>>> referenced by {coff}:({}+{:#x})",
+                        "\nreferenced by {coff}:({}+{:#x})",
                         section.name(),
                         reloc.weight().address()
                     )?;
@@ -177,7 +177,7 @@ impl std::fmt::Display for UndefinedSymbolError<'_, '_> {
             } else {
                 write!(
                     f,
-                    "\n>>> referenced by {coff}:({})",
+                    "\nreferenced by {coff}:({})",
                     reference.source_symbol().name().quoted_demangle()
                 )?;
                 logged_references += 1;
@@ -186,7 +186,7 @@ impl std::fmt::Display for UndefinedSymbolError<'_, '_> {
 
         let remaining = self.0.references().len().saturating_sub(logged_references);
         if remaining > 0 {
-            write!(f, "\n>>> referenced {remaining} more times")?;
+            write!(f, "\nreferenced {remaining} more times")?;
         }
 
         Ok(())
@@ -218,12 +218,12 @@ fn display_symbol_definitions<'arena, 'data>(
     if !definitions.is_empty() {
         let mut definition_iter = definitions.iter();
         for definition in definition_iter.by_ref().take(5) {
-            write!(f, "\n>>> defined at {}", definition.target().coff())?;
+            write!(f, "\ndefined at {}", definition.target().coff())?;
         }
 
         let remaining = definitions.len().saturating_sub(5);
         if remaining > 0 {
-            write!(f, "\n>>> defined {remaining} more times")?;
+            write!(f, "\ndefined {remaining} more times")?;
         }
     }
 

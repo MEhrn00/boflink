@@ -338,14 +338,14 @@ impl SymbolDefinitionsContext {
 
 fn display_remaining_definitions(remaining: &usize) -> String {
     if *remaining != 0 {
-        format!("\n>>> defined {remaining} more times")
+        format!("\ndefined {remaining} more times")
     } else {
         Default::default()
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error(">>> defined at {coff_path}")]
+#[error("defined at {coff_path}")]
 pub struct SymbolDefinition {
     pub coff_path: String,
 }
@@ -407,14 +407,14 @@ impl SymbolReferencesContext {
 
 fn display_remaining_references(remaining: &usize) -> String {
     if *remaining != 0 {
-        format!("\n>>> referenced {remaining} more times")
+        format!("\nreferenced {remaining} more times")
     } else {
         Default::default()
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error(">>> referenced by {coff_path}:({reference})")]
+#[error("referenced by {coff_path}:({reference})")]
 pub struct SymbolReference {
     pub coff_path: String,
     pub reference: String,

@@ -31,7 +31,7 @@ const LEVEL_COLORS: [&str; 6] = [
 const ANSI_RESET: &str = "\x1b[0m";
 
 /// Separator to use for multiline log messages
-const NEWLINE_SEPARATOR: &str = ">>> ";
+const NEWLINE_SEPARATOR: &str = "\n>>> ";
 
 /// The main cli logger implementation
 #[derive(Debug)]

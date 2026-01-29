@@ -34,14 +34,8 @@ fn main() {
                     }
                 }
                 LinkError::Symbol(symbol_errors) => {
-                    let error_count = symbol_errors.errors().len();
-                    let mut error_iter = symbol_errors.errors().iter();
-                    for symbol_error in error_iter.by_ref().take(error_count.saturating_sub(1)) {
-                        error!("{symbol_error}\n");
-                    }
-
-                    if let Some(last_error) = error_iter.next() {
-                        error!("{last_error}");
+                    for symbol_error in symbol_errors.errors() {
+                        error!("{symbol_error}");
                     }
                 }
                 _ => {
