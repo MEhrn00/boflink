@@ -19,15 +19,10 @@ use crate::{
     api::ApiSymbols,
     drectve,
     graph::SpecLinkGraph,
-    libsearch::{LibraryFind, LibrarySearcher},
     linkobject::archive::{LinkArchive, LinkArchiveMemberVariant},
 };
 
-pub trait LinkImpl {
-    fn link(&mut self) -> anyhow::Result<Vec<u8>>;
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
 #[repr(u16)]
 pub enum LinkerTargetArch {
     Amd64 = IMAGE_FILE_MACHINE_AMD64,
@@ -55,9 +50,15 @@ impl TryFrom<object::Architecture> for LinkerTargetArch {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct LinkInput {
+    pub variant: LinkInputVariant,
+    pub options: LinkInputOptions,
+}
+
 /// The linker input types.
-#[derive(PartialEq, Eq, Hash)]
-pub(crate) enum LinkInput {
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum LinkInputVariant {
     /// A file path passed on the command line.
     File(PathBuf),
 
@@ -66,195 +67,27 @@ pub(crate) enum LinkInput {
 }
 
 /// The input attributes.
-#[derive(Default)]
-pub(crate) struct LinkInputItem {
-    /// An already opened buffer associated with the input.
-    pub buffer: Option<Vec<u8>>,
-
+#[derive(Debug, Default, PartialEq, Eq, Hash)]
+pub struct LinkInputOptions {
     /// If the input is a static archive, include all the members as inputs
     pub whole: bool,
 }
 
-/// Sets up inputs and configures a [`super::Linker`].
-#[derive(Default)]
-pub struct LinkerBuilder<L: LibraryFind + 'static> {
-    /// The target architecture.
-    pub(super) target_arch: Option<LinkerTargetArch>,
-
-    /// The ordered link inputs and attributes.
-    pub(super) inputs: IndexMap<LinkInput, LinkInputItem>,
-
-    /// The name of the entrypoint symbol.
-    pub(super) entrypoint: Option<String>,
-
-    /// The custom BOF API library.
-    pub(super) custom_api: Option<String>,
-
-    /// Whether to merge the .bss section with the .data section.
-    pub(super) merge_bss: bool,
-
-    /// Merge grouped sections.
-    pub(super) merge_grouped_sections: bool,
-
-    /// Searcher for finding link libraries.
-    pub(super) library_searcher: Option<L>,
-
-    /// Output path for dumping the link graph.
-    pub(super) link_graph_output: Option<PathBuf>,
-
-    /// Perform GC sections.
-    pub(super) gc_sections: bool,
-
-    /// Keep the specified symbols during GC sections.
-    pub(super) gc_keep_symbols: IndexSet<String>,
-
-    /// Print sections discarded during GC sections.
-    pub(super) print_gc_sections: bool,
-
-    /// Report unresolved symbols as warnings.
-    pub(super) warn_unresolved: bool,
-
-    /// List of ignored unresolved symbols.
-    pub(super) ignored_unresolved_symbols: HashSet<String>,
-}
-
-impl<L: LibraryFind + 'static> LinkerBuilder<L> {
-    /// Creates a new [`LinkerBuilder`] with the defaults.
-    pub fn new() -> Self {
-        Self {
-            target_arch: Default::default(),
-            inputs: Default::default(),
-            entrypoint: Default::default(),
-            merge_bss: false,
-            merge_grouped_sections: false,
-            library_searcher: None,
-            link_graph_output: None,
-            custom_api: None,
-            gc_sections: false,
-            gc_keep_symbols: Default::default(),
-            print_gc_sections: false,
-            warn_unresolved: false,
-            ignored_unresolved_symbols: HashSet::new(),
-        }
-    }
-
-    /// Sets the target architecture for the linker.
-    ///
-    /// This is not needed if the linker can parse the target architecture
-    /// from the input files.
-    pub fn architecture(mut self, arch: LinkerTargetArch) -> Self {
-        self.target_arch = Some(arch);
-        self
-    }
-
-    /// Set the output path for dumping the link graph.
-    pub fn link_graph_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.link_graph_output = Some(path.into());
-        self
-    }
-
-    /// Merge the .bss section with the .data section.
-    pub fn merge_bss(mut self, val: bool) -> Self {
-        self.merge_bss = val;
-        self
-    }
-
-    /// Merge grouped sections.
-    pub fn merge_grouped_sections(mut self, val: bool) -> Self {
-        self.merge_grouped_sections = val;
-        self
-    }
-
-    /// Set the name of the entrypoint symbol.
-    pub fn entrypoint(mut self, name: impl Into<String>) -> Self {
-        self.entrypoint = Some(name.into());
-        self
-    }
-
-    /// Custom BOF API to use instead of the Beacon API.
-    pub fn custom_api(mut self, api: impl Into<String>) -> Self {
-        self.custom_api = Some(api.into());
-        self
-    }
-
-    /// Set the library searcher to use for finding link libraries.
-    pub fn library_searcher(mut self, searcher: L) -> Self {
-        self.library_searcher = Some(searcher);
-        self
-    }
-
-    /// Enable GC sections.
-    pub fn gc_sections(mut self, val: bool) -> Self {
-        self.gc_sections = val;
-        self
-    }
-
-    /// Print sections discarded during GC sections.
-    pub fn print_gc_sections(mut self, val: bool) -> Self {
-        self.print_gc_sections = val;
-        self
-    }
-
-    /// Report unresolved symbols as warnings.
-    pub fn warn_unresolved(mut self, val: bool) -> Self {
-        self.warn_unresolved = val;
-        self
-    }
-
-    /// Add a file path to link
-    pub fn add_file_path(&mut self, path: impl Into<PathBuf>) {
-        self.inputs.entry(LinkInput::File(path.into())).or_default();
-    }
-
-    /// Add a file path to link
-    pub fn add_whole_file_path(&mut self, path: impl Into<PathBuf>) {
-        let entry = self.inputs.entry(LinkInput::File(path.into())).or_default();
-        entry.whole = true;
-    }
-
-    /// Add a link library to the linker.
-    pub fn add_library(&mut self, name: impl Into<String>) {
-        self.inputs
-            .entry(LinkInput::Library(name.into()))
-            .or_default();
-    }
-
-    /// Add a link library to the linker.
-    pub fn add_whole_library(&mut self, name: impl Into<String>) {
-        let entry = self
-            .inputs
-            .entry(LinkInput::Library(name.into()))
-            .or_default();
-        entry.whole = true;
-    }
-
-    /// Adds the list of symbols to keep during GC sections.
-    pub fn add_gc_keep_symbols<S: Into<String>, I: IntoIterator<Item = S>>(
-        mut self,
-        symbols: I,
-    ) -> Self {
-        self.gc_keep_symbols
-            .extend(symbols.into_iter().map(Into::into));
-        self
-    }
-
-    /// Add ignored unresolved symbols.
-    pub fn add_ignored_unresolved_symbols<S: Into<String>, I: IntoIterator<Item = S>>(
-        &mut self,
-        symbols: I,
-    ) {
-        self.ignored_unresolved_symbols
-            .extend(symbols.into_iter().map(Into::into));
-    }
-
-    /// Finishes configuring the linker.
-    pub fn build(mut self) -> Box<dyn LinkImpl> {
-        if let Some(library_searcher) = self.library_searcher.take() {
-            Box::new(ConfiguredLinker::with_opts(self, library_searcher))
-        } else {
-            Box::new(ConfiguredLinker::with_opts(self, LibrarySearcher::new()))
-        }
-    }
+#[derive(Debug, Default)]
+pub struct Config {
+    pub custom_api: Option<String>,
+    pub entrypoint: Option<String>,
+    pub gc_sections: bool,
+    pub gc_roots: IndexSet<String>,
+    pub ignored_unresolved_symbols: HashSet<String>,
+    pub inputs: IndexSet<LinkInput>,
+    pub link_graph_output: Option<PathBuf>,
+    pub merge_bss: bool,
+    pub merge_grouped_sections: bool,
+    pub print_gc_sections: bool,
+    pub search_paths: IndexSet<PathBuf>,
+    pub target_architecture: Option<LinkerTargetArch>,
+    pub warn_unresolved: bool,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -274,92 +107,37 @@ impl std::fmt::Display for CoffPath<'_> {
 }
 
 /// A configured linker.
-pub struct ConfiguredLinker<L: LibraryFind> {
-    /// The target architecture.
-    target_arch: Option<LinkerTargetArch>,
-
-    /// The linker inputs
-    inputs: IndexMap<LinkInput, LinkInputItem>,
-
-    /// The link library searcher.
-    library_searcher: L,
-
-    /// The name of the entrypoint symbol.
-    entrypoint: Option<String>,
-
-    /// The custom BOF API library.
-    custom_api: Option<String>,
-
-    /// Whether to merge the .bss section with the .data section.
-    merge_bss: bool,
-
-    /// Whether to perform GC sections.
-    gc_sections: bool,
-
-    /// GC roots.
-    gc_roots: IndexSet<String>,
-
-    /// Merge grouped sections.
-    merge_grouped_sections: bool,
-
-    /// Print GC sections discarded.
-    print_gc_sections: bool,
-
-    /// Report unresolved symbols as warnings.
-    warn_unresolved: bool,
-
-    /// Ignored unresolved symbols.
-    ignored_unresolved_symbols: HashSet<String>,
-
-    /// Output path for dumping the link graph.
-    link_graph_output: Option<PathBuf>,
+pub struct Linker {
+    config: Config,
 }
 
-impl<L: LibraryFind> ConfiguredLinker<L> {
-    pub(super) fn with_opts<T: LibraryFind>(
-        builder: LinkerBuilder<T>,
-        library_searcher: L,
-    ) -> ConfiguredLinker<L> {
-        Self {
-            target_arch: builder.target_arch,
-            inputs: builder.inputs,
-            library_searcher,
-            entrypoint: builder.entrypoint,
-            custom_api: builder.custom_api,
-            merge_bss: builder.merge_bss,
-            merge_grouped_sections: builder.merge_grouped_sections,
-            link_graph_output: builder.link_graph_output,
-            gc_sections: builder.gc_sections,
-            gc_roots: builder.gc_keep_symbols,
-            print_gc_sections: builder.print_gc_sections,
-            warn_unresolved: builder.warn_unresolved,
-            ignored_unresolved_symbols: builder.ignored_unresolved_symbols,
-        }
+impl Linker {
+    pub fn new(config: Config) -> Self {
+        Self { config }
     }
-}
 
-impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
-    fn link(&mut self) -> anyhow::Result<Vec<u8>> {
+    pub fn link(&mut self) -> anyhow::Result<Vec<u8>> {
         // Buffer arena
-        let buffer_arena: Arena<(PathBuf, Vec<u8>)> = Arena::with_capacity(self.inputs.len());
+        let buffer_arena: Arena<(PathBuf, Vec<u8>)> =
+            Arena::with_capacity(self.config.inputs.len());
 
         let mut input_processor = LinkInputProcessor::with_capacity(
             &buffer_arena,
-            &self.library_searcher,
-            self.inputs.len(),
+            &self.config.search_paths,
+            self.config.inputs.len(),
         );
 
         let mut errored = false;
 
         // Process the input files
-        for (link_input, link_item) in std::mem::take(&mut self.inputs) {
-            if let Err(e) = input_processor.process_input(link_input, link_item) {
+        for link_input in std::mem::take(&mut self.config.inputs) {
+            if let Err(e) = input_processor.process_input(link_input) {
                 log::error!("{e:#}");
                 errored = true;
             }
         }
 
-        if let Some(entrypoint) = self.entrypoint.as_ref() {
+        if let Some(entrypoint) = self.config.entrypoint.as_ref() {
             input_processor.ensure_entrypoint(entrypoint);
         }
 
@@ -372,7 +150,8 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
         }
 
         let target_arch = self
-            .target_arch
+            .config
+            .target_architecture
             .take()
             .or_else(|| {
                 input_processor
@@ -384,6 +163,7 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
 
         let string_arena = Arena::new();
         let api_symbols = self
+            .config
             .custom_api
             .take()
             .map(|api| input_processor.open_custom_api(api))
@@ -403,9 +183,7 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
                     continue;
                 }
 
-                let search_result = self
-                    .library_searcher
-                    .find_library(library_name)
+                let search_result = find_library(&self.config.search_paths, library_name)
                     .with_context(|| format!("{coff_path}: unable to find library {library_name}"));
 
                 let (library_path, buffer) = match search_result {
@@ -491,7 +269,7 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
                 while let Some(((library_path, coff_path), drectve_library)) =
                     drectve_queue.pop_front()
                 {
-                    match self.library_searcher.find_library(drectve_library) {
+                    match find_library(&self.config.search_paths, drectve_library) {
                         Some(found) => {
                             if !input_processor
                                 .opened_library_names
@@ -596,7 +374,7 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
         }
 
         // Write out the link graph
-        if let Some(graph_path) = self.link_graph_output.as_ref() {
+        if let Some(graph_path) = self.config.link_graph_output.as_ref() {
             match std::fs::File::create(graph_path) {
                 Ok(f) => {
                     if let Err(e) = graph.write_dot_graph(BufWriter::new(f)) {
@@ -615,10 +393,10 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
         }
 
         // Finish building the link graph
-        let finish_result = if self.warn_unresolved {
-            graph.finish_unresolved(&self.ignored_unresolved_symbols)
+        let finish_result = if self.config.warn_unresolved {
+            graph.finish_unresolved(&self.config.ignored_unresolved_symbols)
         } else {
-            graph.finish(&self.ignored_unresolved_symbols)
+            graph.finish(&self.config.ignored_unresolved_symbols)
         };
 
         let mut graph = match finish_result {
@@ -629,21 +407,21 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
         };
 
         // Run GC sections
-        if self.gc_sections {
-            graph.gc_sections(self.entrypoint.as_ref(), self.gc_roots.iter())?;
+        if self.config.gc_sections {
+            graph.gc_sections(self.config.entrypoint.as_ref(), self.config.gc_roots.iter())?;
 
-            if self.print_gc_sections {
+            if self.config.print_gc_sections {
                 graph.print_discarded_sections();
             }
         }
 
         // Run merge bss
-        if self.merge_bss {
+        if self.config.merge_bss {
             graph.merge_bss();
         }
 
         // Build the linked output from the graph
-        if self.merge_grouped_sections {
+        if self.config.merge_grouped_sections {
             Ok(graph.link_merge_groups()?)
         } else {
             Ok(graph.link()?)
@@ -652,12 +430,12 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
 }
 
 /// Process the linker inputs
-struct LinkInputProcessor<'b, 'a, L: LibraryFind> {
+struct LinkInputProcessor<'b, 'a> {
     /// Arena for holding opened files
     arena: &'a Arena<(PathBuf, Vec<u8>)>,
 
     /// Used for finding link libraries
-    library_searcher: &'b L,
+    search_paths: &'b IndexSet<PathBuf>,
 
     /// The names of opened link libraries
     opened_library_names: HashSet<String>,
@@ -672,15 +450,15 @@ struct LinkInputProcessor<'b, 'a, L: LibraryFind> {
     spec: SpecLinkGraph,
 }
 
-impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
+impl<'b, 'a> LinkInputProcessor<'b, 'a> {
     pub fn with_capacity(
         arena: &'a Arena<(PathBuf, Vec<u8>)>,
-        library_searcher: &'b L,
+        search_paths: &'b IndexSet<PathBuf>,
         capacity: usize,
-    ) -> LinkInputProcessor<'b, 'a, L> {
+    ) -> LinkInputProcessor<'b, 'a> {
         Self {
             arena,
-            library_searcher,
+            search_paths,
             opened_library_names: HashSet::with_capacity(capacity),
             coffs: IndexMap::with_capacity(capacity),
             link_libraries: IndexMap::with_capacity(capacity),
@@ -688,26 +466,18 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
         }
     }
 
-    pub fn process_input(
-        &mut self,
-        input: LinkInput,
-        mut item: LinkInputItem,
-    ) -> anyhow::Result<()> {
-        match input {
-            LinkInput::File(file_path) => {
-                let (file_path, buffer) = if let Some(existing_buffer) = item.buffer.take() {
-                    self.arena.alloc((file_path, existing_buffer))
-                } else {
-                    let buffer = std::fs::read(&file_path)
-                        .with_context(|| format!("cannot open {}", file_path.display()))?;
-                    self.arena.alloc((file_path, buffer))
-                };
+    pub fn process_input(&mut self, input: LinkInput) -> anyhow::Result<()> {
+        match input.variant {
+            LinkInputVariant::File(file_path) => {
+                let buffer = std::fs::read(&file_path)
+                    .with_context(|| format!("cannot open {}", file_path.display()))?;
+                let (file_path, buffer) = self.arena.alloc((file_path, buffer));
 
                 if object_is_archive(buffer.as_slice()) {
                     let library = LinkArchive::parse(buffer.as_slice())
                         .with_context(|| format!("cannot parse {}", file_path.display()))?;
 
-                    if item.whole {
+                    if input.options.whole {
                         self.add_archive_members(file_path.as_path(), library)
                             .with_context(|| format!("{}", file_path.display()))?;
                     } else if !self.link_libraries.contains_key(file_path.as_path()) {
@@ -726,16 +496,15 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
                     }
                 }
             }
-            LinkInput::Library(library_name) => {
+            LinkInputVariant::Library(library_name) => {
                 if !self.opened_library_names.contains(&library_name) {
-                    let (library_path, library_buffer) = self
-                        .library_searcher
-                        .find_library(&library_name)
-                        .with_context(|| format!("unable to find library -l{library_name}"))?;
+                    let (library_path, library_buffer) =
+                        find_library(self.search_paths, &library_name)
+                            .with_context(|| format!("unable to find library -l{library_name}"))?;
 
                     self.opened_library_names.insert(library_name);
 
-                    if item.whole {
+                    if input.options.whole {
                         let (library_path, library_buffer) =
                             self.arena.alloc((library_path, library_buffer));
                         let archive = LinkArchive::parse(library_buffer.as_slice())
@@ -782,9 +551,7 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
         let custom_api = match std::fs::read(&library) {
             Ok(buffer) => (PathBuf::from(library), buffer),
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                let found = self
-                    .library_searcher
-                    .find_library(&library)
+                let found = find_library(self.search_paths, &library)
                     .with_context(|| format!("unable to find --custom-api: {library}"))?;
                 self.opened_library_names.insert(library);
                 found
@@ -838,4 +605,41 @@ fn object_is_archive(buffer: impl AsRef<[u8]>) -> bool {
         .as_ref()
         .get(..object::archive::MAGIC.len())
         .is_some_and(|magic| magic == object::archive::MAGIC)
+}
+
+fn find_library(
+    search_paths: &IndexSet<PathBuf>,
+    name: impl AsRef<str>,
+) -> Option<(PathBuf, Vec<u8>)> {
+    let try_open_path = |path: &Path| -> Option<Vec<u8>> {
+        std::fs::read(path)
+            .inspect_err(|e| log::debug!("attempt to open {} failed: {e}", path.display()))
+            .ok()
+    };
+
+    let name = name.as_ref();
+
+    if let Some(filename) = name.strip_prefix(':') {
+        search_paths.iter().find_map(|search_path| {
+            let full_path = search_path.join(filename);
+            try_open_path(&full_path).map(|buffer| (full_path, buffer))
+        })
+    } else {
+        let patterns = [
+            ("lib", name, ".dll.a"),
+            ("", name, ".dll.a"),
+            ("lib", name, ".a"),
+            ("", name, ".lib"),
+            ("lib", name, ".lib"),
+            ("", name, ".a"),
+        ];
+
+        search_paths.iter().find_map(|search_path| {
+            patterns.into_iter().find_map(|(prefix, name, ext)| {
+                let filename = format!("{prefix}{name}{ext}");
+                let full_path = search_path.join(filename);
+                try_open_path(&full_path).map(|buffer| (full_path, buffer))
+            })
+        })
+    }
 }

@@ -7,17 +7,17 @@ use anyhow::{Context, Result, bail};
 use log::{error, info};
 
 use arguments::{ParsedCliArgs, ParsedCliInput};
-use libsearch::LibrarySearcher;
-use linker::LinkerBuilder;
 
-use crate::arguments::CliOptionArgs;
+use crate::{
+    arguments::CliOptionArgs,
+    linker::{Config, LinkInput, LinkInputOptions, LinkInputVariant, Linker},
+};
 
 mod api;
 mod arguments;
 mod drectve;
 mod fsutils;
 mod graph;
-mod libsearch;
 mod linker;
 mod linkobject;
 mod logging;
@@ -53,75 +53,63 @@ fn try_main() -> Result<()> {
 
 /// Runs the linker with the command line arguments
 fn run_linker(args: &mut ParsedCliArgs) -> anyhow::Result<()> {
-    let mut library_searcher = LibrarySearcher::new();
-    library_searcher.extend_search_paths(std::mem::take(&mut args.options.library_paths));
+    let mut config = Config {
+        custom_api: args.options.custom_api.take(),
+        entrypoint: Some(std::mem::take(&mut args.options.entry)),
+        gc_sections: args.options.gc_sections,
+        gc_roots: std::mem::take(&mut args.options.keep_symbol)
+            .into_iter()
+            .collect(),
+        ignored_unresolved_symbols: std::mem::take(&mut args.options.ignore_unresolved_symbol)
+            .into_iter()
+            .collect(),
+        link_graph_output: args.options.dump_link_graph.take(),
+        merge_bss: args.options.merge_bss,
+        merge_grouped_sections: args.options.merge_groups,
+        print_gc_sections: args.options.print_gc_sections,
+        search_paths: std::mem::take(&mut args.options.library_paths)
+            .into_iter()
+            .collect(),
+        target_architecture: args.options.machine.take().map(Into::into),
+        warn_unresolved: args.options.warn_unresolved_symbols,
+        ..Default::default()
+    };
 
     if cfg!(windows) {
         if let Some(libenv) = std::env::var_os("LIB") {
-            library_searcher.extend_search_paths(std::env::split_paths(&libenv));
+            config.search_paths.extend(std::env::split_paths(&libenv));
         }
     }
 
-    library_searcher.extend_search_paths(include_mingw_search_paths(&args.options)?);
+    config
+        .search_paths
+        .extend(include_mingw_search_paths(&args.options)?);
 
-    let mut linker = LinkerBuilder::new()
-        .library_searcher(library_searcher)
-        .entrypoint(std::mem::take(&mut args.options.entry))
-        .merge_bss(args.options.merge_bss)
-        .gc_sections(args.options.gc_sections)
-        .print_gc_sections(args.options.print_gc_sections)
-        .add_gc_keep_symbols(std::mem::take(&mut args.options.keep_symbol))
-        .merge_grouped_sections(args.options.merge_groups)
-        .warn_unresolved(args.options.warn_unresolved_symbols);
-
-    linker
-        .add_ignored_unresolved_symbols(std::mem::take(&mut args.options.ignore_unresolved_symbol));
-
-    let linker = if let Some(target_arch) = args.options.machine.take() {
-        linker.architecture(target_arch.into())
-    } else {
-        linker
-    };
-
-    let linker = if let Some(graph_path) = args.options.dump_link_graph.take() {
-        linker.link_graph_path(graph_path)
-    } else {
-        linker
-    };
-
-    let mut linker = if let Some(custom_api) = args.options.custom_api.take() {
-        linker.custom_api(custom_api)
-    } else {
-        linker
-    };
-
-    let mut whole_input = false;
+    let mut whole = false;
     for input in std::mem::take(&mut args.inputs) {
         match input {
             ParsedCliInput::WholeArchiveStart => {
-                whole_input = true;
+                whole = true;
             }
             ParsedCliInput::WholeArchiveEnd => {
-                whole_input = false;
+                whole = false;
             }
             ParsedCliInput::File(file_path) => {
-                if whole_input {
-                    linker.add_whole_file_path(file_path);
-                } else {
-                    linker.add_file_path(file_path);
-                }
+                config.inputs.insert(LinkInput {
+                    variant: LinkInputVariant::File(file_path),
+                    options: LinkInputOptions { whole },
+                });
             }
             ParsedCliInput::Library(library) => {
-                if whole_input {
-                    linker.add_whole_library(library);
-                } else {
-                    linker.add_library(library);
-                }
+                config.inputs.insert(LinkInput {
+                    variant: LinkInputVariant::Library(library),
+                    options: LinkInputOptions { whole },
+                });
             }
         }
     }
 
-    let mut linker = linker.build();
+    let mut linker = Linker::new(config);
     let built = linker.link()?;
     std::fs::write(&args.options.output, built).context("cannot write output file")?;
     Ok(())
