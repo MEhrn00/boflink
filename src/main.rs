@@ -5,6 +5,7 @@ use anyhow::Context;
 use crate::{
     cli::{CliArgs, CliOptions},
     linker::{Config, Linker},
+    timing::DurationFormatter,
 };
 
 mod api;
@@ -15,6 +16,7 @@ mod graph;
 mod linker;
 mod linkobject;
 mod logging;
+mod timing;
 
 #[cfg(windows)]
 mod undname;
@@ -96,7 +98,7 @@ fn try_main(mut args: CliArgs) -> anyhow::Result<()> {
 
     if args.options.print_timing {
         let elapsed = std::time::Instant::now() - timer;
-        log::info!("link time: {}ms", elapsed.as_micros() as f64 / 1000f64);
+        log::info!("link time: {}", DurationFormatter::new(&elapsed));
     }
 
     Ok(())
