@@ -32,20 +32,6 @@ os_str_bytes = "7.1.1"
 thiserror = "2.0.11"
 typed-arena = "2.0.2"
 
-[dependencies.clap]
-version = "4.5.24"
-default-features = false
-features = [
-  "std",
-  "color",
-  "help",
-  "suggestions",
-  "usage",
-  "derive",
-  "string",
-  "cargo",
-]
-
 [dependencies.object]
 version = "0.38.0"
 default-features = false
