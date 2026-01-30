@@ -1,5 +1,6 @@
 use std::{cell::OnceCell, collections::BTreeMap};
 
+use anyhow::{anyhow, bail};
 use indexmap::IndexMap;
 use log::debug;
 use object::{
@@ -17,7 +18,7 @@ use object::{
 use crate::linker::LinkerTargetArch;
 
 use super::{
-    LinkGraphArena, LinkGraphLinkError,
+    LinkGraphArena,
     node::{
         LibraryNode, SectionName, SectionNode, SectionNodeCharacteristics, SectionNodeData,
         SymbolNodeType,
@@ -113,7 +114,7 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
     }
 
     /// Builds the output COFF
-    pub fn build_output(mut self) -> Result<Vec<u8>, LinkGraphLinkError> {
+    pub fn build_output(mut self) -> anyhow::Result<Vec<u8>> {
         let mut built_coff = Vec::new();
         let mut coff_writer = Writer::new(&mut built_coff);
 
@@ -231,17 +232,14 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
                         })
                         .collect::<BTreeMap<_, _>>();
 
-                    Err(LinkGraphLinkError::DiscardedSection {
-                        coff_name: section_node.coff().to_string(),
-                        reference: sorted_definitions
-                            .range(0..=reloc.weight().address())
-                            .next_back()
-                            .map(|(_, name)| name.demangle().to_string())
-                            .unwrap_or_else(|| {
+                    let reference_symbol = sorted_definitions.range(0..=reloc.weight().address())
+                        .next_back()
+                        .map(|(_, name)| name.demangle().to_string())
+                        .unwrap_or_else(|| {
                                 format!("{}+{:#x}", section_node.name(), reloc.weight().address())
-                            }),
-                        symbol: symbol.name().demangle().to_string(),
-                    })
+                        });
+
+                    bail!("{}: {reference_symbol} references symbol '{}' defined in discarded section", section_node.coff(), symbol.name().demangle());
                 })?;
 
                 let kept_relocs = section_node.relocations().len() - pending_relocs;
@@ -645,7 +643,26 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
                     let target_addr = definition.weight().address() as u64
                         + target_section.virtual_address() as u64;
 
-                    let read32le = |data: &[u8]| {
+                    let reloc_bounds_error = || {
+                        anyhow!(
+                            "{}: {}+{:#x} relocation is outside of section bounds (size = {:#x})",
+                            section_node.coff(),
+                            section_node.name(),
+                            reloc.address(),
+                            section_node.data().len()
+                        )
+                    };
+
+                    let reloc_overflow_error = || {
+                        anyhow!(
+                            "{}: relocation adjustment at '{}+{:#x}' overflowed",
+                            section_node.coff(),
+                            section_node.name(),
+                            reloc.address(),
+                        )
+                    };
+
+                    let read32le = |data: &[u8]| -> anyhow::Result<u32> {
                         type V = u32;
                         data.get(..std::mem::size_of::<V>())
                             .map(|data| {
@@ -653,12 +670,7 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
                                     .unwrap_or_else(|_| unreachable!())
                             })
                             .map(V::from_le_bytes)
-                            .ok_or_else(|| LinkGraphLinkError::RelocationBounds {
-                                coff_name: section_node.coff().to_string(),
-                                section: section_node.name().to_string(),
-                                address: reloc.address(),
-                                size: section_node.data().len() as u32,
-                            })
+                            .ok_or_else(reloc_bounds_error)
                     };
 
                     let read64le = |data: &[u8]| {
@@ -669,23 +681,13 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
                                     .unwrap_or_else(|_| unreachable!())
                             })
                             .map(V::from_le_bytes)
-                            .ok_or_else(|| LinkGraphLinkError::RelocationBounds {
-                                coff_name: section_node.coff().to_string(),
-                                section: section_node.name().to_string(),
-                                address: reloc.address(),
-                                size: section_node.data().len() as u32,
-                            })
+                            .ok_or_else(reloc_bounds_error)
                     };
 
                     let write32le = |data: &mut [u8], val: u32| {
                         type V = u32;
                         data.get_mut(..std::mem::size_of::<V>())
-                            .ok_or_else(|| LinkGraphLinkError::RelocationBounds {
-                                coff_name: section_node.coff().to_string(),
-                                section: section_node.name().to_string(),
-                                address: reloc.address(),
-                                size: section_node.data().len() as u32,
-                            })?
+                            .ok_or_else(reloc_bounds_error)?
                             .copy_from_slice(&val.to_le_bytes());
                         Ok(())
                     };
@@ -693,39 +695,35 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
                     let write64le = |data: &mut [u8], val: u64| {
                         type V = u64;
                         data.get_mut(..std::mem::size_of::<V>())
-                            .ok_or_else(|| LinkGraphLinkError::RelocationBounds {
-                                coff_name: section_node.coff().to_string(),
-                                section: section_node.name().to_string(),
-                                address: reloc.address(),
-                                size: section_node.data().len() as u32,
-                            })?
+                            .ok_or_else(reloc_bounds_error)?
                             .copy_from_slice(&val.to_le_bytes());
                         Ok(())
                     };
 
-                    let add32 = |data: &mut [u8], amt| -> Result<(), LinkGraphLinkError> {
+                    let add32 = |data: &mut [u8], amt| -> anyhow::Result<()> {
                         write32le(
                             data,
-                            read32le(data)?.checked_add(amt).ok_or_else(|| {
-                                LinkGraphLinkError::RelocationOverflow {
-                                    coff_name: section_node.coff().to_string(),
-                                    section: section_node.name().to_string(),
-                                    address: reloc.address(),
-                                }
-                            })?,
+                            read32le(data)?
+                                .checked_add(amt)
+                                .ok_or_else(reloc_overflow_error)?,
                         )
                     };
 
-                    let add64 = |data: &mut [u8], amt| -> Result<(), LinkGraphLinkError> {
+                    let add64 = |data: &mut [u8], amt| -> anyhow::Result<()> {
                         write64le(
                             data,
-                            read64le(data)?.checked_add(amt).ok_or_else(|| {
-                                LinkGraphLinkError::RelocationOverflow {
-                                    coff_name: section_node.coff().to_string(),
-                                    section: section_node.name().to_string(),
-                                    address: reloc.address(),
-                                }
-                            })?,
+                            read64le(data)?
+                                .checked_add(amt)
+                                .ok_or_else(reloc_overflow_error)?,
+                        )
+                    };
+
+                    let unsupported_relocation_error = |typ: u16| {
+                        anyhow!(
+                            "{}: unsupported relocation type '{typ:#x}' at '{}+{:#x}",
+                            section_node.coff(),
+                            section_node.name(),
+                            reloc.address(),
                         )
                     };
 
@@ -752,12 +750,7 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
                                 // to process since debug info is not supported
                             }
                             _ => {
-                                return Err(LinkGraphLinkError::UnsupportedRelocation {
-                                    coff_name: section_node.coff().to_string(),
-                                    section: section_node.name().to_string(),
-                                    address: reloc.address(),
-                                    typ,
-                                });
+                                return Err(unsupported_relocation_error(typ));
                             }
                         }
                         Ok(())
@@ -780,26 +773,15 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
                                 // to process since debug info is not supported
                             }
                             _ => {
-                                return Err(LinkGraphLinkError::UnsupportedRelocation {
-                                    coff_name: section_node.coff().to_string(),
-                                    section: section_node.name().to_string(),
-                                    address: reloc.address(),
-                                    typ,
-                                });
+                                return Err(unsupported_relocation_error(typ));
                             }
                         }
                         Ok(())
                     };
 
-                    let reloc_data =
-                        section_data.get_mut(reloc_addr as usize..).ok_or_else(|| {
-                            LinkGraphLinkError::RelocationBounds {
-                                coff_name: section_node.coff().to_string(),
-                                section: section_node.name().to_string(),
-                                address: reloc.address(),
-                                size: section_node.data().len() as u32,
-                            }
-                        })?;
+                    let reloc_data = section_data
+                        .get_mut(reloc_addr as usize..)
+                        .ok_or_else(reloc_bounds_error)?;
 
                     // If the relocation is relative to a symbol defined in
                     // the same section, fully apply it.

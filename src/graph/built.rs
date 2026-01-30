@@ -3,14 +3,12 @@ use std::{
     collections::{BTreeMap, HashSet},
 };
 
+use anyhow::bail;
 use indexmap::IndexMap;
 use log::{debug, warn};
 use object::pe::{IMAGE_REL_AMD64_REL32, IMAGE_REL_I386_DIR32};
 
-use crate::{
-    graph::node::SymbolName,
-    linker::{LinkError, LinkerTargetArch},
-};
+use crate::{graph::node::SymbolName, linker::LinkerTargetArch};
 
 use super::{
     edge::{ComdatSelection, DefinitionEdgeWeight, Edge, RelocationEdgeWeight},
@@ -21,41 +19,6 @@ use super::{
     },
     output::{OutputGraph, OutputSection},
 };
-
-#[derive(Debug, thiserror::Error)]
-pub enum LinkGraphLinkError {
-    #[error("{coff_name}: {reference} references symbol '{symbol}' defined in discarded section.")]
-    DiscardedSection {
-        coff_name: String,
-        reference: String,
-        symbol: String,
-    },
-
-    #[error(
-        "{coff_name}: {section}+{address:#x} relocation is outside section bounds (size = {size:#x})."
-    )]
-    RelocationBounds {
-        coff_name: String,
-        section: String,
-        address: u32,
-        size: u32,
-    },
-
-    #[error("{coff_name}: relocation adjustment at '{section}+{address:#x}' overflowed.")]
-    RelocationOverflow {
-        coff_name: String,
-        section: String,
-        address: u32,
-    },
-
-    #[error("{coff_name}: unsupported relocation type '{typ:#x}' at '{section}+{address:#x}'.")]
-    UnsupportedRelocation {
-        coff_name: String,
-        section: String,
-        address: u32,
-        typ: u16,
-    },
-}
 
 /// Section categories for partitioning sections
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -187,7 +150,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
         &mut self,
         entrypoint: Option<impl AsRef<str>>,
         roots: impl Iterator<Item = S>,
-    ) -> Result<(), LinkError> {
+    ) -> anyhow::Result<()> {
         let mut section_count = 0usize;
 
         // Mark all sections as discarded
@@ -231,7 +194,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
 
         // Return an error if the GC roots could not be established.
         if section_dfs.remaining() == 0 {
-            return Err(LinkError::EmptyGcRoots);
+            bail!("--gc-sections requires a defined --entry symbol or set of GC roots");
         }
 
         // Keep all sections reachable by the GC roots
@@ -867,14 +830,14 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
     }
 
     /// Links the graph components together and merges grouped sections.
-    pub fn link_merge_groups(mut self) -> Result<Vec<u8>, LinkGraphLinkError> {
+    pub fn link_merge_groups(mut self) -> anyhow::Result<Vec<u8>> {
         self.prelink();
         let outputs = self.build_merged_output_sections();
         self.link_final(outputs)
     }
 
     /// Links the graph components together and builds the final COFF.
-    pub fn link(mut self) -> Result<Vec<u8>, LinkGraphLinkError> {
+    pub fn link(mut self) -> anyhow::Result<Vec<u8>> {
         self.prelink();
         let outputs = self.build_output_sections();
         self.link_final(outputs)
@@ -889,7 +852,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
     fn link_final(
         self,
         output_sections: Vec<OutputSection<'arena, 'data>>,
-    ) -> Result<Vec<u8>, LinkGraphLinkError> {
+    ) -> anyhow::Result<Vec<u8>> {
         OutputGraph::new(
             self.machine,
             output_sections,

@@ -7,16 +7,17 @@ use std::{
     sync::LazyLock,
 };
 
+use anyhow::{Context, anyhow, bail};
 use indexmap::{IndexMap, IndexSet};
 use log::warn;
 use object::{
-    Architecture, Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolIndex,
+    Architecture, Object, ObjectSection, ObjectSymbol, SectionIndex,
     coff::{CoffFile, CoffHeader, ImageSymbol},
 };
 
 use crate::{
     graph::{
-        edge::{TryFromWeakDefaultSearch, WeakDefaultEdgeWeight, WeakDefaultSearch},
+        edge::{WeakDefaultEdgeWeight, WeakDefaultSearch},
         node::{SymbolName, SymbolNodeType},
     },
     linker::LinkerTargetArch,
@@ -28,11 +29,11 @@ use super::{
     cache::LinkGraphCache,
     edge::{
         AssociativeSectionEdgeWeight, ComdatSelection, DefinitionEdgeWeight, Edge,
-        ImportEdgeWeight, RelocationEdgeWeight, TryFromComdatSelectionError,
+        ImportEdgeWeight, RelocationEdgeWeight,
     },
     node::{
         CoffNode, LibraryNode, LibraryNodeWeight, SectionNode, SectionNodeCharacteristics,
-        SectionNodeData, SymbolNode, TryFromSymbolError,
+        SectionNodeData, SymbolNode,
     },
 };
 
@@ -40,195 +41,6 @@ pub type LinkGraphArena = bumpalo::Bump;
 
 pub(super) static ROOT_COFF: LazyLock<CoffNode> =
     LazyLock::new(|| CoffNode::new(Path::new("<root>"), None));
-
-#[derive(Debug, thiserror::Error)]
-pub enum LinkGraphAddError {
-    #[error("invalid architecture '{found:?}', expected '{expected:?}'")]
-    ArchitectureMismatch {
-        expected: Architecture,
-        found: Architecture,
-    },
-
-    #[error("could not parse symbol '{name}' at table index {index}: {error}")]
-    Symbol {
-        name: String,
-        index: SymbolIndex,
-        error: TryFromSymbolError,
-    },
-
-    #[error(
-        "symbol '{symbol_name}' at table index {symbol_index} references invalid section number {section_num}"
-    )]
-    SymbolSectionIndex {
-        symbol_name: String,
-        symbol_index: SymbolIndex,
-        section_num: SectionIndex,
-    },
-
-    #[error(
-        "{section}+{address:#x} relocation references invalid target symbol index {symbol_index}"
-    )]
-    RelocationTarget {
-        section: String,
-        address: u32,
-        symbol_index: SymbolIndex,
-    },
-
-    #[error("could not parse symbol '{name}' at table index {index}: {error}")]
-    ComdatSymbol {
-        name: String,
-        index: SymbolIndex,
-        error: TryFromComdatSelectionError,
-    },
-
-    #[error("COMDAT symbol '{0}' is missing a section symbol")]
-    MissingComdatSectionSymbol(String),
-
-    #[error("COMDAT section symbol '{symbol}' is missing associative section {associative_index}")]
-    MissingComdatAssociativeSection {
-        symbol: String,
-        associative_index: SectionIndex,
-    },
-
-    #[error(
-        "weak external symbol '{symbol}' auxiliary record tag index {tag_index} references an invalid symbol"
-    )]
-    WeakTagIndex {
-        symbol: String,
-        tag_index: SymbolIndex,
-    },
-
-    #[error("could not parse symbol '{symbol}' at table index {index}: {error}")]
-    WeakCharacteristics {
-        symbol: String,
-        index: SymbolIndex,
-        error: TryFromWeakDefaultSearch,
-    },
-
-    #[error("{0}")]
-    Object(#[from] object::read::Error),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum SymbolError<'arena, 'data> {
-    #[error("duplicate symbol: {0}")]
-    Duplicate(DuplicateSymbolError<'arena, 'data>),
-
-    #[error("undefined symbol: {0}")]
-    Undefined(UndefinedSymbolError<'arena, 'data>),
-
-    #[error("multiply defined symbol: {0}")]
-    MultiplyDefined(MultiplyDefinedSymbolError<'arena, 'data>),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub struct DuplicateSymbolError<'arena, 'data>(&'arena SymbolNode<'arena, 'data>);
-
-impl<'arena, 'data> DuplicateSymbolError<'arena, 'data> {
-    pub fn symbol(&self) -> &'arena SymbolNode<'arena, 'data> {
-        self.0
-    }
-}
-
-impl std::fmt::Display for DuplicateSymbolError<'_, '_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        display_symbol_definitions(f, self.0)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub struct UndefinedSymbolError<'arena, 'data>(&'arena SymbolNode<'arena, 'data>);
-
-impl<'arena, 'data> UndefinedSymbolError<'arena, 'data> {
-    pub fn symbol(&self) -> &'arena SymbolNode<'arena, 'data> {
-        self.0
-    }
-}
-
-impl std::fmt::Display for UndefinedSymbolError<'_, '_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0.name().quoted_demangle())?;
-
-        let mut reference_iter = self.0.symbol_references().peekable();
-        let mut logged_references = 0;
-
-        while logged_references < 5 {
-            let reference = match reference_iter.next() {
-                Some(reference) => reference,
-                None => break,
-            };
-
-            let reloc = reference.relocation();
-            let section = reloc.source();
-            let coff = section.coff();
-
-            if reference.source_symbol().is_section_symbol() {
-                if reference_iter.peek().is_some_and(|next_reference| {
-                    next_reference.source_symbol().is_section_symbol()
-                }) {
-                    write!(
-                        f,
-                        "\nreferenced by {coff}:({}+{:#x})",
-                        section.name(),
-                        reloc.weight().address()
-                    )?;
-                    logged_references += 1;
-                }
-            } else {
-                write!(
-                    f,
-                    "\nreferenced by {coff}:({})",
-                    reference.source_symbol().name().quoted_demangle()
-                )?;
-                logged_references += 1;
-            }
-        }
-
-        let remaining = self.0.references().len().saturating_sub(logged_references);
-        if remaining > 0 {
-            write!(f, "\nreferenced {remaining} more times")?;
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub struct MultiplyDefinedSymbolError<'arena, 'data>(&'arena SymbolNode<'arena, 'data>);
-
-impl<'arena, 'data> MultiplyDefinedSymbolError<'arena, 'data> {
-    pub fn symbol(&self) -> &'arena SymbolNode<'arena, 'data> {
-        self.0
-    }
-}
-
-impl std::fmt::Display for MultiplyDefinedSymbolError<'_, '_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        display_symbol_definitions(f, self.0)
-    }
-}
-
-fn display_symbol_definitions<'arena, 'data>(
-    f: &mut std::fmt::Formatter<'_>,
-    symbol: &'arena SymbolNode<'arena, 'data>,
-) -> std::fmt::Result {
-    write!(f, "{}", symbol.name().quoted_demangle())?;
-
-    let definitions = symbol.definitions();
-    if !definitions.is_empty() {
-        let mut definition_iter = definitions.iter();
-        for definition in definition_iter.by_ref().take(5) {
-            write!(f, "\ndefined at {}", definition.target().coff())?;
-        }
-
-        let remaining = definitions.len().saturating_sub(5);
-        if remaining > 0 {
-            write!(f, "\ndefined {remaining} more times")?;
-        }
-    }
-
-    Ok(())
-}
 
 /// The link graph.
 pub struct LinkGraph<'arena, 'data> {
@@ -298,14 +110,6 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
         Default::default()
     }
 
-    /// Returns the number of bytes allocated internally for holding the graph
-    /// components.
-    #[allow(unused)]
-    #[inline]
-    pub fn allocated_bytes(&self) -> usize {
-        self.arena.allocated_bytes()
-    }
-
     /// Returns `true` if the graph is empty.
     pub fn is_empty(&self) -> bool {
         self.node_count == 0
@@ -317,12 +121,13 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
         file_path: &'data Path,
         member_path: Option<&'data Path>,
         coff: &CoffFile<'data, &'data [u8], C>,
-    ) -> Result<(), LinkGraphAddError> {
+    ) -> anyhow::Result<()> {
         if Architecture::from(self.machine) != coff.architecture() {
-            return Err(LinkGraphAddError::ArchitectureMismatch {
-                expected: self.machine.into(),
-                found: coff.architecture(),
-            });
+            bail!(
+                "invalid architecture '{:?}', expected '{:?}'",
+                Architecture::from(self.machine),
+                coff.architecture()
+            );
         }
 
         let coff_node = CoffNode::new(file_path, member_path);
@@ -389,11 +194,7 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                 SymbolName::new(symbol_name, self.machine == LinkerTargetArch::I386),
                 coff_symbol,
             )
-            .map_err(|e| LinkGraphAddError::Symbol {
-                name: symbol_name.to_string(),
-                index: symbol.index(),
-                error: e,
-            })?;
+            .with_context(|| format!("symbol '{}' at index {}", symbol_name, symbol.index()))?;
 
             let graph_symbol = if symbol.is_global() {
                 *self
@@ -468,11 +269,12 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
             };
 
             let graph_section = self.cache.get_section(section_idx).ok_or_else(|| {
-                LinkGraphAddError::SymbolSectionIndex {
-                    symbol_name: symbol_name.to_string(),
-                    symbol_index: symbol.index(),
-                    section_num: section_idx,
-                }
+                anyhow!(
+                    "symbol '{}' at index {} references invalid section number {}",
+                    symbol_name,
+                    symbol.index(),
+                    section_idx
+                )
             })?;
 
             let mut definition_edge = Edge::new(
@@ -487,12 +289,8 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
 
                 if graph_section.is_comdat() {
                     let selection =
-                        ComdatSelection::try_from(aux_section.selection).map_err(|e| {
-                            LinkGraphAddError::ComdatSymbol {
-                                name: symbol_name.to_string(),
-                                index: symbol.index(),
-                                error: e,
-                            }
+                        ComdatSelection::try_from(aux_section.selection).with_context(|| {
+                            format!("symbol '{}' at index {}", symbol_name, symbol.index())
                         })?;
 
                     // If this is a COMDAT to an associative section, add an
@@ -505,9 +303,12 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                         let associative_section = self
                             .cache
                             .get_section(associative_section_index)
-                            .ok_or_else(|| LinkGraphAddError::MissingComdatAssociativeSection {
-                                symbol: symbol_name.to_string(),
-                                associative_index: associative_section_index,
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "COMDAT symbol '{}' is missing associative section at {}",
+                                    symbol_name,
+                                    associative_section_index.0
+                                )
                             })?;
 
                         associative_section
@@ -550,7 +351,11 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                     .cache
                     .get_comdat_leader_selection(section_idx)
                     .ok_or_else(|| {
-                        LinkGraphAddError::MissingComdatSectionSymbol(symbol_name.to_string())
+                        anyhow!(
+                            "COMDAT leader '{}' at index {} missing aux section symbol",
+                            symbol_name,
+                            symbol.index()
+                        )
                     })?;
 
                 if let Some(selection) = selection_entry {
@@ -589,17 +394,18 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
             let default_symbol = self
                 .cache
                 .get_symbol(weak_aux.default_symbol())
-                .ok_or_else(|| LinkGraphAddError::WeakTagIndex {
-                    symbol: graph_symbol.name().to_string(),
-                    tag_index: weak_aux.default_symbol(),
+                .ok_or_else(|| {
+                    anyhow!(
+                        "weak external symbol '{}' tag index {} references invalid section",
+                        graph_symbol.name(),
+                        weak_aux.default_symbol()
+                    )
                 })?;
 
             let weak_search =
                 WeakDefaultSearch::try_from(weak_aux.weak_search_type.get(object::LittleEndian))
-                    .map_err(|e| LinkGraphAddError::WeakCharacteristics {
-                        symbol: graph_symbol.name().to_string(),
-                        index: symbol_idx,
-                        error: e,
+                    .with_context(|| {
+                        format!("symbol '{}' at index {}", graph_symbol.name(), symbol_idx)
                     })?;
 
             let default_edge = self.arena.alloc_with(|| {
@@ -621,11 +427,12 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
 
             for reloc in section.coff_relocations()? {
                 let target_symbol = self.cache.get_symbol(reloc.symbol()).ok_or_else(|| {
-                    LinkGraphAddError::RelocationTarget {
-                        section: graph_section.name().to_string(),
-                        address: reloc.virtual_address.get(object::LittleEndian),
-                        symbol_index: reloc.symbol(),
-                    }
+                    anyhow!(
+                        "{}+{:#x} relocation references invalid symbol index {}",
+                        graph_section.name(),
+                        reloc.virtual_address.get(object::LittleEndian),
+                        reloc.symbol()
+                    )
                 })?;
 
                 let reloc_edge = self.arena.alloc_with(|| {
@@ -695,12 +502,11 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
     ///
     /// # Panics
     /// Panics if `symbol` does not exist.
-    #[inline]
     pub fn add_api_import(
         &mut self,
         symbol: &str,
         import: &ImportMember<'data>,
-    ) -> Result<(), LinkGraphAddError> {
+    ) -> anyhow::Result<()> {
         let api_node = *self.api_node.get_or_insert_with(|| {
             self.arena
                 .alloc_with(|| LibraryNode::new(LibraryNodeWeight::new(import.dll)))
@@ -713,12 +519,11 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
     ///
     /// # Panics
     /// Panics if `symbol` does not exist.
-    #[inline]
     pub fn add_library_import(
         &mut self,
         symbol: &str,
         import: &ImportMember<'data>,
-    ) -> Result<(), LinkGraphAddError> {
+    ) -> anyhow::Result<()> {
         let library_node = *self.library_nodes.entry(import.dll).or_insert_with(|| {
             self.arena
                 .alloc_with(|| LibraryNode::new(LibraryNodeWeight::new(import.dll)))
@@ -732,7 +537,7 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
         symbol: &str,
         library: &'arena LibraryNode<'arena, 'data>,
         import: &ImportMember<'data>,
-    ) -> Result<(), LinkGraphAddError> {
+    ) -> anyhow::Result<()> {
         let symbol_node = self
             .external_symbols
             .get(symbol)
@@ -740,10 +545,11 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
             .unwrap_or_else(|| panic!("symbol {symbol} does not exist"));
 
         if import.architecture != self.machine.into() {
-            return Err(LinkGraphAddError::ArchitectureMismatch {
-                expected: self.machine.into(),
-                found: import.architecture,
-            });
+            bail!(
+                "invalid architecture '{:?}', expected '{:?}'",
+                Architecture::from(self.machine),
+                import.architecture
+            );
         }
 
         let import_name = match import.import {
@@ -781,26 +587,27 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
     pub fn finish(
         self,
         ignored_unresolved: &HashSet<String>,
-    ) -> Result<BuiltLinkGraph<'arena, 'data>, Vec<SymbolError<'arena, 'data>>> {
-        let mut symbol_errors = Vec::new();
+    ) -> Result<BuiltLinkGraph<'arena, 'data>, ()> {
+        let mut errored = false;
 
         for symbol in self.external_symbols.values().copied() {
             if symbol.is_undefined()
                 && !symbol.references().is_empty()
                 && !ignored_unresolved.contains(symbol.name().as_str())
             {
-                symbol_errors.push(SymbolError::Undefined(UndefinedSymbolError(symbol)));
+                errored = true;
+                self.report_undefined(symbol, true);
             } else if symbol.is_duplicate() {
-                symbol_errors.push(SymbolError::Duplicate(DuplicateSymbolError(symbol)));
+                errored = true;
+                self.report_duplicate(symbol);
             } else if symbol.is_multiply_defined() {
-                symbol_errors.push(SymbolError::MultiplyDefined(MultiplyDefinedSymbolError(
-                    symbol,
-                )));
+                errored = true;
+                self.report_multiply_defined(symbol);
             }
         }
 
-        if !symbol_errors.is_empty() {
-            return Err(symbol_errors);
+        if errored {
+            return Err(());
         }
 
         Ok(BuiltLinkGraph::new(self))
@@ -813,53 +620,112 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
     pub fn finish_unresolved(
         self,
         ignored_unresolved: &HashSet<String>,
-    ) -> Result<BuiltLinkGraph<'arena, 'data>, Vec<SymbolError<'arena, 'data>>> {
-        let mut symbol_errors = Vec::new();
-        let mut unresolved_symbols = Vec::new();
+    ) -> Result<BuiltLinkGraph<'arena, 'data>, ()> {
+        let mut errored = false;
 
         for symbol in self.external_symbols.values().copied() {
             if symbol.is_undefined()
                 && !symbol.references().is_empty()
                 && !ignored_unresolved.contains(symbol.name().as_str())
             {
-                unresolved_symbols.push(SymbolError::Undefined(UndefinedSymbolError(symbol)));
+                self.report_undefined(symbol, false);
             } else if symbol.is_duplicate() {
-                symbol_errors.push(SymbolError::Duplicate(DuplicateSymbolError(symbol)));
+                errored = true;
+                self.report_duplicate(symbol);
             } else if symbol.is_multiply_defined() {
-                symbol_errors.push(SymbolError::MultiplyDefined(MultiplyDefinedSymbolError(
-                    symbol,
-                )));
+                errored = true;
+                self.report_multiply_defined(symbol);
             }
         }
 
-        if !unresolved_symbols.is_empty() {
-            let mut log_buffer = String::new();
-            let mut unresolved_iter = unresolved_symbols.iter();
-
-            for unresolved_symbol in unresolved_iter
-                .by_ref()
-                .take(unresolved_symbols.len().saturating_sub(1))
-            {
-                writeln!(log_buffer, "{unresolved_symbol}").unwrap();
-                log::warn!("{log_buffer}");
-                log_buffer.clear();
-            }
-
-            if let Some(unresolved_symbol) = unresolved_iter.next() {
-                write!(log_buffer, "{unresolved_symbol}").unwrap();
-                if !symbol_errors.is_empty() {
-                    log_buffer.push('\n');
-                }
-
-                log::warn!("{log_buffer}");
-            }
-        }
-
-        if !symbol_errors.is_empty() {
-            return Err(symbol_errors);
+        if errored {
+            return Err(());
         }
 
         Ok(BuiltLinkGraph::new(self))
+    }
+
+    fn report_undefined(&self, symbol: &SymbolNode, log_error: bool) {
+        let mut buf = format!("undefined symbol: {}", symbol.name().quoted_demangle());
+
+        let mut logged = 0;
+        let mut references = symbol.symbol_references().peekable();
+        while logged < 5 {
+            let Some(reference) = references.next() else {
+                break;
+            };
+
+            let reloc = reference.relocation();
+            let section = reloc.source();
+            let coff = section.coff();
+
+            if reference.source_symbol().is_section_symbol() {
+                if references.peek().is_some_and(|next_reference| {
+                    next_reference.source_symbol().is_section_symbol()
+                }) {
+                    write!(
+                        buf,
+                        "\nreferenced by {coff}:({}+{:#x})",
+                        section.name(),
+                        reloc.weight().address()
+                    )
+                    .unwrap();
+                    logged += 1;
+                }
+            } else {
+                write!(
+                    buf,
+                    "\nreferenced by {coff}:({})",
+                    reference.source_symbol().name().quoted_demangle()
+                )
+                .unwrap();
+                logged += 1;
+            }
+        }
+
+        let remaining = symbol.references().len().saturating_sub(logged);
+        if remaining > 0 {
+            write!(buf, "\nreferenced {remaining} more times").unwrap();
+        }
+
+        if log_error {
+            log::error!("{buf}");
+        } else {
+            log::warn!("{buf}");
+        }
+    }
+
+    fn report_duplicate(&self, symbol: &SymbolNode) {
+        let mut buf = format!("duplicate symbol: {}", symbol.name().quoted_demangle());
+
+        for definition in symbol.definitions().iter().take(5) {
+            write!(buf, "\ndefined at {}", definition.target().coff()).unwrap();
+        }
+
+        let remaining = symbol.definitions().len().saturating_sub(5);
+        if remaining > 0 {
+            write!(buf, "\ndefined {remaining} more times").unwrap();
+        }
+
+        log::error!("{buf}");
+    }
+
+    fn report_multiply_defined(&self, symbol: &SymbolNode) {
+        let mut buf = format!(
+            "multiply defined symbol: {}",
+            symbol.name().quoted_demangle()
+        );
+
+        for definition in symbol.definitions().iter().take(5) {
+            write!(buf, "\ndefined at {}", definition.target().coff()).unwrap();
+        }
+
+        let remaining = symbol.definitions().len().saturating_sub(5);
+        if remaining > 0 {
+            write!(buf, "\ndefined {remaining} more times").unwrap();
+        }
+
+        log::error!("{buf}");
     }
 
     /// Writes out the GraphViz dot representation of this graph to the specified

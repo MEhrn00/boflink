@@ -7,19 +7,10 @@ use typed_arena::Arena;
 use crate::{
     linker::LinkerTargetArch,
     linkobject::{
-        archive::{ArchiveMemberError, ArchiveSymbolError, LinkArchive, LinkArchiveMemberVariant},
+        archive::{LinkArchive, LinkArchiveMemberVariant},
         import::ImportMember,
     },
 };
-
-#[derive(Debug, thiserror::Error)]
-pub enum ApiSymbolsError {
-    #[error("{0}")]
-    Symbol(#[from] ArchiveSymbolError),
-
-    #[error("{0}")]
-    Member(#[from] ArchiveMemberError),
-}
 
 pub struct ApiSymbols<'a> {
     /// The custom API archive path if these symbols are from a custom API.
@@ -44,10 +35,7 @@ impl<'a> ApiSymbols<'a> {
     }
 
     /// Creates a new [`ApiSymbols`] from a [`LinkArchive`].
-    pub fn new(
-        path: &'a Path,
-        archive: LinkArchive<'a>,
-    ) -> Result<ApiSymbols<'a>, ApiSymbolsError> {
+    pub fn new(path: &'a Path, archive: LinkArchive<'a>) -> anyhow::Result<ApiSymbols<'a>> {
         let symbol_iter = archive.symbols();
 
         let symbol_count = symbol_iter.size_hint();

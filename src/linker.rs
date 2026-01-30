@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use anyhow::{Context, bail};
 use indexmap::{IndexMap, IndexSet};
 use log::warn;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
@@ -15,21 +16,15 @@ use object::{
 use typed_arena::Arena;
 
 use crate::{
-    api::{ApiSymbols, ApiSymbolsError},
+    api::ApiSymbols,
     drectve,
-    graph::{
-        LinkGraphAddError, LinkGraphLinkError, SpecLinkGraph, SymbolError,
-        node::{OwnedSymbolName, SymbolNode},
-    },
-    libsearch::{LibraryFind, LibrarySearcher, LibsearchError},
-    linkobject::archive::{
-        ArchiveMemberError, ArchiveParseError, ExtractSymbolError, LinkArchive,
-        LinkArchiveMemberVariant, LinkArchiveParseError, MemberParseErrorKind,
-    },
+    graph::SpecLinkGraph,
+    libsearch::{LibraryFind, LibrarySearcher},
+    linkobject::archive::{LinkArchive, LinkArchiveMemberVariant},
 };
 
 pub trait LinkImpl {
-    fn link(&mut self) -> Result<Vec<u8>, LinkError>;
+    fn link(&mut self) -> anyhow::Result<Vec<u8>>;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
@@ -58,391 +53,6 @@ impl TryFrom<object::Architecture> for LinkerTargetArch {
             _ => return Err(value),
         })
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum LinkError {
-    #[error("{0}")]
-    Setup(LinkerSetupErrors),
-
-    #[error("{0}")]
-    Symbol(LinkerSymbolErrors),
-
-    #[error("{0}")]
-    Graph(#[from] LinkGraphLinkError),
-
-    #[error("--gc-sections requires a defined --entry symbol or set of GC roots")]
-    EmptyGcRoots,
-
-    #[error("no input files")]
-    NoInput,
-
-    #[error("could not detect architecture")]
-    ArchitectureDetect,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("{}", display_vec(.0))]
-pub struct LinkerSetupErrors(pub(super) Vec<LinkerSetupError>);
-
-impl LinkerSetupErrors {
-    pub fn errors(&self) -> &[LinkerSetupError] {
-        &self.0
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum LinkerSetupError {
-    #[error("{0}")]
-    Path(LinkerSetupPathError),
-
-    #[error("{0}")]
-    Library(LibsearchError),
-
-    #[error("{0}")]
-    Api(ApiSetupError),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ApiSetupError {
-    #[error("{}: could not open custom API: {error}", .path.display())]
-    Io {
-        path: PathBuf,
-        error: std::io::Error,
-    },
-
-    #[error("unable to find custom API '{0}'")]
-    NotFound(String),
-
-    #[error("{}: {error}", .path.display())]
-    Parse {
-        path: PathBuf,
-        error: LinkArchiveParseError,
-    },
-
-    #[error("{}: {error}", .path.display())]
-    ApiSymbols {
-        path: PathBuf,
-        error: ApiSymbolsError,
-    },
-}
-
-impl From<LibsearchError> for ApiSetupError {
-    fn from(value: LibsearchError) -> Self {
-        match value {
-            LibsearchError::NotFound(name) => Self::NotFound(name),
-            LibsearchError::Io { path, error } => Self::Io { path, error },
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{}{}: {error}",
-    .path.display(),
-    .member.as_ref().map(|p| format!("({})", p.display())).unwrap_or_default()
-)]
-pub struct LinkerSetupPathError {
-    pub path: PathBuf,
-    pub member: Option<PathBuf>,
-    pub error: LinkerPathErrorKind,
-}
-
-impl LinkerSetupPathError {
-    pub fn new<P: Into<PathBuf>>(
-        path: impl Into<PathBuf>,
-        member: Option<P>,
-        error: impl Into<LinkerPathErrorKind>,
-    ) -> LinkerSetupPathError {
-        Self {
-            path: path.into(),
-            member: member.map(Into::into),
-            error: error.into(),
-        }
-    }
-
-    pub fn nomember(
-        path: impl Into<PathBuf>,
-        error: impl Into<LinkerPathErrorKind>,
-    ) -> LinkerSetupPathError {
-        Self {
-            path: path.into(),
-            member: None,
-            error: error.into(),
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum LinkerPathErrorKind {
-    #[error("{0}")]
-    DrectveLibrary(#[from] DrectveLibsearchError),
-
-    #[error("{0}")]
-    LinkArchive(#[from] LinkArchiveParseError),
-
-    #[error("{0}")]
-    ArchiveParse(#[from] ArchiveParseError),
-
-    #[error("{0}")]
-    ArchiveMember(#[from] MemberParseErrorKind),
-
-    #[error("{0}")]
-    GraphAdd(#[from] LinkGraphAddError),
-
-    #[error("{0}")]
-    Object(#[from] object::Error),
-
-    #[error("{0}")]
-    Io(#[from] std::io::Error),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum DrectveLibsearchError {
-    #[error("unable to find library {0}")]
-    NotFound(String),
-
-    #[error("could not open link library {}: {error}", .path.display())]
-    Io {
-        path: PathBuf,
-        error: std::io::Error,
-    },
-}
-
-impl From<LibsearchError> for DrectveLibsearchError {
-    fn from(value: LibsearchError) -> Self {
-        match value {
-            LibsearchError::Io { path, error } => Self::Io { path, error },
-            LibsearchError::NotFound(name) => Self::NotFound(name),
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("{}", display_vec(.0))]
-pub struct LinkerSymbolErrors(pub(super) Vec<LinkerSymbolError>);
-
-impl LinkerSymbolErrors {
-    pub fn errors(&self) -> &[LinkerSymbolError] {
-        &self.0
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("{kind}: {}{}", .name.quoted_demangle(), .display_demangled_context(kind))]
-pub struct LinkerSymbolError {
-    pub name: OwnedSymbolName,
-    pub kind: LinkerSymbolErrorKind,
-}
-
-impl From<SymbolError<'_, '_>> for LinkerSymbolError {
-    fn from(value: SymbolError<'_, '_>) -> Self {
-        match value {
-            SymbolError::Duplicate(duplicate_error) => {
-                let symbol = duplicate_error.symbol();
-
-                Self {
-                    name: symbol.name().into_owned(),
-                    kind: LinkerSymbolErrorKind::Duplicate(SymbolDefinitionsContext::new(symbol)),
-                }
-            }
-            SymbolError::Undefined(undefined_error) => {
-                let symbol = undefined_error.symbol();
-
-                Self {
-                    name: symbol.name().into_owned(),
-                    kind: LinkerSymbolErrorKind::Undefined(SymbolReferencesContext::new(symbol)),
-                }
-            }
-            SymbolError::MultiplyDefined(multiply_defined_error) => {
-                let symbol = multiply_defined_error.symbol();
-
-                Self {
-                    name: symbol.name().into_owned(),
-                    kind: LinkerSymbolErrorKind::MultiplyDefined(SymbolDefinitionsContext::new(
-                        symbol,
-                    )),
-                }
-            }
-        }
-    }
-}
-
-fn display_demangled_context(kind: &LinkerSymbolErrorKind) -> String {
-    if !kind.context_is_empty() {
-        format!("\n{}", kind.display_context())
-    } else {
-        Default::default()
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum LinkerSymbolErrorKind {
-    #[error("duplicate symbol")]
-    Duplicate(SymbolDefinitionsContext),
-
-    #[error("undefined symbol")]
-    Undefined(SymbolReferencesContext),
-
-    #[error("multiply defined symbol")]
-    MultiplyDefined(SymbolDefinitionsContext),
-}
-
-impl LinkerSymbolErrorKind {
-    pub fn display_context(&self) -> &dyn std::fmt::Display {
-        match self {
-            LinkerSymbolErrorKind::Duplicate(ctx) => ctx as &dyn std::fmt::Display,
-            LinkerSymbolErrorKind::Undefined(ctx) => ctx as &dyn std::fmt::Display,
-            LinkerSymbolErrorKind::MultiplyDefined(ctx) => ctx as &dyn std::fmt::Display,
-        }
-    }
-
-    pub fn context_is_empty(&self) -> bool {
-        match self {
-            LinkerSymbolErrorKind::Duplicate(ctx) => ctx.definitions.is_empty(),
-            LinkerSymbolErrorKind::Undefined(ctx) => ctx.references.is_empty(),
-            LinkerSymbolErrorKind::MultiplyDefined(ctx) => ctx.definitions.is_empty(),
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{}{}",
-    display_vec(.definitions),
-    display_remaining_definitions(.remaining)
-)]
-pub struct SymbolDefinitionsContext {
-    pub definitions: Vec<SymbolDefinition>,
-    pub remaining: usize,
-}
-
-impl SymbolDefinitionsContext {
-    pub fn new(symbol: &SymbolNode<'_, '_>) -> SymbolDefinitionsContext {
-        let mut definition_iter = symbol.definitions().iter();
-        let mut definitions = Vec::with_capacity(5);
-
-        for definition in definition_iter.by_ref().take(5) {
-            definitions.push(SymbolDefinition {
-                coff_path: definition.target().coff().to_string(),
-            });
-        }
-
-        let remaining = definition_iter.count();
-        Self {
-            definitions,
-            remaining,
-        }
-    }
-}
-
-fn display_remaining_definitions(remaining: &usize) -> String {
-    if *remaining != 0 {
-        format!("\ndefined {remaining} more times")
-    } else {
-        Default::default()
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("defined at {coff_path}")]
-pub struct SymbolDefinition {
-    pub coff_path: String,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{}{}",
-    display_vec(.references),
-    display_remaining_references(.remaining),
-)]
-pub struct SymbolReferencesContext {
-    pub references: Vec<SymbolReference>,
-    pub remaining: usize,
-}
-
-impl SymbolReferencesContext {
-    pub fn new(symbol: &SymbolNode<'_, '_>) -> SymbolReferencesContext {
-        let mut reference_iter = symbol.symbol_references().peekable();
-
-        let mut references = Vec::with_capacity(5);
-
-        while references.len() < 5 {
-            let reference = match reference_iter.next() {
-                Some(reference) => reference,
-                None => break,
-            };
-
-            let reloc = reference.relocation();
-            let section = reference.section();
-            let coff = section.coff();
-
-            if reference.source_symbol().is_section_symbol() {
-                if reference_iter.peek().is_some_and(|next_reference| {
-                    next_reference.source_symbol().is_section_symbol()
-                }) {
-                    references.push(SymbolReference {
-                        coff_path: coff.to_string(),
-                        reference: format!("{}+{:#x}", section.name(), reloc.weight().address()),
-                    });
-                }
-            } else {
-                references.push(SymbolReference {
-                    coff_path: coff.to_string(),
-                    reference: reference
-                        .source_symbol()
-                        .name()
-                        .quoted_demangle()
-                        .to_string(),
-                });
-            }
-        }
-
-        SymbolReferencesContext {
-            remaining: symbol.references().len().saturating_sub(references.len()),
-            references,
-        }
-    }
-}
-
-fn display_remaining_references(remaining: &usize) -> String {
-    if *remaining != 0 {
-        format!("\nreferenced {remaining} more times")
-    } else {
-        Default::default()
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("referenced by {coff_path}:({reference})")]
-pub struct SymbolReference {
-    pub coff_path: String,
-    pub reference: String,
-}
-
-struct DisplayVec<'a, T: std::fmt::Display>(&'a Vec<T>);
-
-impl<'a, T: std::fmt::Display> std::fmt::Display for DisplayVec<'a, T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut value_iter = self.0.iter();
-
-        let first_value = match value_iter.next() {
-            Some(v) => v,
-            None => return Ok(()),
-        };
-
-        first_value.fmt(f)?;
-
-        for val in value_iter {
-            write!(f, "\n{val}")?;
-        }
-
-        Ok(())
-    }
-}
-
-fn display_vec<T: std::fmt::Display>(errors: &Vec<T>) -> DisplayVec<'_, T> {
-    DisplayVec(errors)
 }
 
 /// The linker input types.
@@ -602,12 +212,6 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
         entry.whole = true;
     }
 
-    /// Add a file from memory to link
-    pub fn add_file_memory(&mut self, path: impl Into<PathBuf>, buffer: impl Into<Vec<u8>>) {
-        let entry = self.inputs.entry(LinkInput::File(path.into())).or_default();
-        entry.buffer = Some(buffer.into());
-    }
-
     /// Add a link library to the linker.
     pub fn add_library(&mut self, name: impl Into<String>) {
         self.inputs
@@ -622,17 +226,6 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
             .entry(LinkInput::Library(name.into()))
             .or_default();
         entry.whole = true;
-    }
-
-    /// Add a set of link libraries to the linker.
-    pub fn add_libraries<S: Into<String>, I: IntoIterator<Item = S>>(&mut self, names: I) {
-        names.into_iter().for_each(|name| self.add_library(name));
-    }
-
-    /// Add the specified symbol to keep during GC sections.
-    pub fn add_gc_keep_symbol(mut self, symbol: impl Into<String>) -> Self {
-        self.gc_keep_symbols.insert(symbol.into());
-        self
     }
 
     /// Adds the list of symbols to keep during GC sections.
@@ -664,10 +257,20 @@ impl<L: LibraryFind + 'static> LinkerBuilder<L> {
     }
 }
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct CoffPath<'a> {
     file_path: &'a Path,
     member_path: Option<&'a Path>,
+}
+
+impl std::fmt::Display for CoffPath<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(member) = self.member_path {
+            write!(f, "{}({})", self.file_path.display(), member.display())
+        } else {
+            write!(f, "{}", self.file_path.display())
+        }
+    }
 }
 
 /// A configured linker.
@@ -713,11 +316,6 @@ pub struct ConfiguredLinker<L: LibraryFind> {
 }
 
 impl<L: LibraryFind> ConfiguredLinker<L> {
-    /// Returns a [`LinkerBuilder`] for configuring a linker.
-    pub fn builder() -> LinkerBuilder<L> {
-        LinkerBuilder::new()
-    }
-
     pub(super) fn with_opts<T: LibraryFind>(
         builder: LinkerBuilder<T>,
         library_searcher: L,
@@ -741,7 +339,7 @@ impl<L: LibraryFind> ConfiguredLinker<L> {
 }
 
 impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
-    fn link(&mut self) -> Result<Vec<u8>, LinkError> {
+    fn link(&mut self) -> anyhow::Result<Vec<u8>> {
         // Buffer arena
         let buffer_arena: Arena<(PathBuf, Vec<u8>)> = Arena::with_capacity(self.inputs.len());
 
@@ -751,13 +349,13 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
             self.inputs.len(),
         );
 
-        // Errors during setup
-        let mut setup_errors = Vec::new();
+        let mut errored = false;
 
         // Process the input files
         for (link_input, link_item) in std::mem::take(&mut self.inputs) {
             if let Err(e) = input_processor.process_input(link_input, link_item) {
-                setup_errors.push(e);
+                log::error!("{e:#}");
+                errored = true;
             }
         }
 
@@ -765,48 +363,31 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
             input_processor.ensure_entrypoint(entrypoint);
         }
 
-        let target_arch = self.target_arch.take().or_else(|| {
-            input_processor
-                .coffs
-                .values()
-                .find_map(|coff| LinkerTargetArch::try_from(coff.architecture()).ok())
-        });
-
-        let target_arch = match target_arch {
-            Some(target_arch) => target_arch,
-            None => {
-                if !setup_errors.is_empty() {
-                    return Err(LinkError::Setup(LinkerSetupErrors(setup_errors)));
-                }
-
-                if input_processor.coffs.is_empty() {
-                    return Err(LinkError::NoInput);
-                }
-
-                return Err(LinkError::ArchitectureDetect);
-            }
-        };
-
-        let string_arena = Arena::new();
-        let api_symbols = match self.custom_api.take() {
-            Some(custom_api) => match input_processor.open_custom_api(custom_api) {
-                Ok(api_symbols) => api_symbols,
-                Err(e) => {
-                    setup_errors.push(LinkerSetupError::Api(e));
-                    return Err(LinkError::Setup(LinkerSetupErrors(setup_errors)));
-                }
-            },
-            None => ApiSymbols::beacon(&string_arena, target_arch),
-        };
-
-        // Check errors
-        if !setup_errors.is_empty() {
-            return Err(LinkError::Setup(LinkerSetupErrors(setup_errors)));
+        if errored {
+            std::process::exit(1);
         }
 
         if input_processor.coffs.is_empty() {
-            return Err(LinkError::NoInput);
+            bail!("no input files");
         }
+
+        let target_arch = self
+            .target_arch
+            .take()
+            .or_else(|| {
+                input_processor
+                    .coffs
+                    .values()
+                    .find_map(|coff| LinkerTargetArch::try_from(coff.architecture()).ok())
+            })
+            .context("cannot detect target architecture from input files")?;
+
+        let string_arena = Arena::new();
+        let api_symbols = self
+            .custom_api
+            .take()
+            .map(|api| input_processor.open_custom_api(api))
+            .unwrap_or_else(|| Ok(ApiSymbols::beacon(&string_arena, target_arch)))?;
 
         // Build the graph
         let graph_arena = input_processor.spec.alloc_arena();
@@ -818,61 +399,60 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
                 .into_iter()
                 .flatten()
             {
-                if !input_processor.opened_library_names.contains(library_name) {
-                    let (library_path, library_buffer) = match self
-                        .library_searcher
-                        .find_library(library_name)
-                    {
-                        Ok(found) => found,
-                        Err(e) => {
-                            setup_errors.push(LinkerSetupError::Path(LinkerSetupPathError::new(
-                                coff_path.file_path,
-                                coff_path.member_path,
-                                LinkerPathErrorKind::DrectveLibrary(e.into()),
-                            )));
-                            continue;
-                        }
-                    };
-
-                    input_processor
-                        .opened_library_names
-                        .insert(library_name.to_string());
-
-                    if !input_processor
-                        .link_libraries
-                        .contains_key(library_path.as_path())
-                    {
-                        let (library_path, library_buffer) =
-                            input_processor.arena.alloc((library_path, library_buffer));
-                        let archive = match LinkArchive::parse(library_buffer.as_slice()) {
-                            Ok(parsed) => parsed,
-                            Err(e) => {
-                                setup_errors.push(LinkerSetupError::Path(
-                                    LinkerSetupPathError::nomember(library_path.as_path(), e),
-                                ));
-                                continue;
-                            }
-                        };
-
-                        input_processor
-                            .link_libraries
-                            .insert(library_path.as_path(), archive);
-                    }
+                if input_processor.opened_library_names.contains(library_name) {
+                    continue;
                 }
+
+                let search_result = self
+                    .library_searcher
+                    .find_library(&library_name)
+                    .with_context(|| format!("{coff_path}: unable to find library {library_name}"));
+
+                let (library_path, buffer) = match search_result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::error!("{e}");
+                        errored = true;
+                        continue;
+                    }
+                };
+
+                input_processor
+                    .opened_library_names
+                    .insert(library_name.to_string());
+
+                if input_processor
+                    .link_libraries
+                    .contains_key(library_path.as_path())
+                {
+                    continue;
+                }
+
+                let (library_path, library_buffer) =
+                    input_processor.arena.alloc((library_path, buffer));
+                let archive = match LinkArchive::parse(library_buffer.as_slice()) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        log::error!("{}: {e}", library_path.as_path().display());
+                        errored = true;
+                        continue;
+                    }
+                };
+
+                input_processor
+                    .link_libraries
+                    .insert(library_path.as_path(), archive);
             }
 
             if let Err(e) = graph.add_coff(coff_path.file_path, coff_path.member_path, coff) {
-                setup_errors.push(LinkerSetupError::Path(LinkerSetupPathError::new(
-                    coff_path.file_path,
-                    coff_path.member_path,
-                    e,
-                )));
+                log::error!("{coff_path}: {e}");
+                errored = true;
             }
         }
 
-        // Return any errors
-        if !setup_errors.is_empty() {
-            return Err(LinkError::Setup(LinkerSetupErrors(setup_errors)));
+        // Check for any errors
+        if errored {
+            std::process::exit(1);
         }
 
         let mut drectve_queue: VecDeque<((&Path, &Path), &str)> = VecDeque::new();
@@ -900,10 +480,8 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
                 // Try resolving it as an API import first
                 if let Some(api_import) = api_symbols.get(symbol_name) {
                     if let Err(e) = graph.add_api_import(symbol_name, api_import) {
-                        setup_errors.push(LinkerSetupError::Path(LinkerSetupPathError::nomember(
-                            api_symbols.archive_path(),
-                            e,
-                        )));
+                        log::error!("{}: {e}", api_symbols.archive_path().display());
+                        errored = true;
                     }
 
                     continue;
@@ -914,7 +492,7 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
                     drectve_queue.pop_front()
                 {
                     match self.library_searcher.find_library(drectve_library) {
-                        Ok(found) => {
+                        Some(found) => {
                             if !input_processor
                                 .opened_library_names
                                 .contains(drectve_library)
@@ -932,48 +510,40 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
                                             .insert(library_path.as_path(), parsed);
                                     }
                                     Err(e) => {
-                                        setup_errors.push(LinkerSetupError::Path(
-                                            LinkerSetupPathError::new(
-                                                library_path.as_path(),
-                                                Some(coff_path),
-                                                e,
-                                            ),
-                                        ));
+                                        log::error!(
+                                            "{}({}): {e}",
+                                            library_path.display(),
+                                            coff_path.display()
+                                        );
+                                        errored = true;
                                     }
                                 }
                             }
                         }
-                        Err(e) => {
-                            setup_errors.push(LinkerSetupError::Path(LinkerSetupPathError::new(
-                                library_path,
-                                Some(coff_path),
-                                DrectveLibsearchError::from(e),
-                            )));
+                        None => {
+                            log::error!(
+                                "{}({}): unable to find library {drectve_library}",
+                                library_path.display(),
+                                coff_path.display()
+                            );
+                            errored = true;
                         }
                     }
                 }
 
                 // Attempt to resolve the symbol using the opened link libraries
                 for (library_path, library) in &input_processor.link_libraries {
-                    let (member_path, member) =
-                        match library.extract_symbol(symbol_name) {
-                            Ok(extracted) => extracted,
-                            Err(ExtractSymbolError::NotFound) => {
-                                continue;
-                            }
-                            Err(ExtractSymbolError::ArchiveParse(e)) => {
-                                setup_errors.push(LinkerSetupError::Path(
-                                    LinkerSetupPathError::nomember(library_path, e),
-                                ));
-                                continue;
-                            }
-                            Err(ExtractSymbolError::MemberParse(e)) => {
-                                setup_errors.push(LinkerSetupError::Path(
-                                    LinkerSetupPathError::new(library_path, Some(e.path), e.kind),
-                                ));
-                                continue;
-                            }
-                        };
+                    let (member_path, member) = match library.extract_symbol(symbol_name) {
+                        Ok(Some(extracted)) => extracted,
+                        Ok(None) => {
+                            continue;
+                        }
+                        Err(e) => {
+                            log::error!("{}: {e}", library_path.display());
+                            errored = true;
+                            continue;
+                        }
+                    };
 
                     match member {
                         LinkArchiveMemberVariant::Coff(coff) => {
@@ -993,9 +563,12 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
                             }
 
                             if let Err(e) = graph.add_coff(library_path, Some(member_path), &coff) {
-                                setup_errors.push(LinkerSetupError::Path(
-                                    LinkerSetupPathError::new(library_path, Some(member_path), e),
-                                ));
+                                log::error!(
+                                    "{}({}): {e}",
+                                    library_path.display(),
+                                    member_path.display()
+                                );
+                                errored = true;
                                 continue;
                             }
 
@@ -1003,9 +576,12 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
                         }
                         LinkArchiveMemberVariant::Import(import_member) => {
                             if let Err(e) = graph.add_library_import(symbol_name, &import_member) {
-                                setup_errors.push(LinkerSetupError::Path(
-                                    LinkerSetupPathError::new(library_path, Some(member_path), e),
-                                ));
+                                log::error!(
+                                    "{}({}): {e}",
+                                    library_path.display(),
+                                    member_path.display()
+                                );
+                                errored = true;
                                 continue;
                             }
 
@@ -1024,18 +600,18 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
             match std::fs::File::create(graph_path) {
                 Ok(f) => {
                     if let Err(e) = graph.write_dot_graph(BufWriter::new(f)) {
-                        warn!("could not write link graph: {e}");
+                        warn!("cannot not write link graph: {e}");
                     }
                 }
                 Err(e) => {
-                    warn!("could not open {}: {e}", graph_path.display());
+                    warn!("cannot not open {}: {e}", graph_path.display());
                 }
             }
         }
 
-        // Return errors
-        if !setup_errors.is_empty() {
-            return Err(LinkError::Setup(LinkerSetupErrors(setup_errors)));
+        // Check errors
+        if errored {
+            std::process::exit(1);
         }
 
         // Finish building the link graph
@@ -1047,10 +623,8 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
 
         let mut graph = match finish_result {
             Ok(graph) => graph,
-            Err(e) => {
-                return Err(LinkError::Symbol(LinkerSymbolErrors(
-                    e.into_iter().map(|v| v.into()).collect(),
-                )));
+            Err(_) => {
+                std::process::exit(1);
             }
         };
 
@@ -1118,39 +692,30 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
         &mut self,
         input: LinkInput,
         mut item: LinkInputItem,
-    ) -> Result<(), LinkerSetupError> {
+    ) -> anyhow::Result<()> {
         match input {
             LinkInput::File(file_path) => {
                 let (file_path, buffer) = if let Some(existing_buffer) = item.buffer.take() {
                     self.arena.alloc((file_path, existing_buffer))
                 } else {
-                    let buffer = std::fs::read(&file_path).map_err(|e| {
-                        LinkerSetupError::Path(LinkerSetupPathError::nomember(&file_path, e))
-                    })?;
+                    let buffer = std::fs::read(&file_path)
+                        .with_context(|| format!("cannot open {}", file_path.display()))?;
                     self.arena.alloc((file_path, buffer))
                 };
 
                 if object_is_archive(buffer.as_slice()) {
-                    let library = LinkArchive::parse(buffer.as_slice()).map_err(|e| {
-                        LinkerSetupError::Path(LinkerSetupPathError::nomember(
-                            file_path.as_path(),
-                            e,
-                        ))
-                    })?;
+                    let library = LinkArchive::parse(buffer.as_slice())
+                        .with_context(|| format!("cannot parse {}", file_path.display()))?;
 
                     if item.whole {
                         self.add_archive_members(file_path.as_path(), library)
-                            .map_err(LinkerSetupError::Path)?;
+                            .with_context(|| format!("{}", file_path.display()))?;
                     } else if !self.link_libraries.contains_key(file_path.as_path()) {
                         self.link_libraries.insert(file_path.as_path(), library);
                     }
                 } else {
-                    let coff: CoffFile = CoffFile::parse(buffer.as_slice()).map_err(|e| {
-                        LinkerSetupError::Path(LinkerSetupPathError::nomember(
-                            file_path.as_path(),
-                            e,
-                        ))
-                    })?;
+                    let coff: CoffFile = CoffFile::parse(buffer.as_slice())
+                        .with_context(|| format!("cannot parse {}", file_path.display()))?;
 
                     if let indexmap::map::Entry::Vacant(coff_entry) = self.coffs.entry(CoffPath {
                         file_path: file_path.as_path(),
@@ -1166,33 +731,23 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
                     let (library_path, library_buffer) = self
                         .library_searcher
                         .find_library(&library_name)
-                        .map_err(LinkerSetupError::Library)?;
+                        .with_context(|| format!("unable to find library -l{library_name}"))?;
 
                     self.opened_library_names.insert(library_name);
 
                     if item.whole {
                         let (library_path, library_buffer) =
                             self.arena.alloc((library_path, library_buffer));
-                        let archive =
-                            LinkArchive::parse(library_buffer.as_slice()).map_err(|e| {
-                                LinkerSetupError::Path(LinkerSetupPathError::nomember(
-                                    library_path.as_path(),
-                                    e,
-                                ))
-                            })?;
+                        let archive = LinkArchive::parse(library_buffer.as_slice())
+                            .with_context(|| format!("cannot parse {}", library_path.display()))?;
 
                         self.add_archive_members(library_path.as_path(), archive)
-                            .map_err(LinkerSetupError::Path)?;
+                            .with_context(|| format!("{}", library_path.display()))?;
                     } else if !self.link_libraries.contains_key(library_path.as_path()) {
                         let (library_path, library_buffer) =
                             self.arena.alloc((library_path, library_buffer));
-                        let archive =
-                            LinkArchive::parse(library_buffer.as_slice()).map_err(|e| {
-                                LinkerSetupError::Path(LinkerSetupPathError::nomember(
-                                    library_path.as_path(),
-                                    e,
-                                ))
-                            })?;
+                        let archive = LinkArchive::parse(library_buffer.as_slice())
+                            .with_context(|| format!("cannot parse {}", library_path.display()))?;
 
                         self.link_libraries.insert(library_path.as_path(), archive);
                     }
@@ -1207,16 +762,9 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
         &mut self,
         archive_path: &'a Path,
         archive: LinkArchive<'a>,
-    ) -> Result<(), LinkerSetupPathError> {
+    ) -> anyhow::Result<()> {
         for member in archive.coff_members() {
-            let (member_path, coff) = member.map_err(|e| match e {
-                ArchiveMemberError::ArchiveParse(e) => {
-                    LinkerSetupPathError::nomember(archive_path, e)
-                }
-                ArchiveMemberError::MemberParse(e) => {
-                    LinkerSetupPathError::new(archive_path, Some(e.path), e.kind)
-                }
-            })?;
+            let (member_path, coff) = member?;
 
             if let indexmap::map::Entry::Vacant(coff_entry) = self.coffs.entry(CoffPath {
                 file_path: archive_path,
@@ -1230,38 +778,29 @@ impl<'b, 'a, L: LibraryFind> LinkInputProcessor<'b, 'a, L> {
         Ok(())
     }
 
-    fn open_custom_api(&mut self, library: String) -> Result<ApiSymbols<'a>, ApiSetupError> {
+    fn open_custom_api(&mut self, library: String) -> anyhow::Result<ApiSymbols<'a>> {
         let custom_api = match std::fs::read(&library) {
             Ok(buffer) => (PathBuf::from(library), buffer),
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                match self.library_searcher.find_library(&library) {
-                    Ok(found) => {
-                        self.opened_library_names.insert(library);
-                        found
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+                let found = self
+                    .library_searcher
+                    .find_library(&library)
+                    .with_context(|| format!("unable to find --custom-api: {library}"))?;
+                self.opened_library_names.insert(library);
+                found
             }
             Err(e) => {
-                return Err(ApiSetupError::Io {
-                    path: PathBuf::from(library),
-                    error: e,
-                });
+                bail!("cannot open {library}: {e}");
             }
         };
 
         let (api_path, api_buffer) = self.arena.alloc(custom_api);
 
-        let api_archive =
-            LinkArchive::parse(api_buffer.as_slice()).map_err(|e| ApiSetupError::Parse {
-                path: api_path.clone(),
-                error: e,
-            })?;
+        let api_archive = LinkArchive::parse(api_buffer.as_slice())
+            .with_context(|| format!("cannot parse {}", api_path.display()))?;
 
-        ApiSymbols::new(api_path.as_path(), api_archive).map_err(|e| ApiSetupError::ApiSymbols {
-            path: api_path.clone(),
-            error: e,
-        })
+        ApiSymbols::new(api_path.as_path(), api_archive)
+            .with_context(|| format!("{}", api_path.display()))
     }
 
     fn ensure_entrypoint(&mut self, entrypoint: &str) {

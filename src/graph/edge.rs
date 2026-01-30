@@ -31,10 +31,6 @@ pub trait EdgeListEntry<'arena, Tr: EdgeListTraversal>: SealedTrait {
     fn next_node(&self) -> &Cell<Option<&'arena Self>>;
 }
 
-#[derive(Debug, Copy, Clone, thiserror::Error)]
-#[error("invalid COMDAT selection ({0})")]
-pub struct TryFromComdatSelectionError(u8);
-
 /// An adjacency list for a node's adjacent edges.
 pub struct EdgeList<'arena, E: EdgeListEntry<'arena, Tr>, Tr: EdgeListTraversal> {
     /// The head edge in the list.
@@ -357,6 +353,10 @@ impl DefinitionEdgeWeight {
         self.selection
     }
 }
+
+#[derive(Debug, Copy, Clone, thiserror::Error)]
+#[error("invalid COMDAT selection ({0})")]
+pub struct TryFromComdatSelectionError(u8);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
 #[num_enum(

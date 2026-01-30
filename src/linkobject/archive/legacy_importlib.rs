@@ -1,16 +1,12 @@
 use std::ffi::CStr;
 
+use anyhow::{Context, anyhow, bail};
 use object::{
     Architecture, Object, ObjectSection, ObjectSymbol, SymbolSection, coff::CoffFile,
     pe::IMAGE_SCN_CNT_CODE,
 };
 
 use crate::linkobject::import::{ImportMember, ImportName, ImportType};
-
-use super::error::{
-    LegacyImportHeadMemberParseError, LegacyImportSymbolMemberParseError,
-    LegacyImportTailMemberParseError,
-};
 
 /// A parsed legacy import library member for a symbol.
 pub struct LegacyImportSymbolMember<'a> {
@@ -25,11 +21,9 @@ pub struct LegacyImportSymbolMember<'a> {
 }
 
 impl<'a> LegacyImportSymbolMember<'a> {
-    pub fn parse(
-        coff: &CoffFile<'a>,
-    ) -> Result<LegacyImportSymbolMember<'a>, LegacyImportSymbolMemberParseError> {
+    pub fn parse(coff: &CoffFile<'a>) -> anyhow::Result<LegacyImportSymbolMember<'a>> {
         if coff.coff_section_table().len() > 7 {
-            return Err(LegacyImportSymbolMemberParseError::Invalid);
+            bail!("COFF is not a legacy import symbol member");
         }
 
         // Check for IAT (.idata$5) and Hint/Name table (.idata$6)
@@ -46,7 +40,7 @@ impl<'a> LegacyImportSymbolMember<'a> {
 
         // If there is no IAT and Hint/Name table, this is not an import COFF
         if !(have_iat_section && have_hintname_section) {
-            return Err(LegacyImportSymbolMemberParseError::Invalid);
+            bail!("COFF has no IAT or hint name section");
         }
 
         let mut thunk_entry = None;
@@ -77,7 +71,8 @@ impl<'a> LegacyImportSymbolMember<'a> {
             }
         }
 
-        let import_symbol = import_symbol.ok_or(LegacyImportSymbolMemberParseError::Iat)?;
+        let import_symbol =
+            import_symbol.context("import address table entry is missing or malformed")?;
 
         let mut import = ImportMember {
             architecture: coff.architecture(),
@@ -114,9 +109,7 @@ impl<'a> LegacyImportSymbolMember<'a> {
 
         Ok(LegacyImportSymbolMember {
             import,
-            head_symbol: head_symbol
-                .ok_or(LegacyImportSymbolMemberParseError::MissingHeadSymbol)?
-                .name()?,
+            head_symbol: head_symbol.context("'_head_*' symbol is missing")?.name()?,
         })
     }
 }
@@ -128,17 +121,9 @@ pub struct LegacyImportHeadMember<'a> {
 }
 
 impl<'a> LegacyImportHeadMember<'a> {
-    pub fn parse(
-        coff: &CoffFile<'a>,
-    ) -> Result<LegacyImportHeadMember<'a>, LegacyImportHeadMemberParseError> {
-        if coff.coff_section_table().len() > 6 {
-            return Err(LegacyImportHeadMemberParseError::Invalid);
-        }
-
-        // This is the first '.idata' section after the .text, .data and .bss
-        // sections. Use this as a smoke test to check if the COFF is valid.
-        if coff.section_by_name(".idata$2").is_none() {
-            return Err(LegacyImportHeadMemberParseError::Invalid);
+    pub fn parse(coff: &CoffFile<'a>) -> anyhow::Result<LegacyImportHeadMember<'a>> {
+        if coff.coff_section_table().len() > 6 && coff.section_by_name(".idata$2").is_none() {
+            bail!("COFF is not a legacy import library head");
         }
 
         for symbol in coff
@@ -153,7 +138,7 @@ impl<'a> LegacyImportHeadMember<'a> {
             }
         }
 
-        Err(LegacyImportHeadMemberParseError::MissingInameSymbol)
+        bail!("'*_iname' symbol is missing")
     }
 }
 
@@ -164,17 +149,9 @@ pub struct LegacyImportTailMember<'a> {
 }
 
 impl<'a> LegacyImportTailMember<'a> {
-    pub fn parse(
-        coff: &CoffFile<'a>,
-    ) -> Result<LegacyImportTailMember<'a>, LegacyImportTailMemberParseError> {
-        if coff.coff_section_table().len() > 6 {
-            return Err(LegacyImportTailMemberParseError::Invalid);
-        }
-
-        // This is the first '.idata' section after the .text, .data and .bss
-        // sections. Use it as a smoke test to check if the COFF is valid.
-        if coff.section_by_name(".idata$4").is_none() {
-            return Err(LegacyImportTailMemberParseError::Invalid);
+    pub fn parse(coff: &CoffFile<'a>) -> anyhow::Result<LegacyImportTailMember<'a>> {
+        if coff.coff_section_table().len() > 6 || coff.section_by_name(".idata$4").is_none() {
+            bail!("COFF is not a legacy import library tail");
         }
 
         for symbol in coff
@@ -182,28 +159,21 @@ impl<'a> LegacyImportTailMember<'a> {
             .filter(|symbol| symbol.is_global() && symbol.is_definition())
         {
             let symbol_name = symbol.name()?;
-            if symbol_name.ends_with("_iname") {
-                let iname_section = match symbol.section() {
-                    object::SymbolSection::Section(section_idx) => {
-                        coff.section_by_index(section_idx)?
-                    }
-                    _ => return Err(LegacyImportTailMemberParseError::InameSectionInvalid),
-                };
-
-                if iname_section.name()? != ".idata$7" {
-                    return Err(LegacyImportTailMemberParseError::InameSectionInvalid);
-                }
-
+            if symbol_name.ends_with("_iname")
+                && let SymbolSection::Section(section_idx) = symbol.section()
+                && let iname_section = coff.section_by_index(section_idx)?
+                && iname_section.name()? == ".idata$7"
+            {
                 let iname_data = iname_section.data()?;
                 let dll = CStr::from_bytes_until_nul(iname_data)
                     .map(|name| name.to_str())
                     .unwrap_or_else(|_| std::str::from_utf8(iname_data))
-                    .map_err(LegacyImportTailMemberParseError::DllName)?;
+                    .map_err(|_| anyhow!("cannot parse '*_iname' symbol DLL name"))?;
 
                 return Ok(LegacyImportTailMember { dll });
             }
         }
 
-        Err(LegacyImportTailMemberParseError::MissingInameSymbol)
+        bail!("'*_iname' symbol for tail member is missing")
     }
 }

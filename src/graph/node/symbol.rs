@@ -28,16 +28,6 @@ use crate::graph::edge::{
 
 use super::{SectionNode, SectionType};
 
-#[derive(Debug, Copy, Clone, thiserror::Error)]
-#[error("unknown storage class value ({0})")]
-pub struct TryFromStorageClassError(u8);
-
-#[derive(Debug, thiserror::Error)]
-pub enum TryFromSymbolError {
-    #[error("{0}")]
-    StorageClass(#[from] TryFromStorageClassError),
-}
-
 /// A symbol node in the graph.
 pub struct SymbolNode<'arena, 'data> {
     /// The list of outgoing definition edges for this symbol.
@@ -72,7 +62,6 @@ pub struct SymbolNode<'arena, 'data> {
 }
 
 impl<'arena, 'data> SymbolNode<'arena, 'data> {
-    #[inline]
     pub fn new(
         name: impl Into<BorrowedSymbolName<'arena>>,
         storage_class: SymbolNodeStorageClass,
@@ -96,7 +85,7 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     pub fn try_from_symbol<'file, C: CoffHeader>(
         name: impl Into<BorrowedSymbolName<'arena>>,
         coff_symbol: &'arena C::ImageSymbol,
-    ) -> Result<SymbolNode<'arena, 'data>, TryFromSymbolError> {
+    ) -> anyhow::Result<SymbolNode<'arena, 'data>> {
         Ok(Self {
             definition_edges: EdgeList::new(),
             import_edges: EdgeList::new(),
@@ -162,13 +151,11 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     }
 
     /// Returns the storage class of the symbol.
-    #[inline]
     pub fn storage_class(&self) -> SymbolNodeStorageClass {
         self.storage_class
     }
 
     /// Returns `true` if this is a section symbol.
-    #[inline]
     pub fn is_section_symbol(&self) -> bool {
         self.section
     }
@@ -326,13 +313,11 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     }
 
     /// Returns the type associated with this symbol.
-    #[inline]
     pub fn typ(&self) -> SymbolNodeType {
         self.typ.get()
     }
 
     /// Sets the type to the specified value for this symbol.
-    #[inline]
     pub fn set_type(&self, val: u16) {
         self.typ.set(SymbolNodeType::Value(val));
     }
@@ -340,7 +325,6 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     /// Sets the symbol table index for this symbol.
     ///
     /// This can only be set once.
-    #[inline]
     pub fn assign_table_index(&self, value: u32) -> Result<(), u32> {
         self.table_index.set(value)
     }
@@ -348,7 +332,6 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     /// Gets the assigned symbol table index for this symbol.
     ///
     /// Returns `None` if this symbol has not been assigned an index.
-    #[inline]
     pub fn table_index(&self) -> Option<u32> {
         self.table_index.get().copied()
     }
@@ -356,7 +339,6 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     /// Gets the name of the symbol for the output COFF.
     ///
     /// Returns `None` if the name of the symbol was never added to the COFF.
-    #[inline]
     pub fn output_name(&self) -> &OnceCell<object::write::coff::Name> {
         &self.output_name
     }
@@ -503,6 +485,10 @@ impl<T: Deref<Target = str>> std::fmt::Display for QuotedSymbolNameDemangler<'_,
         Ok(())
     }
 }
+
+#[derive(Debug, Copy, Clone, thiserror::Error)]
+#[error("unknown storage class value ({0})")]
+pub struct TryFromStorageClassError(u8);
 
 /// The storage class of a symbol.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]

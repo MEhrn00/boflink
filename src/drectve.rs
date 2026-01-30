@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use nom::{
     AsChar, Finish, Offset, Parser,
     branch::alt,
@@ -11,19 +12,6 @@ use nom::{
     sequence::{delimited, preceded, separated_pair, terminated},
 };
 use object::{Object, ObjectSection, coff::CoffFile, pe::IMAGE_SCN_LNK_INFO};
-
-#[derive(Debug, thiserror::Error)]
-pub enum DirectiveParserError {
-    #[error("could not parse .drectve section data as a string: {0}")]
-    Utf8(#[from] std::str::Utf8Error),
-
-    #[error("{0}")]
-    Object(#[from] object::Error),
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("could not parse .drectve section")]
-pub struct DirectiveParseError;
 
 pub struct DirectiveParser<'a> {
     offset: usize,
@@ -50,7 +38,7 @@ impl<'a> DirectiveParser<'a> {
         }
     }
 
-    pub fn parse_next(&mut self) -> Option<Result<(&'a str, &'a str), DirectiveParseError>> {
+    pub fn parse_next(&mut self) -> Option<anyhow::Result<(&'a str, &'a str)>> {
         if self.data.is_empty() {
             return None;
         }
@@ -66,7 +54,9 @@ impl<'a> DirectiveParser<'a> {
                 self.data = remaining;
                 Some(Ok((flag, value)))
             }
-            Err(_) => Some(Err(DirectiveParseError)),
+            Err(_) => Some(Err(anyhow!(
+                "cannot parse .drectve section data as a string"
+            ))),
         }
     }
 }
@@ -103,7 +93,7 @@ fn flag_value(input: &str) -> nom::IResult<&str, &str> {
 }
 
 impl<'a> Iterator for DirectiveParser<'a> {
-    type Item = Result<(&'a str, &'a str), DirectiveParseError>;
+    type Item = anyhow::Result<(&'a str, &'a str)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.parse_next()
@@ -115,7 +105,7 @@ impl<'a> Iterator for DirectiveParser<'a> {
 /// Returns `Ok(None)` if the COFF does not contain a .drectve section.
 pub fn parse_linker_directives<'a>(
     coff: &CoffFile<'a>,
-) -> Result<Option<DirectiveParser<'a>>, DirectiveParserError> {
+) -> anyhow::Result<Option<DirectiveParser<'a>>> {
     let drectve_section = match coff.section_by_name(".drectve") {
         Some(section) => {
             if section

@@ -298,7 +298,6 @@ pub struct SectionNode<'arena, 'data> {
 }
 
 impl<'arena, 'data> SectionNode<'arena, 'data> {
-    #[inline]
     pub fn new(
         name: impl Into<SectionName<'arena>>,
         characteristics: SectionNodeCharacteristics,
@@ -426,7 +425,6 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
     /// connection. This includes direct outgoing connections (i.e. associative
     /// section edge connections) and indirect, single-hop,
     /// relocation -> symbol -> definition -> section connections.
-    #[inline]
     pub fn reachable_dfs(&'arena self) -> ReachableDfs<'arena, 'data> {
         ReachableDfs {
             stack: VecDeque::from([self]),
@@ -437,37 +435,31 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
     /// Returns the COFF associated with this section.
     ///
     /// This is the COFF where the section node was sourced from.
-    #[inline]
     pub fn coff(&self) -> &'arena CoffNode<'data> {
         self.coff
     }
 
     /// Marks this section as being discarded.
-    #[inline]
     pub fn discard(&self) {
         self.discarded.set(true);
     }
 
     /// Sets the discarded value for the section.
-    #[inline]
     pub fn set_discarded(&self, val: bool) {
         self.discarded.set(val);
     }
 
     /// Keeps this section.
-    #[inline]
     pub fn keep(&self) {
         self.discarded.set(false);
     }
 
     /// Returns `true` if this section was discarded.
-    #[inline]
     pub fn is_discarded(&self) -> bool {
         self.discarded.get()
     }
 
     /// Returns `true` if this is a debug section.
-    #[inline]
     pub fn is_debug(&self) -> bool {
         self.name().group_name() == ".debug"
             && self
@@ -477,32 +469,27 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
     }
 
     /// Returns `true` if this is a COMDAT section.
-    #[inline]
     pub fn is_comdat(&self) -> bool {
         self.characteristics()
             .contains(SectionNodeCharacteristics::LnkComdat)
     }
 
     /// Returns the name of the section.
-    #[inline]
     pub fn name(&self) -> SectionName<'arena> {
         self.name
     }
 
     /// Returns the characteristics flags associated with this section.
-    #[inline]
     pub fn characteristics(&self) -> SectionNodeCharacteristics {
         self.characteristics
     }
 
     /// Returns the data associated with this section.
-    #[inline]
     pub fn data(&self) -> SectionNodeData<'arena> {
         self.data.get()
     }
 
     /// Sets the size value if this section contains uninitialized data.
-    #[inline]
     pub fn set_uninitialized_size(&self, val: u32) {
         if matches!(self.data(), SectionNodeData::Uninitialized(_)) {
             self.data.set(SectionNodeData::Uninitialized(val));
@@ -510,25 +497,21 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
     }
 
     /// Returns the checksum value for the section data.
-    #[inline]
     pub fn checksum(&self) -> u32 {
         self.checksum.get()
     }
 
     /// Replaces the checksum value for the section data.
-    #[inline]
     pub fn replace_checksum(&self, val: u32) {
         self.checksum.set(val);
     }
 
     /// Returns the assigned virtual address of the section.
-    #[inline]
     pub fn virtual_address(&self) -> u32 {
         self.virtual_address.get()
     }
 
     /// Assigns a virtual address for the section.
-    #[inline]
     pub fn assign_virtual_address(&self, val: u32) {
         self.virtual_address.set(val);
     }

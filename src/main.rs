@@ -1,11 +1,14 @@
-use std::{path::PathBuf, process::Command};
+use std::{
+    path::PathBuf,
+    process::{Command, ExitCode},
+};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use log::{error, info};
 
 use arguments::{ParsedCliArgs, ParsedCliInput};
 use libsearch::LibrarySearcher;
-use linker::{LinkError, LinkerBuilder};
+use linker::LinkerBuilder;
 
 use crate::arguments::CliOptionArgs;
 
@@ -22,41 +25,13 @@ mod logging;
 #[cfg(windows)]
 mod undname;
 
-#[derive(Debug)]
-struct EmptyError;
-
-impl std::fmt::Display for EmptyError {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Ok(())
-    }
-}
-
-impl std::error::Error for EmptyError {}
-
 /// cli entrypoint
-fn main() {
+fn main() -> ExitCode {
     if let Err(e) = try_main() {
-        if let Some(link_error) = e.downcast_ref::<LinkError>() {
-            match link_error {
-                LinkError::Setup(setup_errors) => {
-                    for setup_error in setup_errors.errors() {
-                        error!("{setup_error}");
-                    }
-                }
-                LinkError::Symbol(symbol_errors) => {
-                    for symbol_error in symbol_errors.errors() {
-                        error!("{symbol_error}");
-                    }
-                }
-                _ => {
-                    error!("{e}");
-                }
-            }
-        } else if !e.is::<EmptyError>() {
-            error!("{e}");
-        }
-
-        std::process::exit(1);
+        error!("{e:#}");
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -151,10 +126,10 @@ fn run_linker(args: &mut ParsedCliArgs) -> anyhow::Result<()> {
     match linker.link() {
         Ok(built) => {
             std::fs::write(&args.options.output, built)
-                .map_err(|e| anyhow!("could not write output file: {e}"))?;
+                .with_context(|| format!("cannot write output file"))?;
         }
         Err(e) => {
-            return Err(anyhow!(e));
+            return Err(e.into());
         }
     }
 
@@ -184,7 +159,7 @@ fn query_gcc(gcc: &str) -> anyhow::Result<Vec<PathBuf>> {
     let print_search_dirs = Command::new(gcc)
         .arg("--print-search-dirs")
         .output()
-        .map_err(|e| anyhow!("cannot run '{}': {e}", cmdline()))?;
+        .with_context(|| format!("cannot run '{}'", cmdline()))?;
 
     if !print_search_dirs.status.success() {
         if let Some(code) = print_search_dirs.status.code() {
@@ -195,7 +170,7 @@ fn query_gcc(gcc: &str) -> anyhow::Result<Vec<PathBuf>> {
     }
 
     let stdout = std::str::from_utf8(&print_search_dirs.stdout)
-        .map_err(|e| anyhow!("cannot not decode '{}' output: {e}", cmdline()))?;
+        .with_context(|| format!("cannot decode '{}' output", cmdline()))?;
 
     let libraries = stdout.lines().find_map(|line| {
         let line = line.strip_prefix("libraries: ")?;

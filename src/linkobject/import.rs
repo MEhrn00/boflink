@@ -1,18 +1,7 @@
 use std::str::Utf8Error;
 
+use anyhow::Context;
 use object::{Architecture, pe::IMAGE_FILE_MACHINE_UNKNOWN};
-
-#[derive(Debug, thiserror::Error)]
-pub enum TryFromImportFileError {
-    #[error("symbol field value could not be parsed: {0}")]
-    Symbol(Utf8Error),
-
-    #[error("dll field value could not be parsed: {0}")]
-    Dll(Utf8Error),
-
-    #[error("import field value could not be parsed: {0}")]
-    ImportName(Utf8Error),
-}
 
 /// An exported name from a DLL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,17 +79,18 @@ impl<'a> std::default::Default for ImportMember<'a> {
 }
 
 impl<'a> TryFrom<object::read::coff::ImportFile<'a>> for ImportMember<'a> {
-    type Error = TryFromImportFileError;
+    type Error = anyhow::Error;
 
     fn try_from(value: object::read::coff::ImportFile<'a>) -> Result<Self, Self::Error> {
         Ok(Self {
             architecture: value.architecture(),
-            symbol: std::str::from_utf8(value.symbol()).map_err(TryFromImportFileError::Symbol)?,
-            dll: std::str::from_utf8(value.dll()).map_err(TryFromImportFileError::Dll)?,
+            symbol: std::str::from_utf8(value.symbol())
+                .context("symbol field value could not be parsed")?,
+            dll: std::str::from_utf8(value.dll()).context("DLL field value could not be parsed")?,
             import: value
                 .import()
                 .try_into()
-                .map_err(TryFromImportFileError::ImportName)?,
+                .context("import field value could not be parsed")?,
             typ: value.import_type().into(),
         })
     }
