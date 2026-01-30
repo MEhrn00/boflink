@@ -10,6 +10,7 @@ use crate::{
 
 mod api;
 mod cli;
+mod coff;
 mod drectve;
 mod fsutils;
 mod graph;
