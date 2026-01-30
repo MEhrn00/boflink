@@ -11,7 +11,6 @@ pub struct CoffNode<'data> {
 }
 
 impl<'data> CoffNode<'data> {
-    #[inline]
     pub const fn new(file_path: &'data Path, member_path: Option<&'data Path>) -> CoffNode<'data> {
         Self {
             file_path,
@@ -21,7 +20,6 @@ impl<'data> CoffNode<'data> {
 
     /// Returns a [`CoffNodeShortName`] for displaying a shortened version of
     /// the COFF name.
-    #[inline]
     pub fn short_name(&self) -> CoffNodeShortName<'_, 'data> {
         CoffNodeShortName(self)
     }

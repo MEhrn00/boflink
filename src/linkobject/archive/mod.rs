@@ -103,8 +103,7 @@ impl<'a> LinkArchive<'a> {
     ) -> anyhow::Result<Option<(&'a Path, LinkArchiveMemberVariant<'a>)>> {
         let extracted = self.extract_archive_symbol(symbol)?;
         if let Some(member) = extracted {
-            let member_name = std::str::from_utf8(member.name())
-                .with_context(|| format!("archive member name"))?;
+            let member_name = std::str::from_utf8(member.name()).context("archive member name")?;
 
             Ok(Some(
                 self.parse_archive_member(&member, member_name)
@@ -128,25 +127,9 @@ impl<'a> LinkArchive<'a> {
         }
     }
 
-    /// Returns an iterator over the archive members.
-    pub fn members(&self) -> LinkArchiveMembersIterator<'_, 'a> {
-        LinkArchiveMembersIterator {
-            archive: self,
-            iter: self.archive_file.members(),
-        }
-    }
-
     /// Returns an iterator over the archive COFF members.
     pub fn coff_members(&self) -> LinkArchiveCoffMembersIterator<'_, 'a> {
         LinkArchiveCoffMembersIterator {
-            archive: self,
-            iter: self.archive_file.members(),
-        }
-    }
-
-    /// Returns an iterator over the archive import members.
-    pub fn import_members(&self) -> LinkArchiveImportMembersIterator<'_, 'a> {
-        LinkArchiveImportMembersIterator {
             archive: self,
             iter: self.archive_file.members(),
         }
@@ -277,32 +260,6 @@ impl<'a> LinkArchive<'a> {
     }
 }
 
-/// Iterator over the [`LinkArchive`] members.
-pub struct LinkArchiveMembersIterator<'b, 'a> {
-    archive: &'b LinkArchive<'a>,
-    iter: ArchiveMemberIterator<'a>,
-}
-
-impl<'b, 'a> Iterator for LinkArchiveMembersIterator<'b, 'a> {
-    type Item = anyhow::Result<(&'a Path, LinkArchiveMemberVariant<'a>)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let member = match self.iter.next()? {
-            Ok(member) => member,
-            Err(e) => return Some(Err(e.into())),
-        };
-
-        let member_name = match std::str::from_utf8(member.name())
-            .map_err(|_| anyhow!("archive member name is not a valid utf8 string"))
-        {
-            Ok(v) => v,
-            Err(e) => return Some(Err(e)),
-        };
-
-        Some(self.archive.parse_archive_member(&member, member_name))
-    }
-}
-
 /// Iterator over the [`LinkArchive`] COFF members.
 pub struct LinkArchiveCoffMembersIterator<'b, 'a> {
     archive: &'b LinkArchive<'a>,
@@ -332,42 +289,6 @@ impl<'b, 'a> Iterator for LinkArchiveCoffMembersIterator<'b, 'a> {
 
             if let LinkArchiveMemberVariant::Coff(coff) = member {
                 return Some(Ok((member_path, coff)));
-            }
-        }
-
-        None
-    }
-}
-
-/// Iterator over the [`LinkArchive`] import members.
-pub struct LinkArchiveImportMembersIterator<'b, 'a> {
-    archive: &'b LinkArchive<'a>,
-    iter: ArchiveMemberIterator<'a>,
-}
-
-impl<'b, 'a> Iterator for LinkArchiveImportMembersIterator<'b, 'a> {
-    type Item = anyhow::Result<(&'a Path, ImportMember<'a>)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        for member in self.iter.by_ref() {
-            let member = match member {
-                Ok(member) => member,
-                Err(e) => return Some(Err(e.into())),
-            };
-
-            let member_name = match std::str::from_utf8(member.name()) {
-                Ok(member_name) => member_name,
-                Err(e) => return Some(Err(e.into())),
-            };
-
-            let (member_path, member) =
-                match self.archive.parse_archive_member(&member, member_name) {
-                    Ok(parsed) => parsed,
-                    Err(e) => return Some(Err(anyhow!("archive member {}: {e}", member_name))),
-                };
-
-            if let LinkArchiveMemberVariant::Import(import_member) = member {
-                return Some(Ok((member_path, import_member)));
             }
         }
 

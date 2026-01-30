@@ -25,7 +25,7 @@ use crate::{
 };
 
 use super::{
-    BuiltLinkGraph, SpecLinkGraph,
+    BuiltLinkGraph,
     cache::LinkGraphCache,
     edge::{
         AssociativeSectionEdgeWeight, ComdatSelection, DefinitionEdgeWeight, Edge,
@@ -82,39 +82,6 @@ pub struct LinkGraph<'arena, 'data> {
 }
 
 impl<'arena, 'data> LinkGraph<'arena, 'data> {
-    /// Constructs a new empty [`LinkGraph`] using the specified `arena` for
-    /// holding graph components.
-    pub fn new(
-        arena: &'arena LinkGraphArena,
-        machine: LinkerTargetArch,
-    ) -> LinkGraph<'arena, 'data> {
-        Self {
-            machine,
-            section_nodes: Vec::new(),
-            common_section: OnceCell::new(),
-            library_nodes: IndexMap::new(),
-            coff_nodes: IndexSet::new(),
-            root_coff: &*ROOT_COFF,
-            api_node: None,
-            external_symbols: IndexMap::new(),
-            extraneous_symbols: LinkedList::new(),
-            node_count: 0,
-            cache: LinkGraphCache::new(),
-            arena,
-        }
-    }
-
-    /// Creates a new [`super::SpecLinkGraph`] for pre-calculating the memory
-    /// needed for building the graph.
-    pub fn spec() -> SpecLinkGraph {
-        Default::default()
-    }
-
-    /// Returns `true` if the graph is empty.
-    pub fn is_empty(&self) -> bool {
-        self.node_count == 0
-    }
-
     /// Adds a COFF to the graph.
     pub fn add_coff<C: CoffHeader>(
         &mut self,
@@ -478,13 +445,6 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
         }
 
         Ok(())
-    }
-
-    /// Returns an iterator over the defined external symbols
-    pub fn defined_externals(&self) -> impl Iterator<Item = &'data str> + use<'_, 'data, 'arena> {
-        self.external_symbols
-            .iter()
-            .filter_map(|(name, symbol)| symbol.is_defined().then_some(*name))
     }
 
     /// Returns an iterator over the names of the symbols which should be searched

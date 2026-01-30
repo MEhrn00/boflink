@@ -10,7 +10,6 @@ pub struct LibraryNode<'arena, 'data> {
 }
 
 impl<'arena, 'data> LibraryNode<'arena, 'data> {
-    #[inline]
     pub fn new(weight: LibraryNodeWeight<'data>) -> LibraryNode<'arena, 'data> {
         Self {
             import_edges: EdgeList::new(),
@@ -22,7 +21,6 @@ impl<'arena, 'data> LibraryNode<'arena, 'data> {
         &self.import_edges
     }
 
-    #[inline]
     pub fn name(&self) -> LibraryName<'data> {
         self.weight.name
     }
@@ -35,7 +33,6 @@ pub struct LibraryNodeWeight<'data> {
 }
 
 impl<'data> LibraryNodeWeight<'data> {
-    #[inline]
     pub fn new(name: impl Into<LibraryName<'data>>) -> LibraryNodeWeight<'data> {
         Self { name: name.into() }
     }

@@ -172,7 +172,6 @@ where
     type Item = <Self::IntoIter as Iterator>::Item;
     type IntoIter = EdgeListIter<'arena, Edge<'arena, S, T, W>, Tr>;
 
-    #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
@@ -186,7 +185,6 @@ where
     type Item = <Self::IntoIter as Iterator>::Item;
     type IntoIter = EdgeListIter<'arena, Edge<'arena, S, T, W>, Tr>;
 
-    #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
@@ -207,7 +205,6 @@ impl<'arena, 'data> EdgeListIter<'arena, RelocationEdge<'arena, 'data>, Incoming
 impl<'arena, E: EdgeListEntry<'arena, T>, T: EdgeListTraversal> Clone
     for EdgeListIter<'arena, E, T>
 {
-    #[inline]
     fn clone(&self) -> Self {
         Self(self.0)
     }
@@ -248,7 +245,6 @@ pub struct Edge<'arena, S, T, W> {
 }
 
 impl<'arena, S, T, W> Edge<'arena, S, T, W> {
-    #[inline]
     pub(super) fn new(
         source_node: &'arena S,
         target_node: &'arena T,
@@ -265,32 +261,27 @@ impl<'arena, S, T, W> Edge<'arena, S, T, W> {
 
     /// Replaces the source node joined to this edge. The edge must be removed
     /// from the source node before it can be replaced.
-    #[inline]
     pub(super) fn replace_source(&self, source_node: &'arena S) {
         debug_assert!(self.next_outgoing.get().is_none());
         self.source_node.replace(source_node);
     }
 
     /// Returns a reference to the source node joined to this edge.
-    #[inline]
     pub fn source(&self) -> &'arena S {
         self.source_node.get()
     }
 
     /// Returns a reference to the target node joined to this edge.
-    #[inline]
     pub fn target(&self) -> &'arena T {
         self.target_node.get()
     }
 
     /// Returns a reference to the edge weight
-    #[inline]
     pub fn weight(&self) -> &W {
         &self.weight
     }
 
     /// Returns a mutable reference to the edge weight
-    #[inline]
     pub fn weight_mut(&mut self) -> &mut W {
         &mut self.weight
     }
@@ -299,14 +290,12 @@ impl<'arena, S, T, W> Edge<'arena, S, T, W> {
 impl<S, T, W> SealedTrait for Edge<'_, S, T, W> {}
 
 impl<'arena, S, T, W> EdgeListEntry<'arena, OutgoingEdges> for Edge<'arena, S, T, W> {
-    #[inline]
     fn next_node(&self) -> &Cell<Option<&'arena Edge<'arena, S, T, W>>> {
         &self.next_outgoing
     }
 }
 
 impl<'arena, S, T, W> EdgeListEntry<'arena, IncomingEdges> for Edge<'arena, S, T, W> {
-    #[inline]
     fn next_node(&self) -> &Cell<Option<&'arena Edge<'arena, S, T, W>>> {
         &self.next_incoming
     }
@@ -322,7 +311,6 @@ pub struct DefinitionEdgeWeight {
 }
 
 impl DefinitionEdgeWeight {
-    #[inline]
     pub(super) fn new(
         virtual_address: u32,
         selection: Option<ComdatSelection>,
@@ -334,7 +322,6 @@ impl DefinitionEdgeWeight {
     }
 
     /// Returns the address of the symbol
-    #[inline]
     pub fn address(&self) -> u32 {
         self.virtual_address.get()
     }
@@ -342,13 +329,11 @@ impl DefinitionEdgeWeight {
     /// Sets the virtual address for the symbol.
     ///
     /// Used for assigning addresses to COMMON symbols.
-    #[inline]
     pub fn set_address(&self, val: u32) {
         self.virtual_address.set(val);
     }
 
     /// Returns the COMDAT selection for the symbol if this is a COMDAT symbol.
-    #[inline]
     pub fn selection(&self) -> Option<ComdatSelection> {
         self.selection
     }
@@ -388,7 +373,6 @@ pub struct RelocationEdgeWeight {
 }
 
 impl RelocationEdgeWeight {
-    #[inline]
     pub(super) fn new(virtual_address: u32, typ: u16) -> RelocationEdgeWeight {
         Self {
             virtual_address,
@@ -396,12 +380,10 @@ impl RelocationEdgeWeight {
         }
     }
 
-    #[inline]
     pub fn address(&self) -> u32 {
         self.virtual_address
     }
 
-    #[inline]
     pub fn typ(&self) -> u16 {
         self.typ
     }
@@ -426,7 +408,6 @@ pub struct ImportEdgeWeight<'data> {
 }
 
 impl<'data> ImportEdgeWeight<'data> {
-    #[inline]
     pub(super) fn new(
         import_name: impl Into<BorrowedSymbolName<'data>>,
     ) -> ImportEdgeWeight<'data> {
@@ -435,7 +416,6 @@ impl<'data> ImportEdgeWeight<'data> {
         }
     }
 
-    #[inline]
     pub fn import_name(&self) -> &BorrowedSymbolName<'data> {
         &self.import_name
     }

@@ -405,7 +405,7 @@ impl<L: LibraryFind> LinkImpl for ConfiguredLinker<L> {
 
                 let search_result = self
                     .library_searcher
-                    .find_library(&library_name)
+                    .find_library(library_name)
                     .with_context(|| format!("{coff_path}: unable to find library {library_name}"));
 
                 let (library_path, buffer) = match search_result {

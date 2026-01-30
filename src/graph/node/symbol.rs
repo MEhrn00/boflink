@@ -408,7 +408,7 @@ impl<T: Deref<Target = str>> SymbolName<T> {
     }
 
     /// Converts the symbol name into an [`OwnedSymbolName`].
-    pub fn into_owned(&self) -> OwnedSymbolName {
+    pub fn into_owned(self) -> OwnedSymbolName {
         SymbolName {
             i386: self.i386,
             name: self.name.to_owned(),

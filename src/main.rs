@@ -122,17 +122,8 @@ fn run_linker(args: &mut ParsedCliArgs) -> anyhow::Result<()> {
     }
 
     let mut linker = linker.build();
-
-    match linker.link() {
-        Ok(built) => {
-            std::fs::write(&args.options.output, built)
-                .with_context(|| format!("cannot write output file"))?;
-        }
-        Err(e) => {
-            return Err(e.into());
-        }
-    }
-
+    let built = linker.link()?;
+    std::fs::write(&args.options.output, built).context("cannot write output file")?;
     Ok(())
 }
 

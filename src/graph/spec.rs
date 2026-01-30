@@ -50,7 +50,6 @@ impl SpecLinkGraph {
     }
 
     /// Returns the calculated number of bytes needed to hold graph components.
-    #[inline]
     pub fn byte_capacity(&self) -> usize {
         self.alloc_size
     }
