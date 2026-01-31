@@ -1,15 +1,14 @@
 use std::{
     collections::{HashSet, VecDeque},
     ffi::{OsStr, OsString},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     process::Command,
 };
 
-use anyhow::{Context, bail};
-use object::pe::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386};
 use os_str_bytes::OsStrBytesExt;
 
-use crate::{fsutils, linker::LinkerTargetArch, logging::ColorOption};
+use crate::{ErrorContext, bail, coff::ImageFileMachine, fsutils, logging::ColorOption};
 
 const CARGO_PKG_NAME: &str = env!("CARGO_PKG_NAME");
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -35,6 +34,7 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
   --demangle                 Demangle symbols in log messages (default)
     --no-demangle
   --dump-link-graph=<file>   Write the link graph to <file>
+  --end-lib                  End a grouping of objects with archive semantics
   -e <symbol>, --entry=<symbol>
                              Name of the entrypoint symbol [default: go]
   --error-limit=<number>     Number of errors to print before exiting [default: 20]
@@ -67,7 +67,11 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
   --push-state               Save the current state of positional significant arguments
   --require-defined=<symbol>
                              Ensure <symbol> is defined in the final output
+  --start-lib                Start a grouping of objects with archive semantics
+  -S, --strip-debug          Strip .debug_* and .debug$[F,S,P,T] sections (default)
+    --no-strip-debug
   --sysroot=<dir>            Set the sysroot path
+  --threads=<number>         Number of threads. Defaults to available hardware threads
   -u <symbol>, --undefined=<symbol>
                              Start with an undefined reference to <symbol>
   --warn-unresolved-symbols  Report unresolved symbols as warnings
@@ -143,7 +147,7 @@ fn short_opt(name: char) -> impl for<'a> FnOnce(&'a OsStr) -> bool {
     }
 }
 
-fn short_val<P>(name: char) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<anyhow::Result<OsString>>
+fn short_val<P>(name: char) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<crate::Result<OsString>>
 where
     P: Iterator,
     <P as Iterator>::Item: Into<OsString>,
@@ -179,7 +183,7 @@ fn long_bool(name: &str) -> impl for<'a> FnOnce(&'a OsStr) -> Option<bool> {
     }
 }
 
-fn long_val<P>(name: &str) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<anyhow::Result<OsString>>
+fn long_val<P>(name: &str) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<crate::Result<OsString>>
 where
     P: Iterator,
     <P as Iterator>::Item: Into<OsString>,
@@ -206,9 +210,7 @@ fn legacy_opt(name: &str) -> impl for<'a> FnOnce(&'a OsStr) -> bool {
     move |arg| arg.strip_prefix("-").is_some_and(|arg| arg == name)
 }
 
-fn legacy_val<P>(
-    name: &str,
-) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<anyhow::Result<OsString>>
+fn legacy_val<P>(name: &str) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<crate::Result<OsString>>
 where
     P: Iterator,
     <P as Iterator>::Item: Into<OsString>,
@@ -234,7 +236,7 @@ where
 fn anyval<P>(
     s1: &str,
     s2: &str,
-) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<anyhow::Result<OsString>>
+) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<crate::Result<OsString>>
 where
     P: Iterator,
     <P as Iterator>::Item: Into<OsString>,
@@ -290,7 +292,7 @@ pub struct CliArgs {
 }
 
 impl CliArgs {
-    pub fn try_update_from<I, T>(&mut self, mut arg_iter: I) -> anyhow::Result<()>
+    pub fn try_update_from<I, T>(&mut self, mut arg_iter: I) -> crate::Result<()>
     where
         I: Iterator<Item = T>,
         T: Into<OsString>,
@@ -313,7 +315,7 @@ impl CliArgs {
         Ok(())
     }
 
-    fn try_update_inputs_from<I>(&mut self, arg: &OsStr, mut it: I) -> anyhow::Result<bool>
+    fn try_update_inputs_from<I>(&mut self, arg: &OsStr, mut it: I) -> crate::Result<bool>
     where
         I: Iterator,
         <I as Iterator>::Item: Into<OsString>,
@@ -373,7 +375,7 @@ impl CliArgs {
         Ok(true)
     }
 
-    fn try_update_from_mingw_arg<I>(&mut self, arg: &OsStr, mut it: I) -> anyhow::Result<bool>
+    fn try_update_from_mingw_arg<I>(&mut self, arg: &OsStr, mut it: I) -> crate::Result<bool>
     where
         I: Iterator,
         <I as Iterator>::Item: Into<OsString>,
@@ -461,7 +463,9 @@ pub struct CliOptions {
     pub print_gc_sections: bool,
     pub print_timing: bool,
     pub require_defined: Vec<String>,
+    pub strip_debug: bool,
     pub sysroot: Option<PathBuf>,
+    pub threads: Option<NonZeroUsize>,
     pub undefined: Vec<String>,
     pub warn_unresolved_symbols: bool,
     pub verbose: usize,
@@ -501,7 +505,9 @@ impl std::default::Default for CliOptions {
             print_gc_sections: false,
             print_timing: false,
             require_defined: Vec::new(),
+            strip_debug: true,
             sysroot: None,
+            threads: None,
             undefined: Vec::new(),
             warn_unresolved_symbols: true,
             verbose: 0,
@@ -513,7 +519,7 @@ impl std::default::Default for CliOptions {
 }
 
 impl CliOptions {
-    fn try_update_from<I>(&mut self, arg: &OsStr, mut it: I) -> anyhow::Result<bool>
+    fn try_update_from<I>(&mut self, arg: &OsStr, mut it: I) -> crate::Result<bool>
     where
         I: Iterator,
         <I as Iterator>::Item: Into<OsString>,
@@ -636,8 +642,22 @@ impl CliOptions {
         } else if let Some(v) = anyval("require-defined", "keep-symbol") {
             self.require_defined
                 .extend(v?.to_string_lossy().split(',').map(|s| s.to_owned()));
+        } else if short_opt('S') {
+            self.strip_debug = true;
+        } else if let Some(v) = long_bool("strip-debug") {
+            self.strip_debug = v;
         } else if let Some(v) = anyval("sysroot", "") {
             self.sysroot = Some(v?.into());
+        } else if let Some(v) = anyval("threads", "") {
+            let v = v?;
+            self.threads = Some(
+                v.to_str()
+                    .and_then(|s| s.parse().ok())
+                    .and_then(NonZeroUsize::new)
+                    .with_context(|| {
+                        format!("--threads value must be a non-zero positive number")
+                    })?,
+            );
         } else if let Some(v) = anyval("u", "undefined") {
             self.undefined
                 .extend(v?.to_string_lossy().split(',').map(String::from));
@@ -683,26 +703,10 @@ impl Emulation {
         }
     }
 
-    pub fn into_machine(self) -> u16 {
+    pub fn into_machine(self) -> ImageFileMachine {
         match self {
-            Self::I386Pep => IMAGE_FILE_MACHINE_AMD64,
-            Self::I386Pe => IMAGE_FILE_MACHINE_I386,
-        }
-    }
-
-    pub fn into_architecture(self) -> object::Architecture {
-        match self {
-            Self::I386Pep => object::Architecture::X86_64,
-            Self::I386Pe => object::Architecture::I386,
-        }
-    }
-}
-
-impl From<Emulation> for LinkerTargetArch {
-    fn from(value: Emulation) -> Self {
-        match value {
-            Emulation::I386Pep => Self::Amd64,
-            Emulation::I386Pe => Self::I386,
+            Self::I386Pep => ImageFileMachine::Amd64,
+            Self::I386Pe => ImageFileMachine::I386,
         }
     }
 }
@@ -781,7 +785,7 @@ pub fn expand_response_files(cmdline: impl Iterator<Item = OsString>) -> Vec<OsS
     expanded
 }
 
-fn query_gcc(gcc: impl AsRef<OsStr>) -> anyhow::Result<Vec<OsString>> {
+fn query_gcc(gcc: impl AsRef<OsStr>) -> crate::Result<Vec<OsString>> {
     let mut args = Vec::new();
 
     let output = Command::new(gcc.as_ref())
