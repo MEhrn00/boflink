@@ -1,26 +1,30 @@
-use std::process::ExitCode;
+use std::{path::PathBuf, process::ExitCode};
 
-use anyhow::Context;
+use indexmap::IndexSet;
 
 use crate::{
-    cli::{CliArgs, CliOptions},
-    linker::{Config, Linker},
+    cli::{CliArgs, CliOptions, Emulation},
+    coff::ImageFileMachine,
+    context::{LinkConfig, LinkContext},
+    syncpool::SyncBumpPool,
     timing::DurationFormatter,
 };
 
-mod api;
 mod cli;
 mod coff;
-mod drectve;
+mod context;
+mod error;
 mod fsutils;
-mod graph;
+mod inputs;
 mod linker;
-mod linkobject;
 mod logging;
+mod syncpool;
 mod timing;
 
 #[cfg(windows)]
 mod undname;
+
+pub use error::*;
 
 /// cli entrypoint
 fn main() -> ExitCode {
@@ -58,44 +62,59 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn try_main(mut args: CliArgs) -> anyhow::Result<()> {
+fn try_main(args: CliArgs) -> Result<()> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(
+            args.options
+                .threads
+                .or_else(|| std::thread::available_parallelism().ok())
+                .map(|num| num.get())
+                .unwrap_or(1),
+        )
+        .build()
+        .context("cannot create thread pool")?;
+
+    pool.install(|| run_boflink(args))
+}
+
+fn run_boflink(mut args: CliArgs) -> Result<()> {
     let timer = std::time::Instant::now();
 
-    let mut config = Config {
-        custom_api: args
-            .options
-            .custom_api
-            .take()
-            .map(|api| api.to_string_lossy().to_string()),
-        entrypoint: Some(std::mem::take(&mut args.options.entry)),
-        gc_sections: args.options.gc_sections,
-        gc_roots: std::mem::take(&mut args.options.require_defined)
-            .into_iter()
-            .collect(),
-        ignored_unresolved_symbols: std::mem::take(&mut args.options.ignore_unresolved_symbol)
-            .into_iter()
-            .collect(),
-        link_graph_output: args.options.dump_link_graph.take(),
-        merge_bss: args.options.merge_bss,
-        merge_grouped_sections: args.options.force_group_allocation,
-        print_gc_sections: args.options.print_gc_sections,
-        search_paths: std::mem::take(&mut args.options.library_path)
-            .into_iter()
-            .collect(),
-        target_architecture: args.options.machine.take().map(Into::into),
-        warn_unresolved: args.options.warn_unresolved_symbols,
-        inputs: std::mem::take(&mut args.inputs).into_iter().collect(),
-    };
+    let bump_pool = SyncBumpPool::new();
 
-    if cfg!(windows) {
-        if let Some(libenv) = std::env::var_os("LIB") {
-            config.search_paths.extend(std::env::split_paths(&libenv));
-        }
+    // Deduplicate library paths
+    let mut library_path: IndexSet<PathBuf> =
+        IndexSet::from_iter(std::mem::take(&mut args.options.library_path).into_iter());
+
+    // Add Windows `LIB` paths
+    if cfg!(windows)
+        && args.options.sysroot.is_none()
+        && let Some(libenv) = std::env::var_os("LIB")
+    {
+        library_path.extend(
+            std::env::split_paths(&libenv).map(|path| fsutils::lexically_normalize_path(path)),
+        );
     }
 
-    let mut linker = Linker::new(config);
-    let built = linker.link()?;
-    std::fs::write(&args.options.output, built).context("cannot write output file")?;
+    let ctx = LinkContext::new(
+        LinkConfig {
+            architecture: args
+                .options
+                .machine
+                .map(|m| match m {
+                    Emulation::I386Pep => ImageFileMachine::Amd64,
+                    Emulation::I386Pe => ImageFileMachine::I386,
+                })
+                .unwrap_or(ImageFileMachine::Unknown),
+            demangle: args.options.demangle,
+            do_gc: args.options.gc_sections,
+            print_gc_sections: args.options.print_gc_sections,
+            error_limit: args.options.error_limit,
+            strip_debug: args.options.strip_debug,
+            search_paths: library_path.into_iter().collect::<Vec<_>>(),
+        },
+        &bump_pool,
+    );
 
     if args.options.print_timing {
         let elapsed = std::time::Instant::now() - timer;
