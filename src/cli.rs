@@ -896,12 +896,3 @@ enum SplitState {
     Space,
     Quote(char),
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn shell_split() {
-        let cmdline = "/usr/libexec/gcc/x86_64-w64-mingw32/15.2.1/collect2 -fno-lto \"--sysroot=/usr/x86_64-w64-mingw32/sys-root\" -m i386pep -Bdynamic -L/usr/lib/gcc/x86_64-w64-mingw32/15.2.1 -L/usr/lib/gcc/x86_64-w64-mingw32/15.2.1/../../../../x86_64-w64-mingw32/lib/../lib -L/usr/x86_64-w64-mingw32/sys-root/mingw/lib/../lib -L/usr/lib/gcc/x86_64-w64-mingw32/15.2.1/../../../../x86_64-w64-mingw32/lib -L/usr/x86_64-w64-mingw32/sys-root/mingw/lib a.o \"-lstdc++\" -lmingw32 -lgcc_s -lgcc -lmingwex -lmsvcrt -lkernel32 -lpthread -ladvapi32 -lshell32 -luser32 -lkernel32 -lmingw32 -lgcc_s -lgcc -lmingwex -lmsvcrt -lkernel32";
-        println!("{:?}", super::shell_split(cmdline));
-    }
-}
