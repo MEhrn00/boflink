@@ -2,21 +2,21 @@ name: CI
 
 on:
   push:
-    paths:
-      - ".github/workflows/*.yaml"
-      - ".github/workflows/*.yml"
-      - "Cargo.toml"
-      - "crates/**"
-      - "src/**"
-      - "tests/**"
-      - "xtask/**"
+    paths-ignore:
+      - "docs/**"
+      - "examples/**"
+      - "CHANGELOG.md"
+      - "LICENSE"
+      - "README.md"
+    branches-ignore:
+      - "dev-noci/**"
   pull_request:
-    paths:
-      - "Cargo.toml"
-      - "crates/**"
-      - "src/**"
-      - "tests/**"
-      - "xtask/**"
+    paths-ignore:
+      - "docs/**"
+      - "examples/**"
+      - "CHANGELOG.md"
+      - "LICENSE"
+      - "README.md"
 
 env:
   CARGO_TERM_COLOR: always
