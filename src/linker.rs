@@ -18,7 +18,7 @@ use crate::{
     context::LinkContext,
     error,
     fsutils::{UniqueFileExt, UniqueFileId},
-    inputs::{FileKind, InputFile, ObjectFile},
+    inputs::{FileKind, InputFile, ObjectFile, ObjectFileId},
     syncpool::{BumpBox, BumpRef},
     timing::ScopedTimer,
 };
@@ -179,7 +179,6 @@ impl<'r, 'a> InputsReader<'r, 'a> {
                     data: &mapping,
                     path,
                     parent: None,
-                    offset: 0,
                 },
             )
         } else {
@@ -243,7 +242,7 @@ impl<'r, 'a> InputsReader<'r, 'a> {
         let obj = {
             let have_parent = file.parent.is_some();
             let obj = self.bump.alloc_boxed(ObjectFile::new(
-                self.objs_arena.len() as u32,
+                ObjectFileId::new(self.objs_arena.len()),
                 file,
                 input_ctx.in_lib || (have_parent && !input_ctx.in_whole_archive),
             ));
@@ -332,7 +331,6 @@ impl<'r, 'a> InputsReader<'r, 'a> {
                     data: member_data,
                     path: member_path,
                     parent: Some(file),
-                    offset,
                 },
             )?;
         }

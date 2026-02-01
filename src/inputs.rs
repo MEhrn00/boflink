@@ -21,7 +21,8 @@ use crate::{
     },
     context::LinkContext,
     error,
-    syncpool::{BumpBox, BumpRef},
+    symbols::SymbolId,
+    syncpool::BumpRef,
 };
 
 #[derive(Debug)]
@@ -29,7 +30,6 @@ pub struct InputFile<'a> {
     pub data: &'a [u8],
     pub path: &'a Path,
     pub parent: Option<&'a InputFile<'a>>,
-    pub offset: u64,
 }
 
 impl<'a> InputFile<'a> {
@@ -190,8 +190,6 @@ pub enum ShortFileSource<'a> {
 
 impl std::fmt::Display for ShortFileSource<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // TODO: Change this to [`OsStr::display()`] when MSRV is bumped to
-        // 1.87.0.
         match self {
             Self::Internal => write!(f, "<internal>"),
             Self::Disk(file) => write!(f, "{}", file.to_string_lossy()),
@@ -207,17 +205,43 @@ impl std::fmt::Display for ShortFileSource<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectFileId(u32);
+
+impl ObjectFileId {
+    pub const fn invalid() -> Self {
+        ObjectFileId(u32::MAX)
+    }
+
+    pub const fn is_invalid(&self) -> bool {
+        self.0 == ObjectFileId::invalid().0
+    }
+
+    pub fn new(idx: usize) -> Self {
+        let idx: u32 = u32::try_from(idx).unwrap_or_else(|_| panic!("object file ID overflowed"));
+        if idx == u32::MAX {
+            panic!("object file ID overflowed");
+        }
+
+        Self(idx)
+    }
+
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Debug)]
 pub struct ObjectFile<'a> {
     machine: ImageFileMachine,
-    id: u32,
+    id: ObjectFileId,
     pub file: InputFile<'a>,
     pub lazy: bool,
     pub variant: ObjectFileVariant<'a>,
 }
 
 impl<'a> ObjectFile<'a> {
-    pub fn new(id: u32, file: InputFile<'a>, lazy: bool) -> ObjectFile<'a> {
+    pub fn new(id: ObjectFileId, file: InputFile<'a>, lazy: bool) -> ObjectFile<'a> {
         let u16le = |offset| {
             file.data
                 .read_at::<U16Bytes<_>>(offset)
@@ -303,8 +327,8 @@ pub struct CoffObjectFile<'a> {
     coff_sections: &'a [pe::ImageSectionHeader],
     coff_symbols: &'a [pe::ImageSymbolBytes],
     coff_strtab: StringTable<'a>,
-    sections: Vec<Option<BumpBox<'a, CoffObjectSection<'a>>>>,
-    symbols: Vec<Option<BumpBox<'a, CoffObjectSymbol<'a>>>>,
+    sections: Vec<Option<Section<'a>>>,
+    symbols: Vec<Option<CoffObjectSymbol<'a>>>,
     has_idata: bool,
     directives: &'a [u8],
 }
@@ -455,7 +479,7 @@ impl<'a> CoffObjectFile<'a> {
                 &[]
             };
 
-            self.sections[i] = Some(bump.alloc_boxed(CoffObjectSection {
+            self.sections[i] = Some(Section {
                 name,
                 data: coff_section.coff_data(file.data).map_err(|_| {
                     error!("section at index {i}: section data size exceeds file bounds")
@@ -468,7 +492,7 @@ impl<'a> CoffObjectFile<'a> {
                 coff_relocs: relocs,
                 associative: None,
                 live: AtomicBool::new(!ctx.options.gc_sections),
-            }));
+            });
 
             if name == b".idata" || name.starts_with(b".idata$") {
                 self.has_idata = true;
@@ -521,7 +545,7 @@ impl<'a> CoffObjectFile<'a> {
 }
 
 #[derive(Debug)]
-struct CoffObjectSection<'a> {
+struct Section<'a> {
     name: &'a [u8],
     data: &'a [u8],
     checksum: u32,
@@ -533,7 +557,14 @@ struct CoffObjectSection<'a> {
 }
 
 #[derive(Debug)]
-struct CoffObjectSymbol<'a> {
+enum CoffObjectSymbol<'a> {
+    Local(LocalCoffObjectSymbol<'a>),
+    Global(SymbolId),
+    External(SymbolId),
+}
+
+#[derive(Debug)]
+struct LocalCoffObjectSymbol<'a> {
     name: &'a [u8],
     value: u32,
     section: SymbolSectionNumber,
