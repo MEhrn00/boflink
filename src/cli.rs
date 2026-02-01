@@ -64,6 +64,7 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
   --pop-state                Restore the previous state of positional significant arguments
   --print-gc-sections        Print sections discarded during '--gc-sections'
   --print-timing             Print timing information
+  --print-stats              Print input statistics
   --push-state               Save the current state of positional significant arguments
   --require-defined=<symbol>
                              Ensure <symbol> is defined in the final output
@@ -462,6 +463,7 @@ pub struct CliOptions {
     pub plugin_opt: Vec<OsString>,
     pub print_gc_sections: bool,
     pub print_timing: bool,
+    pub print_stats: bool,
     pub require_defined: Vec<String>,
     pub strip_debug: bool,
     pub sysroot: Option<PathBuf>,
@@ -504,6 +506,7 @@ impl std::default::Default for CliOptions {
             plugin_opt: Vec::new(),
             print_gc_sections: false,
             print_timing: false,
+            print_stats: false,
             require_defined: Vec::new(),
             strip_debug: true,
             sysroot: None,
@@ -639,6 +642,8 @@ impl CliOptions {
             self.print_gc_sections = true;
         } else if long_opt("print-timing") {
             self.print_timing = true;
+        } else if long_opt("print-stats") {
+            self.print_stats = true;
         } else if let Some(v) = anyval("require-defined", "keep-symbol") {
             self.require_defined
                 .extend(v?.to_string_lossy().split(',').map(|s| s.to_owned()));
