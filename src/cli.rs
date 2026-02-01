@@ -71,6 +71,8 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
     --no-strip-debug
   --sysroot=<dir>            Set the sysroot path
   --threads=<number>         Number of threads. Defaults to available hardware threads
+  -y <symbol>, --trace-symbol=<symbol>
+                             Trace mentions of <symbol>
   --ucrt32                   Alias for --mingw=i686-w64-mingw32ucrt-gcc
   --ucrt64                   Alias for --mingw=x86_64-w64-mingw32ucrt-gcc
   -u <symbol>, --undefined=<symbol>
@@ -468,6 +470,7 @@ pub struct CliOptions {
     pub strip_debug: bool,
     pub sysroot: Option<PathBuf>,
     pub threads: Option<NonZeroUsize>,
+    pub trace_symbol: Vec<String>,
     pub undefined: Vec<String>,
     pub warn_unresolved_symbols: bool,
     pub verbose: usize,
@@ -511,6 +514,7 @@ impl std::default::Default for CliOptions {
             strip_debug: true,
             sysroot: None,
             threads: None,
+            trace_symbol: Vec::new(),
             undefined: Vec::new(),
             warn_unresolved_symbols: true,
             verbose: 0,
@@ -663,6 +667,9 @@ impl CliOptions {
                         format!("--threads value must be a non-zero positive number")
                     })?,
             );
+        } else if let Some(v) = anyval("y", "trace-symbol") {
+            self.trace_symbol
+                .extend(v?.to_string_lossy().split(',').map(String::from));
         } else if let Some(v) = anyval("u", "undefined") {
             self.undefined
                 .extend(v?.to_string_lossy().split(',').map(String::from));
