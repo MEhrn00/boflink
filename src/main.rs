@@ -19,6 +19,7 @@ mod fsutils;
 mod inputs;
 mod linker;
 mod logging;
+mod symbols;
 mod syncpool;
 mod timing;
 

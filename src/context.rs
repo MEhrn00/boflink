@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use crate::{cli::CliOptions, coff::ImageFileMachine, syncpool::SyncBumpPool};
+use crate::{cli::CliOptions, coff::ImageFileMachine, symbols::SymbolMap, syncpool::SyncBumpPool};
 
 /// Structure which holds "global-state" used throughout the linker.
 ///
@@ -11,6 +11,7 @@ pub struct LinkContext<'a> {
     pub options: &'a CliOptions,
     pub errored: AtomicBool,
     pub bump_pool: &'a SyncBumpPool,
+    pub symbol_map: SymbolMap<'a>,
     pub stats: LinkStats,
 }
 
@@ -21,6 +22,7 @@ impl<'a> LinkContext<'a> {
             options,
             errored: false.into(),
             bump_pool,
+            symbol_map: SymbolMap::new(),
             stats: Default::default(),
         }
     }
@@ -84,9 +86,6 @@ impl LinkStats {
         );
     }
 }
-
-#[derive(Debug, Default)]
-pub struct ReadStats {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetArchitecture {
