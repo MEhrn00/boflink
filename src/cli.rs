@@ -25,9 +25,9 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
     const HELP_OPTIONS: &str = r#"
   --Bdynamic                 Link against shared libraries (default) [aliases: --dy, --call_shared]
   --Bstatic                  Do not link against shared libraries [aliases: --static, --dn, --non_shared]
+  --color[=<color>]          Deprecated alias for '--color-diagnostics'
   --color-diagnostics[=<color>]
                              Use colors in diagnostic messages [default: auto] [possible values: auto, always, never]
-  --color[=<color>]          Deprecated alias for '--color-diagnostics'
   --custom-api=<libname>     Custom API to use for the Beacon API [aliases: --api]
   --define-common            Define common symbols (default) [aliases: -d, --dc, --dp]
     --no-define-common
@@ -45,26 +45,24 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
   --ignore-unresolved-symbol=<symbol>
                              Unresolved <symbol> will not cause an error or warning
   --keep-symbol=<symbol>     Alias for --require-defined
-  -L <dir>, --library-path=<dir>
-                             Add <dir> to the list of library search paths
   -l <libname>, --library=<libname>
                              Search for the library <libname>
-  -m <emulation>             Set the target emulation [possible values: i386pep, i386pe]
+  -L <dir>, --library-path=<dir>
+                             Add <dir> to the list of library search paths
   --merge-bss                Initialize the .bss section and merge it with the .data section
     --no-merge-bss
   --merge-groups             Alias for --force-group-allocation
     --no-merge-groups
   --mingw=<executable>       Include MinGW GCC link libraries and search paths from <executable>
-  --mingw64                  Alias for --mingw=x86_64-w64-mingw32-gcc
   --mingw32                  Alias for --mingw=i686-w64-mingw32-gcc
-  --ucrt64                   Alias for --mingw=x86_64-w64-mingw32ucrt-gcc
-  --ucrt32                   Alias for --mingw=i686-w64-mingw32ucrt-gcc
+  --mingw64                  Alias for --mingw=x86_64-w64-mingw32-gcc
+  -m <emulation>             Set the target emulation [possible values: i386pep, i386pe]
   -o <file>, --output=<file>
                              Path to write the output file [default: a.bof]
   --pop-state                Restore the previous state of positional significant arguments
   --print-gc-sections        Print sections discarded during '--gc-sections'
-  --print-timing             Print timing information
   --print-stats              Print input statistics
+  --print-timing             Print timing information
   --push-state               Save the current state of positional significant arguments
   --require-defined=<symbol>
                              Ensure <symbol> is defined in the final output
@@ -73,6 +71,8 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
     --no-strip-debug
   --sysroot=<dir>            Set the sysroot path
   --threads=<number>         Number of threads. Defaults to available hardware threads
+  --ucrt32                   Alias for --mingw=i686-w64-mingw32ucrt-gcc
+  --ucrt64                   Alias for --mingw=x86_64-w64-mingw32ucrt-gcc
   -u <symbol>, --undefined=<symbol>
                              Start with an undefined reference to <symbol>
   --warn-unresolved-symbols  Report unresolved symbols as warnings
@@ -537,15 +537,6 @@ impl CliOptions {
             self.auto_image_base = true;
         } else if long_opt("disable-auto-image-base") {
             self.auto_image_base = false;
-        } else if long_opt("color-diagnostics") {
-            self.color_diagnostics = ColorOption::Auto;
-        } else if let Some(v) = arg.strip_prefix("--color-diagnostics=") {
-            self.color_diagnostics = ColorOption::parse(v, true).with_context(|| {
-                format!(
-                    "unknown '--color-diagnostics' value: {}",
-                    v.to_string_lossy()
-                )
-            })?;
         } else if let Some(v) = anyval("color", "") {
             let v = v?;
             self.color_diagnostics = ColorOption::parse(&v, true).with_context(|| {
@@ -555,6 +546,15 @@ impl CliOptions {
                 )
             })?;
             self.color_used = true;
+        } else if long_opt("color-diagnostics") {
+            self.color_diagnostics = ColorOption::Auto;
+        } else if let Some(v) = arg.strip_prefix("--color-diagnostics=") {
+            self.color_diagnostics = ColorOption::parse(v, true).with_context(|| {
+                format!(
+                    "unknown '--color-diagnostics' value: {}",
+                    v.to_string_lossy()
+                )
+            })?;
         } else if let Some(v) = anyval("custom-api", "api") {
             self.custom_api = Some(v?);
         } else if let Some(v) = long_bool("define-common") {
@@ -640,10 +640,10 @@ impl CliOptions {
             self.plugin_opt.push(v?);
         } else if long_opt("print-gc-sections") {
             self.print_gc_sections = true;
-        } else if long_opt("print-timing") {
-            self.print_timing = true;
         } else if long_opt("print-stats") {
             self.print_stats = true;
+        } else if long_opt("print-timing") {
+            self.print_timing = true;
         } else if let Some(v) = anyval("require-defined", "keep-symbol") {
             self.require_defined
                 .extend(v?.to_string_lossy().split(',').map(|s| s.to_owned()));
