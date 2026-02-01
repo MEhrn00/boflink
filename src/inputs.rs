@@ -25,13 +25,7 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct LinkInputs<'a> {
-    pub objs: Vec<BumpBox<'a, ObjectFile<'a>>>,
-}
-
-#[derive(Debug)]
 pub struct InputFile<'a> {
-    pub id: u32,
     pub data: &'a [u8],
     pub path: &'a Path,
     pub parent: Option<&'a InputFile<'a>>,
@@ -216,13 +210,14 @@ impl std::fmt::Display for ShortFileSource<'_> {
 #[derive(Debug)]
 pub struct ObjectFile<'a> {
     machine: ImageFileMachine,
-    pub file: &'a InputFile<'a>,
+    id: u32,
+    pub file: InputFile<'a>,
     pub lazy: bool,
     pub variant: ObjectFileVariant<'a>,
 }
 
 impl<'a> ObjectFile<'a> {
-    pub fn new(file: &'a InputFile<'a>, lazy: bool) -> ObjectFile<'a> {
+    pub fn new(id: u32, file: InputFile<'a>, lazy: bool) -> ObjectFile<'a> {
         let u16le = |offset| {
             file.data
                 .read_at::<U16Bytes<_>>(offset)
@@ -245,6 +240,7 @@ impl<'a> ObjectFile<'a> {
 
         if is_import_header() {
             Self {
+                id,
                 machine: read_machine(6).unwrap_or(sentinel),
                 file,
                 lazy,
@@ -252,6 +248,7 @@ impl<'a> ObjectFile<'a> {
             }
         } else {
             Self {
+                id,
                 machine,
                 file,
                 lazy,
@@ -264,6 +261,10 @@ impl<'a> ObjectFile<'a> {
         self.machine
     }
 
+    pub const fn is_coff_import(&self) -> bool {
+        matches!(self.variant, ObjectFileVariant::Import(_))
+    }
+
     pub fn parse(&mut self, ctx: &LinkContext<'a>) -> crate::Result<()> {
         debug_assert_ne!(
             self.machine,
@@ -272,7 +273,7 @@ impl<'a> ObjectFile<'a> {
         );
 
         self.variant
-            .parse(ctx, self.file, self.lazy)
+            .parse(ctx, &self.file, self.lazy)
             .with_context(|| format!("cannot parse {}", self.file.source()))
     }
 }
@@ -287,7 +288,7 @@ impl<'a> ObjectFileVariant<'a> {
     fn parse(
         &mut self,
         ctx: &LinkContext<'a>,
-        file: &'a InputFile<'a>,
+        file: &InputFile<'a>,
         lazy: bool,
     ) -> crate::Result<()> {
         match self {
@@ -312,7 +313,7 @@ impl<'a> CoffObjectFile<'a> {
     fn parse(
         &mut self,
         ctx: &LinkContext<'a>,
-        file: &'a InputFile<'a>,
+        file: &InputFile<'a>,
         _lazy: bool,
     ) -> crate::Result<()> {
         self.parse_coff_data(ctx, file)?;
@@ -325,7 +326,7 @@ impl<'a> CoffObjectFile<'a> {
     fn parse_coff_data(
         &mut self,
         ctx: &LinkContext<'a>,
-        file: &'a InputFile<'a>,
+        file: &InputFile<'a>,
     ) -> crate::Result<()> {
         let mut offset = 0;
         let header = pe::ImageFileHeader::parse(file.data, &mut offset)?;
@@ -339,7 +340,7 @@ impl<'a> CoffObjectFile<'a> {
         &mut self,
         ctx: &LinkContext<'a>,
         header: &pe::ImageFileHeader,
-        file: &'a InputFile<'a>,
+        file: &InputFile<'a>,
     ) -> crate::Result<()> {
         let scnhdrs_offset = std::mem::size_of_val(header) as u64
             + header.size_of_optional_header.get(object::LittleEndian) as u64;
@@ -358,7 +359,7 @@ impl<'a> CoffObjectFile<'a> {
         &mut self,
         ctx: &LinkContext<'a>,
         header: &pe::ImageFileHeader,
-        file: &'a InputFile<'a>,
+        file: &InputFile<'a>,
     ) -> crate::Result<()> {
         if header.number_of_symbols() > 0 && header.pointer_to_symbol_table() > 0 {
             self.coff_symbols = file
@@ -378,7 +379,7 @@ impl<'a> CoffObjectFile<'a> {
     fn parse_strtab(
         &mut self,
         header: &pe::ImageFileHeader,
-        file: &'a InputFile<'a>,
+        file: &InputFile<'a>,
     ) -> crate::Result<()> {
         let strtab_offset = {
             let offset = header.pointer_to_symbol_table() as u64;
@@ -405,7 +406,7 @@ impl<'a> CoffObjectFile<'a> {
         &mut self,
         ctx: &LinkContext<'a>,
         bump: &BumpRef<'a>,
-        file: &'a InputFile<'a>,
+        file: &InputFile<'a>,
     ) -> crate::Result<()> {
         self.sections.reserve_exact(self.coff_sections.len());
         self.sections.resize_with(self.coff_sections.len(), || None);
@@ -437,7 +438,7 @@ impl<'a> CoffObjectFile<'a> {
                     || name == b".debug$T"
             };
 
-            if ctx.config.strip_debug && (is_dwarf() || is_codeview()) {
+            if ctx.options.strip_debug && (is_dwarf() || is_codeview()) {
                 continue;
             }
 
@@ -466,7 +467,7 @@ impl<'a> CoffObjectFile<'a> {
                 ),
                 coff_relocs: relocs,
                 associative: None,
-                live: AtomicBool::new(!ctx.config.do_gc),
+                live: AtomicBool::new(!ctx.options.gc_sections),
             }));
 
             if name == b".idata" || name.starts_with(b".idata$") {
@@ -481,7 +482,7 @@ impl<'a> CoffObjectFile<'a> {
         &mut self,
         ctx: &LinkContext<'a>,
         bump: &BumpRef<'a>,
-        file: &'a InputFile<'a>,
+        file: &InputFile<'a>,
     ) -> crate::Result<()> {
         self.symbols.reserve_exact(self.coff_symbols.len());
         self.symbols.resize_with(self.coff_symbols.len(), || None);
@@ -553,7 +554,7 @@ impl<'a> ImportObjectFile<'a> {
     fn parse(
         &mut self,
         _ctx: &LinkContext<'a>,
-        file: &'a InputFile<'a>,
+        file: &InputFile<'a>,
         _lazy: bool,
     ) -> crate::Result<()> {
         let file = ImportFile::parse(file.data)?;
