@@ -1,9 +1,6 @@
-use std::{
-    path::PathBuf,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use crate::{coff::ImageFileMachine, syncpool::SyncBumpPool};
+use crate::{cli::CliOptions, coff::ImageFileMachine, syncpool::SyncBumpPool};
 
 /// Structure which holds "global-state" used throughout the linker.
 ///
@@ -11,7 +8,7 @@ use crate::{coff::ImageFileMachine, syncpool::SyncBumpPool};
 /// functions for different uses. The majority of the fields in this structure
 /// should either be thread-safe or only need to be mutable in limited contexts.
 pub struct LinkContext<'a> {
-    pub config: LinkConfig,
+    pub options: &'a CliOptions,
     pub errored: AtomicBool,
     pub bump_pool: &'a SyncBumpPool,
     pub stats: LinkStats,
@@ -19,9 +16,9 @@ pub struct LinkContext<'a> {
 
 impl<'a> LinkContext<'a> {
     /// Creates a new [`LinkContext`] with everything set to the defaults.
-    pub fn new(config: LinkConfig, bump_pool: &'a SyncBumpPool) -> Self {
+    pub fn new(options: &'a CliOptions, bump_pool: &'a SyncBumpPool) -> Self {
         Self {
-            config,
+            options,
             errored: false.into(),
             bump_pool,
             stats: Default::default(),
@@ -52,47 +49,6 @@ impl<'a> log::Log for &LinkContext<'a> {
 
     fn flush(&self) {
         log::logger().flush();
-    }
-}
-
-/// Global configuration options.
-///
-/// Most of these fields are set through command line options.
-#[derive(Debug)]
-pub struct LinkConfig {
-    /// Target architecture
-    pub architecture: ImageFileMachine,
-
-    /// Demangle symbols
-    pub demangle: bool,
-
-    /// Whether section garbage collection is being performed.
-    pub do_gc: bool,
-
-    /// Print sections discarded during GC sections
-    pub print_gc_sections: bool,
-
-    /// Error limit value
-    pub error_limit: usize,
-
-    /// Strip debug sections and symbols
-    pub strip_debug: bool,
-
-    /// Library search paths
-    pub search_paths: Vec<PathBuf>,
-}
-
-impl std::default::Default for LinkConfig {
-    fn default() -> Self {
-        Self {
-            architecture: ImageFileMachine::Unknown,
-            demangle: false,
-            do_gc: false,
-            print_gc_sections: false,
-            error_limit: 0,
-            strip_debug: false,
-            search_paths: Vec::new(),
-        }
     }
 }
 

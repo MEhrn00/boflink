@@ -1,13 +1,14 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{collections::HashSet, path::Path, process::ExitCode};
 
-use indexmap::IndexSet;
+use typed_arena::Arena;
 
 use crate::{
-    cli::{CliArgs, CliOptions, Emulation},
+    cli::{CliArgs, CliOptions},
     coff::ImageFileMachine,
-    context::{LinkConfig, LinkContext},
+    context::LinkContext,
+    linker::Linker,
     syncpool::SyncBumpPool,
-    timing::DurationFormatter,
+    timing::DurationExt,
 };
 
 mod cli;
@@ -79,49 +80,57 @@ fn try_main(args: CliArgs) -> Result<()> {
 
 fn run_boflink(mut args: CliArgs) -> Result<()> {
     let timer = std::time::Instant::now();
-
     let bump_pool = SyncBumpPool::new();
+    let mappings = Arena::new();
+    let inputs = std::mem::take(&mut args.inputs);
 
-    // Deduplicate library paths
-    let mut library_path: IndexSet<PathBuf> =
-        IndexSet::from_iter(std::mem::take(&mut args.options.library_path).into_iter());
+    setup_options(&mut args.options);
 
-    // Add Windows `LIB` paths
-    if cfg!(windows)
-        && args.options.sysroot.is_none()
-        && let Some(libenv) = std::env::var_os("LIB")
-    {
-        library_path.extend(
-            std::env::split_paths(&libenv).map(|path| fsutils::lexically_normalize_path(path)),
-        );
+    let ctx = LinkContext::new(&args.options, &bump_pool);
+
+    let linker = Linker::read_inputs(&ctx, &inputs, &mappings)?;
+
+    if linker.objs.is_empty() {
+        bail!("no input files");
     }
 
-    let ctx = LinkContext::new(
-        LinkConfig {
-            architecture: args
-                .options
-                .machine
-                .map(|m| match m {
-                    Emulation::I386Pep => ImageFileMachine::Amd64,
-                    Emulation::I386Pe => ImageFileMachine::I386,
-                })
-                .unwrap_or(ImageFileMachine::Unknown),
-            demangle: args.options.demangle,
-            do_gc: args.options.gc_sections,
-            print_gc_sections: args.options.print_gc_sections,
-            error_limit: args.options.error_limit,
-            strip_debug: args.options.strip_debug,
-            search_paths: library_path.into_iter().collect::<Vec<_>>(),
-        },
-        &bump_pool,
-    );
+    if linker.architecture == ImageFileMachine::Unknown {
+        bail!("unable to detect target architecture from input files");
+    }
 
     if args.options.print_timing {
         let elapsed = std::time::Instant::now() - timer;
-        log::info!("link time: {}", DurationFormatter::new(&elapsed));
+        log::info!("link time: {}", elapsed.display());
+    }
+
+    if args.options.print_stats {
+        ctx.stats.print_yaml();
     }
 
     Ok(())
+}
+
+fn setup_options(options: &mut CliOptions) {
+    if cfg!(windows)
+        && options.sysroot.is_none()
+        && let Some(libenv) = std::env::var_os("LIB")
+    {
+        options.library_path.extend(std::env::split_paths(&libenv));
+    }
+
+    dedup_library_paths(options);
+}
+
+fn dedup_library_paths(options: &mut CliOptions) {
+    let arena = Arena::<u8>::new();
+    let mut seen = HashSet::<&[u8]>::with_capacity(options.library_path.len());
+
+    let save =
+        |path: &Path| arena.alloc_extend(path.as_os_str().as_encoded_bytes().iter().copied());
+
+    options
+        .library_path
+        .retain(|path| seen.insert(save(path.as_path())));
 }
 
 fn setup_logging(options: &CliOptions) {
