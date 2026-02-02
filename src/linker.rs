@@ -266,7 +266,7 @@ impl<'r, 'a> InputsReader<'r, 'a> {
         if !(machine == ImageFileMachine::Amd64 || machine == ImageFileMachine::I386) {
             bail!(
                 "cannot parse {}: invalid or unsupported COFF architecture '{}'",
-                obj.file.source(),
+                obj.source(),
                 machine.fmt_hex()
             );
         }
@@ -276,7 +276,7 @@ impl<'r, 'a> InputsReader<'r, 'a> {
         } else if self.architecture != machine {
             bail!(
                 "cannot parse {}: expected machine value '{}' but found '{machine}'",
-                obj.file.source(),
+                obj.source(),
                 self.architecture,
             );
         }

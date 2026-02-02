@@ -5,24 +5,27 @@ use std::{
 };
 
 use bitflags::Flags;
+use num_enum::TryFromPrimitive;
 use object::{
-    ReadRef, U16Bytes, U32Bytes,
-    coff::{CoffHeader, ImageSymbol as _, ImportFile, ImportName, ImportType},
+    Object as _, ObjectSection, ObjectSymbol as _, ReadRef, SectionIndex, SymbolIndex, U16Bytes,
+    coff::{CoffFile, CoffHeader, ImageSymbol, ImportFile, ImportName, ImportType},
     pe::{
-        self, IMAGE_SCN_LNK_REMOVE, IMAGE_SYM_CLASS_FILE, IMAGE_SYM_DEBUG, ImageAuxSymbolSection,
+        self, IMAGE_COMDAT_SELECT_ASSOCIATIVE, IMAGE_SYM_ABSOLUTE, IMAGE_SYM_CLASS_FILE,
+        IMAGE_SYM_DEBUG, IMAGE_SYM_UNDEFINED, IMAGE_WEAK_EXTERN_SEARCH_ALIAS,
+        IMAGE_WEAK_EXTERN_SEARCH_LIBRARY, IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY,
+        ImageAuxSymbolSection,
     },
 };
 
 use crate::{
     ErrorContext,
     coff::{
-        ComdatSelection, ImageFileMachine, SectionFlags, SectionIndex, StorageClass, StringTable,
-        SymbolSectionNumber,
+        ComdatSelection, ImageFileMachine, SectionFlags, SectionTable, StorageClass,
+        SymbolSectionNumber, SymbolTable,
     },
     context::LinkContext,
     error,
-    symbols::SymbolId,
-    syncpool::BumpRef,
+    symbols::{Symbol, SymbolId},
 };
 
 #[derive(Debug)]
@@ -232,12 +235,18 @@ impl ObjectFileId {
 }
 
 #[derive(Debug)]
-pub struct ObjectFile<'a> {
+struct ObjectFileContext<'a> {
     machine: ImageFileMachine,
     id: ObjectFileId,
-    pub file: InputFile<'a>,
-    pub lazy: bool,
-    pub variant: ObjectFileVariant<'a>,
+    file: InputFile<'a>,
+    lazy: bool,
+    reachable: AtomicBool,
+}
+
+#[derive(Debug)]
+pub struct ObjectFile<'a> {
+    context: ObjectFileContext<'a>,
+    variant: ObjectFileVariant<'a>,
 }
 
 impl<'a> ObjectFile<'a> {
@@ -262,43 +271,46 @@ impl<'a> ObjectFile<'a> {
                 && read_version().is_some_and(|version| version == 0)
         };
 
-        if is_import_header() {
-            Self {
-                id,
-                machine: read_machine(6).unwrap_or(sentinel),
-                file,
-                lazy,
-                variant: ObjectFileVariant::Import(ImportObjectFile::default()),
-            }
+        let mut context = ObjectFileContext {
+            id,
+            machine,
+            file,
+            lazy,
+            reachable: AtomicBool::new(!lazy),
+        };
+
+        let variant = if is_import_header() {
+            context.machine = read_machine(6).unwrap_or(sentinel);
+            ObjectFileVariant::Import(ImportObjectFile::default())
         } else {
-            Self {
-                id,
-                machine,
-                file,
-                lazy,
-                variant: ObjectFileVariant::Coff(CoffObjectFile::default()),
-            }
-        }
+            ObjectFileVariant::Coff(CoffObjectFile::default())
+        };
+
+        Self { context, variant }
     }
 
     pub const fn machine(&self) -> ImageFileMachine {
-        self.machine
+        self.context.machine
     }
 
-    pub const fn is_coff_import(&self) -> bool {
-        matches!(self.variant, ObjectFileVariant::Import(_))
+    pub fn source(&self) -> InputFileSource<'a> {
+        self.context.file.source()
     }
 
     pub fn parse(&mut self, ctx: &LinkContext<'a>) -> crate::Result<()> {
         debug_assert_ne!(
-            self.machine,
+            self.machine(),
             ImageFileMachine(u16::MAX),
             "Machine value should have been detected during ObjectFile::new(). This sentinel value means the data from the passed input file is not large enough for parsing the COFF headers."
         );
 
         self.variant
-            .parse(ctx, &self.file, self.lazy)
-            .with_context(|| format!("cannot parse {}", self.file.source()))
+            .parse(ctx, &self.context)
+            .with_context(|| format!("cannot parse {}", self.context.file.source()))
+    }
+
+    pub fn resolve_symbols(&self, ctx: &LinkContext<'a>) {
+        self.variant.resolve_symbols(ctx, &self.context);
     }
 }
 
@@ -309,139 +321,65 @@ pub enum ObjectFileVariant<'a> {
 }
 
 impl<'a> ObjectFileVariant<'a> {
-    fn parse(
-        &mut self,
-        ctx: &LinkContext<'a>,
-        file: &InputFile<'a>,
-        lazy: bool,
-    ) -> crate::Result<()> {
+    fn parse(&mut self, ctx: &LinkContext<'a>, obj: &ObjectFileContext<'a>) -> crate::Result<()> {
         match self {
-            Self::Coff(coff) => coff.parse(ctx, file, lazy),
-            Self::Import(import) => import.parse(ctx, file, lazy),
+            Self::Coff(coff) => coff.parse(ctx, obj),
+            Self::Import(import) => import.parse(ctx, obj),
+        }
+    }
+
+    fn resolve_symbols(&self, ctx: &LinkContext<'a>, obj: &ObjectFileContext<'a>) {
+        match self {
+            Self::Coff(coff) => coff.resolve_symbols(ctx, obj),
+            Self::Import(import) => import.resolve_symbols(ctx, obj),
         }
     }
 }
 
 #[derive(Debug, Default)]
 pub struct CoffObjectFile<'a> {
-    coff_sections: &'a [pe::ImageSectionHeader],
-    coff_symbols: &'a [pe::ImageSymbolBytes],
-    coff_strtab: StringTable<'a>,
+    coff_sections: SectionTable<'a>,
+    coff_symbols: SymbolTable<'a>,
     sections: Vec<Option<Section<'a>>>,
-    symbols: Vec<Option<CoffObjectSymbol<'a>>>,
+    symbols: Vec<Option<(Symbol<'a>, SymbolId)>>,
     has_idata: bool,
     directives: &'a [u8],
 }
 
 impl<'a> CoffObjectFile<'a> {
-    fn parse(
-        &mut self,
-        ctx: &LinkContext<'a>,
-        file: &InputFile<'a>,
-        _lazy: bool,
-    ) -> crate::Result<()> {
-        self.parse_coff_data(ctx, file)?;
-        let bump = ctx.bump_pool.get();
-        self.initialize_sections(ctx, &bump, file)?;
-        self.initialize_symbols(ctx, &bump, file)?;
+    fn parse(&mut self, ctx: &LinkContext<'a>, obj: &ObjectFileContext<'a>) -> crate::Result<()> {
+        let coff = self.parse_coff_data(obj)?;
+        self.initialize_sections(ctx, &coff)?;
+        self.initialize_symbols(ctx, obj, &coff)?;
         Ok(())
     }
 
-    fn parse_coff_data(
-        &mut self,
-        ctx: &LinkContext<'a>,
-        file: &InputFile<'a>,
-    ) -> crate::Result<()> {
-        let mut offset = 0;
-        let header = pe::ImageFileHeader::parse(file.data, &mut offset)?;
-        self.parse_coff_sections(ctx, header, file)?;
-        self.parse_coff_symbols(ctx, header, file)?;
-        self.parse_strtab(header, file)?;
-        Ok(())
-    }
-
-    fn parse_coff_sections(
-        &mut self,
-        ctx: &LinkContext<'a>,
-        header: &pe::ImageFileHeader,
-        file: &InputFile<'a>,
-    ) -> crate::Result<()> {
-        let scnhdrs_offset = std::mem::size_of_val(header) as u64
-            + header.size_of_optional_header.get(object::LittleEndian) as u64;
-
-        self.coff_sections = file
-            .data
-            .read_slice_at(scnhdrs_offset, header.number_of_sections() as usize)
-            .map_err(|_| error!("COFF section headers size exceeds size of data"))?;
-        ctx.stats
-            .parsed_coff_sections
-            .fetch_add(self.coff_sections.len(), Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn parse_coff_symbols(
-        &mut self,
-        ctx: &LinkContext<'a>,
-        header: &pe::ImageFileHeader,
-        file: &InputFile<'a>,
-    ) -> crate::Result<()> {
-        if header.number_of_symbols() > 0 && header.pointer_to_symbol_table() > 0 {
-            self.coff_symbols = file
-                .data
-                .read_slice_at(
-                    header.pointer_to_symbol_table() as u64,
-                    header.number_of_symbols() as usize,
-                )
-                .map_err(|_| error!("COFF symbol table size exceeds size of data"))?;
-            ctx.stats
-                .parsed_coff_symbols
-                .fetch_add(self.coff_symbols.len(), Ordering::Relaxed);
-        }
-        Ok(())
-    }
-
-    fn parse_strtab(
-        &mut self,
-        header: &pe::ImageFileHeader,
-        file: &InputFile<'a>,
-    ) -> crate::Result<()> {
-        let strtab_offset = {
-            let offset = header.pointer_to_symbol_table() as u64;
-            let symtab_size = header.number_of_symbols() as u64
-                * std::mem::size_of::<pe::ImageSymbolBytes>() as u64;
-            offset + symtab_size
-        };
-
-        let length = file
-            .data
-            .read_at::<U32Bytes<_>>(strtab_offset)
-            .map(|v| v.get(object::LittleEndian))
-            .map_err(|_| error!("COFF string table offset exceeds size of data"))?;
-
-        let strtab_end = strtab_offset
-            .checked_add(length as u64)
-            .context("COFF string table length too large")?;
-
-        self.coff_strtab = StringTable::new(file.data, strtab_offset, strtab_end);
-        Ok(())
+    fn parse_coff_data(&mut self, obj: &ObjectFileContext<'a>) -> crate::Result<CoffFile<'a>> {
+        let coff: CoffFile = CoffFile::parse(obj.file.data)?;
+        self.coff_sections = coff.coff_section_table();
+        let header = coff.coff_header();
+        self.coff_symbols = header.symbols(obj.file.data).unwrap();
+        Ok(coff)
     }
 
     fn initialize_sections(
         &mut self,
         ctx: &LinkContext<'a>,
-        bump: &BumpRef<'a>,
-        file: &InputFile<'a>,
+        coff: &CoffFile<'a>,
     ) -> crate::Result<()> {
         self.sections.reserve_exact(self.coff_sections.len());
         self.sections.resize_with(self.coff_sections.len(), || None);
+        ctx.stats
+            .parsed_coff_sections
+            .fetch_add(self.coff_sections.len(), Ordering::Relaxed);
 
-        for (i, coff_section) in self.coff_sections.iter().enumerate() {
+        for (i, coff_section) in coff.sections().enumerate() {
             let name = coff_section
-                .name(self.coff_strtab)
+                .name_bytes()
                 .with_context(|| format!("section at index {i}"))?;
 
             if name == b".drectve" {
-                self.directives = coff_section.coff_data(file.data).map_err(|_| {
+                self.directives = coff_section.data().map_err(|_| {
                     error!("section at index {i}: section data size exceeds file bounds")
                 })?;
                 continue;
@@ -449,7 +387,13 @@ impl<'a> CoffObjectFile<'a> {
                 continue;
             }
 
-            if coff_section.characteristics.get(object::LittleEndian) & IMAGE_SCN_LNK_REMOVE != 0 {
+            let characteristics = SectionFlags::from_bits_retain(
+                coff_section
+                    .coff_section()
+                    .characteristics
+                    .get(object::LittleEndian),
+            );
+            if characteristics.contains(SectionFlags::LnkRemove) {
                 continue;
             }
 
@@ -466,29 +410,18 @@ impl<'a> CoffObjectFile<'a> {
                 continue;
             }
 
-            let relocs = if coff_section.number_of_relocations.get(object::LittleEndian) > 0
-                && coff_section
-                    .pointer_to_relocations
-                    .get(object::LittleEndian)
-                    > 0
-            {
-                coff_section.coff_relocations(file.data).map_err(|_| {
-                    error!("section at index {i}: relocation data exceeds file bounds")
-                })?
-            } else {
-                &[]
-            };
+            let relocs = coff_section
+                .coff_relocations()
+                .with_context(|| format!("section at index {i}"))?;
 
             self.sections[i] = Some(Section {
                 name,
-                data: coff_section.coff_data(file.data).map_err(|_| {
-                    error!("section at index {i}: section data size exceeds file bounds")
-                })?,
+                data: coff_section
+                    .data()
+                    .with_context(|| format!("section at index {i}"))?,
                 length: 0,
                 checksum: 0,
-                characteristics: SectionFlags::from_bits_truncate(
-                    coff_section.characteristics.get(object::LittleEndian),
-                ),
+                characteristics,
                 coff_relocs: relocs,
                 associative: None,
                 live: AtomicBool::new(!ctx.options.gc_sections),
@@ -505,43 +438,156 @@ impl<'a> CoffObjectFile<'a> {
     fn initialize_symbols(
         &mut self,
         ctx: &LinkContext<'a>,
-        bump: &BumpRef<'a>,
-        file: &InputFile<'a>,
+        obj: &ObjectFileContext<'a>,
+        coff: &CoffFile<'a>,
     ) -> crate::Result<()> {
         self.symbols.reserve_exact(self.coff_symbols.len());
         self.symbols.resize_with(self.coff_symbols.len(), || None);
+        ctx.stats
+            .parsed_coff_symbols
+            .fetch_add(self.coff_symbols.len(), Ordering::Relaxed);
 
         let mut comdat_aux: Vec<Option<&'a ImageAuxSymbolSection>> = Vec::new();
         comdat_aux.reserve_exact(self.coff_sections.len() + 1);
         comdat_aux.resize_with(self.coff_sections.len() + 1, || None);
 
-        let mut aux_num = 0u8;
-        for (i, coff_symbol_bytes) in self.coff_symbols.iter().enumerate() {
-            if aux_num > 0 {
-                aux_num -= 1;
+        let mut pending_weak = Vec::new();
+
+        let bump = ctx.bump_pool.get();
+
+        for symbol in coff.symbols() {
+            if symbol.coff_symbol().storage_class() == IMAGE_SYM_CLASS_FILE {
                 continue;
             }
 
-            let coff_symbol = coff_symbol_bytes
-                .0
-                .read_at::<pe::ImageSymbol>(0)
-                .map_err(|_| error!("symbol at index {i}: data is invalid"))?;
+            let name = symbol
+                .name_bytes()
+                .with_context(|| format!("symbol at index {}", symbol.index()))?;
 
-            aux_num = coff_symbol.number_of_aux_symbols();
+            let (obj_symbol, external_id) = {
+                self.symbols[symbol.index().0] = Some((
+                    Symbol {
+                        name,
+                        value: symbol.coff_symbol().value(),
+                        section: match symbol.coff_symbol().section_number() {
+                            IMAGE_SYM_UNDEFINED => SymbolSectionNumber::Undefined,
+                            IMAGE_SYM_DEBUG => SymbolSectionNumber::Debug,
+                            IMAGE_SYM_ABSOLUTE => SymbolSectionNumber::Absolute,
+                            o => SymbolSectionNumber(o as u16),
+                        },
+                        storage_class: StorageClass(symbol.coff_symbol().storage_class()),
+                        typ: symbol.coff_symbol().typ(),
+                        owner: obj.id,
+                        table_index: symbol.index(),
+                        selection: None,
+                    },
+                    SymbolId::invalid(),
+                ));
 
-            if coff_symbol.storage_class() == IMAGE_SYM_CLASS_FILE
-                && coff_symbol.section_number() == IMAGE_SYM_DEBUG
+                let Some(obj_symbol) = &mut self.symbols[symbol.index().0] else {
+                    unreachable!();
+                };
+                obj_symbol
+            };
+
+            if symbol.is_global() {
+                *external_id = ctx.symbol_map.get_or_default(&bump, name);
+            }
+
+            if symbol.is_weak() {
+                let weak_aux = self
+                    .coff_symbols
+                    .aux_weak_external(symbol.index())
+                    .with_context(|| format!("symbol at index {}", symbol.index()))?;
+
+                let default_idx = weak_aux.default_symbol();
+
+                let weak_default = coff
+                    .symbol_by_index(default_idx)
+                    .with_context(|| format!("symbol at index {}", default_idx,))?;
+
+                let weak_search = weak_aux.weak_search_type.get(object::LittleEndian);
+
+                if (weak_default.is_global() && weak_search == IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY)
+                    || (weak_default.is_local() && weak_search == IMAGE_WEAK_EXTERN_SEARCH_LIBRARY)
+                    || (symbol.is_global()
+                        && weak_default.is_local()
+                        && weak_search == IMAGE_WEAK_EXTERN_SEARCH_ALIAS)
+                {
+                    pending_weak.push((default_idx.0, weak_aux));
+                }
+            }
+
+            let Some(section_index) = symbol.section_index().map(|index| index.0 - 1) else {
+                continue;
+            };
+
+            let section = {
+                let section = self.sections.get_mut(section_index).ok_or_else(|| {
+                    error!(
+                        "symbol at index {}: section number is invalid {}",
+                        symbol.index(),
+                        section_index
+                    )
+                })?;
+
+                let Some(section) = section else {
+                    continue;
+                };
+                section
+            };
+
+            if symbol.coff_symbol().has_aux_section() {
+                let aux_section = self
+                    .coff_symbols
+                    .aux_section(symbol.index())
+                    .with_context(|| format!("symbol at index {}", symbol.index()))?;
+                section.length = aux_section.length.get(object::LittleEndian);
+                section.checksum = aux_section.check_sum.get(object::LittleEndian);
+
+                if aux_section.selection == IMAGE_COMDAT_SELECT_ASSOCIATIVE {
+                    section.associative = Some(SectionIndex(
+                        (aux_section.number.get(object::LittleEndian) - 1) as usize,
+                    ));
+                } else if section.characteristics.contains(SectionFlags::LnkComdat) {
+                    comdat_aux[section_index] = Some(aux_section);
+                }
+            } else if symbol.is_global()
+                && section.characteristics.contains(SectionFlags::LnkComdat)
             {
-                continue;
+                if let Some(aux_section) = comdat_aux[section_index].take() {
+                    obj_symbol.selection = Some(
+                        ComdatSelection::try_from_primitive(aux_section.selection)
+                            .with_context(|| format!("symbol at index {}", symbol.index()))?,
+                    );
+                }
             }
 
-            let name = coff_symbol
-                .name(self.coff_strtab)
-                .with_context(|| format!("symbol at index {i}"))?;
+            symbol.is_common();
+        }
+
+        for (default_idx, weak_aux) in pending_weak {
+            let Some((weak_default, external_id)) = &mut self.symbols[default_idx] else {
+                unreachable!();
+            };
+
+            let weak_search = weak_aux.weak_search_type.get(object::LittleEndian);
+            if weak_default.storage_class == StorageClass::External
+                && weak_search == IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY
+            {
+                *external_id = SymbolId::invalid();
+            } else if weak_default.storage_class != StorageClass::External
+                && (weak_search == IMAGE_WEAK_EXTERN_SEARCH_LIBRARY
+                    || weak_search == IMAGE_WEAK_EXTERN_SEARCH_ALIAS)
+            {
+                *external_id = ctx.symbol_map.get_or_default(&bump, weak_default.name);
+            }
         }
 
         Ok(())
     }
+
+    fn resolve_symbols(&self, ctx: &LinkContext<'a>, obj: &ObjectFileContext<'a>) {}
 }
 
 #[derive(Debug)]
@@ -557,44 +603,78 @@ struct Section<'a> {
 }
 
 #[derive(Debug)]
-enum CoffObjectSymbol<'a> {
-    Local(LocalCoffObjectSymbol<'a>),
-    Global(SymbolId),
-    External(SymbolId),
-}
-
-#[derive(Debug)]
-struct LocalCoffObjectSymbol<'a> {
-    name: &'a [u8],
-    value: u32,
-    section: SymbolSectionNumber,
-    typ: u16,
-    storage_class: StorageClass,
-    selection: Option<ComdatSelection>,
-}
-
-#[derive(Debug)]
 pub struct ImportObjectFile<'a> {
     kind: ImportType,
     dll: &'a [u8],
-    symbol: &'a [u8],
     name: ImportName<'a>,
+    public_symbol: &'a [u8],
+    symbols: [(Symbol<'a>, SymbolId); 2],
 }
 
 impl<'a> ImportObjectFile<'a> {
-    fn parse(
-        &mut self,
-        _ctx: &LinkContext<'a>,
-        file: &InputFile<'a>,
-        _lazy: bool,
-    ) -> crate::Result<()> {
-        let file = ImportFile::parse(file.data)?;
+    fn parse(&mut self, ctx: &LinkContext<'a>, obj: &ObjectFileContext<'a>) -> crate::Result<()> {
+        let file = ImportFile::parse(obj.file.data)?;
         self.kind = file.import_type();
         self.dll = file.dll();
-        self.symbol = file.symbol();
+        self.public_symbol = file.symbol();
         self.name = file.import();
+        self.initialize(ctx, obj);
         Ok(())
     }
+
+    fn initialize(&mut self, ctx: &LinkContext<'a>, obj: &ObjectFileContext<'a>) {
+        let name = if let ImportName::Name(name) = self.name {
+            name
+        } else {
+            log::warn!(
+                "{}: using public symbol name {} for resolving ordinal import",
+                obj.file.source(),
+                String::from_utf8_lossy(self.public_symbol),
+            );
+
+            let mut name = self.public_symbol;
+            if obj.machine == ImageFileMachine::I386 {
+                name = name.strip_prefix(&[b'_']).unwrap_or(name);
+            }
+            name
+        };
+
+        let bump = ctx.bump_pool.get();
+        self.symbols[0] = (
+            Symbol {
+                name,
+                value: 0,
+                section: if self.kind == ImportType::Code {
+                    SymbolSectionNumber(1)
+                } else {
+                    SymbolSectionNumber::Undefined
+                },
+                storage_class: StorageClass::External,
+                typ: 0,
+                owner: obj.id,
+                table_index: SymbolIndex(0),
+                selection: None,
+            },
+            ctx.symbol_map.get_or_default(&bump, name),
+        );
+
+        let name = bump.alloc_bytes(&[b"__imp_", name].concat());
+        self.symbols[1] = (
+            Symbol {
+                name,
+                value: 0,
+                section: SymbolSectionNumber::Undefined,
+                storage_class: StorageClass::External,
+                typ: 0,
+                owner: obj.id,
+                table_index: SymbolIndex(1),
+                selection: None,
+            },
+            ctx.symbol_map.get_or_default(&bump, name),
+        );
+    }
+
+    fn resolve_symbols(&self, ctx: &LinkContext<'a>, obj: &ObjectFileContext<'a>) {}
 }
 
 impl<'a> std::default::Default for ImportObjectFile<'a> {
@@ -602,8 +682,12 @@ impl<'a> std::default::Default for ImportObjectFile<'a> {
         Self {
             kind: ImportType::Const,
             dll: Default::default(),
-            symbol: Default::default(),
+            public_symbol: Default::default(),
             name: ImportName::Name(Default::default()),
+            symbols: [
+                (Symbol::default(), SymbolId::invalid()),
+                (Symbol::default(), SymbolId::invalid()),
+            ],
         }
     }
 }
