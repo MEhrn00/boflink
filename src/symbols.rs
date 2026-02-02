@@ -5,10 +5,11 @@ use std::{
 
 use crossbeam_utils::CachePadded;
 use indexmap::IndexMap;
+use object::SymbolIndex;
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
 
 use crate::{
-    coff::{ComdatSelection, StorageClass, SymbolIndex, SymbolSectionNumber},
+    coff::{ComdatSelection, SectionNumber, StorageClass},
     inputs::ObjectFileId,
     syncpool::{BumpBox, BumpRef},
 };
@@ -55,7 +56,7 @@ impl SymbolId {
 pub struct Symbol<'a> {
     pub name: &'a [u8],
     pub value: u32,
-    pub section: SymbolSectionNumber,
+    pub section: SectionNumber,
     pub storage_class: StorageClass,
     pub typ: u16,
     pub owner: ObjectFileId,
@@ -68,7 +69,7 @@ impl<'a> std::default::Default for Symbol<'a> {
         Self {
             name: &[],
             value: 0,
-            section: SymbolSectionNumber::Undefined,
+            section: SectionNumber::Undefined,
             typ: 0,
             storage_class: StorageClass::Null,
             owner: ObjectFileId::invalid(),
@@ -81,17 +82,17 @@ impl<'a> std::default::Default for Symbol<'a> {
 impl<'a> Symbol<'a> {
     pub fn is_undefined(&self) -> bool {
         self.storage_class == StorageClass::External
-            && self.section == SymbolSectionNumber::Undefined
+            && self.section == SectionNumber::Undefined
             && self.value == 0
     }
 
     pub fn is_defined(&self) -> bool {
-        self.section > SymbolSectionNumber::Undefined && self.section < SymbolSectionNumber::Debug
+        self.section > SectionNumber::Undefined && self.section < SectionNumber::Debug
     }
 
     pub fn is_common(&self) -> bool {
         self.storage_class == StorageClass::External
-            && self.section == SymbolSectionNumber::Undefined
+            && self.section == SectionNumber::Undefined
             && self.value != 0
     }
 
@@ -140,7 +141,7 @@ impl<'a> SymbolMap<'a> {
                 RwLock::new(arena.alloc_boxed(Symbol {
                     name,
                     value: 0,
-                    section: SymbolSectionNumber::Undefined,
+                    section: SectionNumber::Undefined,
                     typ: 0,
                     storage_class: StorageClass::Null,
                     owner: ObjectFileId::invalid(),

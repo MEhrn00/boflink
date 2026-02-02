@@ -4,11 +4,13 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use bitflags::Flags;
 use num_enum::TryFromPrimitive;
 use object::{
     Object as _, ObjectSection, ObjectSymbol as _, ReadRef, SectionIndex, SymbolIndex, U16Bytes,
-    coff::{CoffFile, CoffHeader, ImageSymbol, ImportFile, ImportName, ImportType},
+    coff::{
+        CoffFile, CoffHeader, ImageSymbol, ImportFile, ImportName, ImportType, SectionTable,
+        SymbolTable,
+    },
     pe::{
         self, IMAGE_COMDAT_SELECT_ASSOCIATIVE, IMAGE_SYM_ABSOLUTE, IMAGE_SYM_CLASS_FILE,
         IMAGE_SYM_DEBUG, IMAGE_SYM_UNDEFINED, IMAGE_WEAK_EXTERN_SEARCH_ALIAS,
@@ -18,11 +20,8 @@ use object::{
 };
 
 use crate::{
-    ErrorContext,
-    coff::{
-        ComdatSelection, ImageFileMachine, SectionFlags, SectionTable, StorageClass,
-        SymbolSectionNumber, SymbolTable,
-    },
+    ErrorContext, bail,
+    coff::{ComdatSelection, ImageFileMachine, SectionFlags, SectionNumber, StorageClass},
     context::LinkContext,
     error,
     symbols::{Symbol, SymbolId},
@@ -250,47 +249,35 @@ pub struct ObjectFile<'a> {
 }
 
 impl<'a> ObjectFile<'a> {
-    pub fn new(id: ObjectFileId, file: InputFile<'a>, lazy: bool) -> ObjectFile<'a> {
-        let u16le = |offset| {
-            file.data
-                .read_at::<U16Bytes<_>>(offset)
-                .map(|v| v.get(object::LittleEndian))
-                .ok()
-        };
-
-        let read_machine = |offset| Some(ImageFileMachine(u16le(offset)?));
-        let read_sig2 = || u16le(2);
-        let read_version = || u16le(4);
-
-        let sentinel = ImageFileMachine(u16::MAX);
-        let machine = read_machine(0).unwrap_or(sentinel);
-
-        let is_import_header = || {
-            machine == ImageFileMachine::Unknown
-                && read_sig2().is_some_and(|sig2| sig2 == 0xffff)
-                && read_version().is_some_and(|version| version == 0)
-        };
-
-        let mut context = ObjectFileContext {
-            id,
-            machine,
-            file,
-            lazy,
-            reachable: AtomicBool::new(!lazy),
-        };
-
-        let variant = if is_import_header() {
-            context.machine = read_machine(6).unwrap_or(sentinel);
-            ObjectFileVariant::Import(ImportObjectFile::default())
+    pub fn identify_machine(data: &'a [u8]) -> crate::Result<ImageFileMachine> {
+        let machine = CoffObjectFile::identify_machine(data)?;
+        if machine == ImageFileMachine::Unknown {
+            ImportObjectFile::identify_machine(data)
         } else {
-            ObjectFileVariant::Coff(CoffObjectFile::default())
-        };
-
-        Self { context, variant }
+            Ok(machine)
+        }
     }
 
-    pub const fn machine(&self) -> ImageFileMachine {
-        self.context.machine
+    pub fn new(
+        id: ObjectFileId,
+        file: InputFile<'a>,
+        lazy: bool,
+        variant: ObjectFileVariant<'a>,
+    ) -> ObjectFile<'a> {
+        Self {
+            context: ObjectFileContext {
+                machine: ImageFileMachine::Unknown,
+                id,
+                file,
+                lazy,
+                reachable: AtomicBool::new(false),
+            },
+            variant,
+        }
+    }
+
+    pub fn file(&self) -> &InputFile<'a> {
+        &self.context.file
     }
 
     pub fn source(&self) -> InputFileSource<'a> {
@@ -298,12 +285,12 @@ impl<'a> ObjectFile<'a> {
     }
 
     pub fn parse(&mut self, ctx: &LinkContext<'a>) -> crate::Result<()> {
-        debug_assert_ne!(
-            self.machine(),
-            ImageFileMachine(u16::MAX),
-            "Machine value should have been detected during ObjectFile::new(). This sentinel value means the data from the passed input file is not large enough for parsing the COFF headers."
-        );
-
+        if self.context.machine == ImageFileMachine::Unknown {
+            self.context.machine = self
+                .variant
+                .identify_machine(self.context.file.data)
+                .with_context(|| format!("cannot parse {}", self.context.file.source()))?;
+        }
         self.variant
             .parse(ctx, &self.context)
             .with_context(|| format!("cannot parse {}", self.context.file.source()))
@@ -321,6 +308,13 @@ pub enum ObjectFileVariant<'a> {
 }
 
 impl<'a> ObjectFileVariant<'a> {
+    fn identify_machine(&self, data: &'a [u8]) -> crate::Result<ImageFileMachine> {
+        match self {
+            Self::Coff(_) => CoffObjectFile::identify_machine(data),
+            Self::Import(_) => ImportObjectFile::identify_machine(data),
+        }
+    }
+
     fn parse(&mut self, ctx: &LinkContext<'a>, obj: &ObjectFileContext<'a>) -> crate::Result<()> {
         match self {
             Self::Coff(coff) => coff.parse(ctx, obj),
@@ -347,6 +341,13 @@ pub struct CoffObjectFile<'a> {
 }
 
 impl<'a> CoffObjectFile<'a> {
+    pub fn identify_machine(data: &'a [u8]) -> crate::Result<ImageFileMachine> {
+        data.read_at::<U16Bytes<_>>(0)
+            .map(|v| v.get(object::LittleEndian))
+            .map_err(|_| error!("data too short to be a COFF"))
+            .and_then(|machine| ImageFileMachine::try_from(machine).map_err(crate::Error::from))
+    }
+
     fn parse(&mut self, ctx: &LinkContext<'a>, obj: &ObjectFileContext<'a>) -> crate::Result<()> {
         let coff = self.parse_coff_data(obj)?;
         self.initialize_sections(ctx, &coff)?;
@@ -470,12 +471,15 @@ impl<'a> CoffObjectFile<'a> {
                         name,
                         value: symbol.coff_symbol().value(),
                         section: match symbol.coff_symbol().section_number() {
-                            IMAGE_SYM_UNDEFINED => SymbolSectionNumber::Undefined,
-                            IMAGE_SYM_DEBUG => SymbolSectionNumber::Debug,
-                            IMAGE_SYM_ABSOLUTE => SymbolSectionNumber::Absolute,
-                            o => SymbolSectionNumber(o as u16),
+                            IMAGE_SYM_UNDEFINED => SectionNumber::Undefined,
+                            IMAGE_SYM_DEBUG => SectionNumber::Debug,
+                            IMAGE_SYM_ABSOLUTE => SectionNumber::Absolute,
+                            o => SectionNumber::from(o as u16),
                         },
-                        storage_class: StorageClass(symbol.coff_symbol().storage_class()),
+                        storage_class: StorageClass::try_from_primitive(
+                            symbol.coff_symbol().storage_class(),
+                        )
+                        .with_context(|| format!("symbol at index {}", symbol.index()))?,
                         typ: symbol.coff_symbol().typ(),
                         owner: obj.id,
                         table_index: symbol.index(),
@@ -504,7 +508,7 @@ impl<'a> CoffObjectFile<'a> {
 
                 let weak_default = coff
                     .symbol_by_index(default_idx)
-                    .with_context(|| format!("symbol at index {}", default_idx,))?;
+                    .with_context(|| format!("symbol at index {}", default_idx))?;
 
                 let weak_search = weak_aux.weak_search_type.get(object::LittleEndian);
 
@@ -557,7 +561,7 @@ impl<'a> CoffObjectFile<'a> {
             {
                 if let Some(aux_section) = comdat_aux[section_index].take() {
                     obj_symbol.selection = Some(
-                        ComdatSelection::try_from_primitive(aux_section.selection)
+                        ComdatSelection::try_from(aux_section.selection)
                             .with_context(|| format!("symbol at index {}", symbol.index()))?,
                     );
                 }
@@ -612,6 +616,28 @@ pub struct ImportObjectFile<'a> {
 }
 
 impl<'a> ImportObjectFile<'a> {
+    pub fn identify_machine(data: &'a [u8]) -> crate::Result<ImageFileMachine> {
+        let read_u16le = |offset| {
+            data.read_at::<U16Bytes<_>>(offset)
+                .map(|v| v.get(object::LittleEndian))
+                .ok()
+        };
+
+        let read_sig2 = || read_u16le(2);
+        let read_version = || read_u16le(4);
+
+        let coff_machine = CoffObjectFile::identify_machine(data)?;
+        if coff_machine == ImageFileMachine::Unknown
+            && read_sig2().is_some_and(|sig2| sig2 == 0xffff)
+            && read_version().is_some_and(|version| version == 0)
+            && let Some(machine) = read_u16le(6)
+        {
+            return Ok(ImageFileMachine::try_from(machine)?);
+        }
+
+        bail!("data is not for an import file")
+    }
+
     fn parse(&mut self, ctx: &LinkContext<'a>, obj: &ObjectFileContext<'a>) -> crate::Result<()> {
         let file = ImportFile::parse(obj.file.data)?;
         self.kind = file.import_type();
@@ -645,9 +671,9 @@ impl<'a> ImportObjectFile<'a> {
                 name,
                 value: 0,
                 section: if self.kind == ImportType::Code {
-                    SymbolSectionNumber(1)
+                    SectionNumber::from(1)
                 } else {
-                    SymbolSectionNumber::Undefined
+                    SectionNumber::Undefined
                 },
                 storage_class: StorageClass::External,
                 typ: 0,
@@ -663,7 +689,7 @@ impl<'a> ImportObjectFile<'a> {
             Symbol {
                 name,
                 value: 0,
-                section: SymbolSectionNumber::Undefined,
+                section: SectionNumber::Undefined,
                 storage_class: StorageClass::External,
                 typ: 0,
                 owner: obj.id,

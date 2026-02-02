@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use crate::{cli::CliOptions, coff::ImageFileMachine, symbols::SymbolMap, syncpool::SyncBumpPool};
+use crate::{cli::CliOptions, symbols::SymbolMap, syncpool::SyncBumpPool};
 
 /// Structure which holds "global-state" used throughout the linker.
 ///
@@ -91,41 +91,3 @@ impl LinkStats {
         );
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TargetArchitecture {
-    Amd64,
-    I386,
-}
-
-impl TargetArchitecture {
-    pub const fn into_machine(self) -> ImageFileMachine {
-        match self {
-            Self::Amd64 => ImageFileMachine::Amd64,
-            Self::I386 => ImageFileMachine::I386,
-        }
-    }
-}
-
-impl TryFrom<ImageFileMachine> for TargetArchitecture {
-    type Error = TryFromMachineError;
-
-    fn try_from(value: ImageFileMachine) -> Result<Self, Self::Error> {
-        Ok(match value {
-            ImageFileMachine::Amd64 => Self::Amd64,
-            ImageFileMachine::I386 => Self::I386,
-            o => return Err(TryFromMachineError(o)),
-        })
-    }
-}
-
-#[derive(Debug)]
-pub struct TryFromMachineError(ImageFileMachine);
-
-impl std::fmt::Display for TryFromMachineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown or unsupported COFF machine value '{}'", self.0)
-    }
-}
-
-impl std::error::Error for TryFromMachineError {}

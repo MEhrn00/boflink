@@ -18,12 +18,12 @@ use crate::{
     context::LinkContext,
     error,
     fsutils::{UniqueFileExt, UniqueFileId},
-    inputs::{FileKind, InputFile, ObjectFile, ObjectFileId},
+    inputs::{FileKind, InputFile, ObjectFile, ObjectFileId, ObjectFileVariant},
     syncpool::{BumpBox, BumpRef},
     timing::ScopedTimer,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Linker<'a> {
     pub architecture: ImageFileMachine,
     pub objs: Vec<BumpBox<'a, ObjectFile<'a>>>,
@@ -62,15 +62,6 @@ impl<'a> Linker<'a> {
             architecture: reader.architecture,
             objs: objs.into_vec(),
         })
-    }
-}
-
-impl<'a> std::default::Default for Linker<'a> {
-    fn default() -> Self {
-        Self {
-            architecture: ImageFileMachine::Unknown,
-            objs: Vec::new(),
-        }
     }
 }
 
@@ -201,8 +192,23 @@ impl<'r, 'a> InputsReader<'r, 'a> {
             .with_context(|| format!("cannot parse {}", file.source()))?;
 
         match kind {
-            FileKind::Coff | FileKind::Import => {
-                self.parse_object_file(ctx, scope, input_ctx, file)?;
+            FileKind::Coff => {
+                self.parse_object_file(
+                    ctx,
+                    scope,
+                    input_ctx,
+                    file,
+                    ObjectFileVariant::Coff(Default::default()),
+                )?;
+            }
+            FileKind::Import => {
+                self.parse_object_file(
+                    ctx,
+                    scope,
+                    input_ctx,
+                    file,
+                    ObjectFileVariant::Import(Default::default()),
+                )?;
             }
             FileKind::Archive => {
                 if file.parent.is_some() {
@@ -226,6 +232,7 @@ impl<'r, 'a> InputsReader<'r, 'a> {
         scope: &Scope<'scope>,
         input_ctx: InputArgContext,
         file: InputFile<'a>,
+        variant: ObjectFileVariant<'a>,
     ) -> crate::Result<()>
     where
         'r: 'scope,
@@ -245,6 +252,7 @@ impl<'r, 'a> InputsReader<'r, 'a> {
                 ObjectFileId::new(self.objs_arena.len()),
                 file,
                 input_ctx.in_lib || (have_parent && !input_ctx.in_whole_archive),
+                variant,
             ));
             self.objs_arena.alloc(obj)
         };
@@ -262,12 +270,11 @@ impl<'r, 'a> InputsReader<'r, 'a> {
     }
 
     fn validate_object_architecture(&mut self, obj: &ObjectFile) -> crate::Result<()> {
-        let machine = obj.machine();
+        let machine = ObjectFile::identify_machine(obj.file().data)?;
         if !(machine == ImageFileMachine::Amd64 || machine == ImageFileMachine::I386) {
             bail!(
-                "cannot parse {}: invalid or unsupported COFF architecture '{}'",
+                "cannot parse {}: unsupported COFF architecture '{machine:#}'",
                 obj.source(),
-                machine.fmt_hex()
             );
         }
 
