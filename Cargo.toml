@@ -23,7 +23,8 @@ bitflags = "2.9.0"
 bumpalo = { version = "3.17.0", features = ["boxed"] }
 cpp_demangle = "0.5.0"
 crc32fast = "1.5.0"
-indexmap = "2.7.1"
+crossbeam-utils = "0.8.21"
+indexmap = { version = "2.7.1", features = ["rayon"] }
 log = { version = "0.4.26", features = ["std"] }
 memmap2 = "0.9.9"
 nom = "8.0.0"

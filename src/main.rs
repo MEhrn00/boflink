@@ -1,4 +1,6 @@
-use std::{collections::HashSet, path::Path, process::ExitCode};
+use std::{
+    collections::HashSet, num::NonZeroUsize, path::Path, process::ExitCode, sync::atomic::Ordering,
+};
 
 use typed_arena::Arena;
 
@@ -64,15 +66,15 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn try_main(args: CliArgs) -> Result<()> {
+fn try_main(mut args: CliArgs) -> Result<()> {
+    let threads = args.options.threads.get_or_insert_with(|| {
+        std::thread::available_parallelism()
+            .ok()
+            .unwrap_or(NonZeroUsize::new(1).unwrap_or_else(|| unreachable!()))
+    });
+
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(
-            args.options
-                .threads
-                .or_else(|| std::thread::available_parallelism().ok())
-                .map(|num| num.get())
-                .unwrap_or(1),
-        )
+        .num_threads(threads.get())
         .build()
         .context("cannot create thread pool")?;
 
@@ -98,6 +100,10 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
     if linker.architecture == ImageFileMachine::Unknown {
         bail!("unable to detect target architecture from input files");
     }
+
+    ctx.stats
+        .global_symbols
+        .store(ctx.symbol_map.len(), Ordering::Relaxed);
 
     if args.options.print_timing {
         let elapsed = std::time::Instant::now() - timer;

@@ -22,7 +22,9 @@ impl<'a> LinkContext<'a> {
             options,
             errored: false.into(),
             bump_pool,
-            symbol_map: SymbolMap::new(),
+            symbol_map: SymbolMap::with_slot_count(
+                options.threads.map(|num| num.get()).unwrap_or(1),
+            ),
             stats: Default::default(),
         }
     }
@@ -63,6 +65,7 @@ pub struct LinkStats {
     pub parsed_coffs: AtomicU32,
     pub parsed_coff_sections: AtomicUsize,
     pub parsed_coff_symbols: AtomicUsize,
+    pub global_symbols: AtomicUsize,
 }
 
 impl LinkStats {
@@ -75,7 +78,8 @@ impl LinkStats {
   input_archive_members: {input_archive_members}
   parsed_coffs: {parsed_coffs}
   parsed_coff_sections: {parsed_coff_sections}
-  parsed_coff_symbols: {parsed_coff_symbols}"#,
+  parsed_coff_symbols: {parsed_coff_symbols}
+  global_symbols: {global_symbols}"#,
             input_files = self.input_files.load(Ordering::Relaxed),
             input_coffs = self.input_coffs.load(Ordering::Relaxed),
             input_archives = self.input_archives.load(Ordering::Relaxed),
@@ -83,6 +87,7 @@ impl LinkStats {
             parsed_coffs = self.parsed_coffs.load(Ordering::Relaxed),
             parsed_coff_sections = self.parsed_coff_sections.load(Ordering::Relaxed),
             parsed_coff_symbols = self.parsed_coff_symbols.load(Ordering::Relaxed),
+            global_symbols = self.global_symbols.load(Ordering::Relaxed),
         );
     }
 }
