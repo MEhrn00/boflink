@@ -8,7 +8,10 @@ use std::{
 use memmap2::Mmap;
 use object::read::archive::ArchiveFile;
 use os_str_bytes::OsStrBytesExt;
-use rayon::Scope;
+use rayon::{
+    Scope,
+    iter::{IntoParallelRefIterator, ParallelIterator},
+};
 use typed_arena::Arena;
 
 use crate::{
@@ -19,6 +22,7 @@ use crate::{
     error,
     fsutils::{UniqueFileExt, UniqueFileId},
     inputs::{FileKind, InputFile, ObjectFile, ObjectFileId, ObjectFileVariant},
+    symbols::SymbolId,
     syncpool::{BumpBox, BumpRef},
     timing::ScopedTimer,
 };
@@ -27,6 +31,7 @@ use crate::{
 pub struct Linker<'a> {
     pub architecture: ImageFileMachine,
     pub objs: Vec<BumpBox<'a, ObjectFile<'a>>>,
+    pub root_symbols: Vec<SymbolId>,
 }
 
 impl<'a> Linker<'a> {
@@ -61,7 +66,30 @@ impl<'a> Linker<'a> {
         Ok(Self {
             architecture: reader.architecture,
             objs: objs.into_vec(),
+            root_symbols: Vec::new(),
         })
+    }
+
+    pub fn mangle(&self, arena: &BumpRef<'a>, name: &'a [u8]) -> &'a [u8] {
+        if self.architecture != ImageFileMachine::I386 {
+            return name;
+        }
+
+        arena.alloc_bytes([b"_", name].concat().as_slice())
+    }
+
+    pub fn add_root_symbol(
+        &mut self,
+        ctx: &mut LinkContext<'a>,
+        bump: &BumpRef<'a>,
+        name: &'a [u8],
+    ) {
+        if let Some(symbol) = ctx
+            .symbol_map
+            .get_exclusive_or_default_new(bump, self.mangle(bump, name))
+        {
+            self.root_symbols.push(symbol);
+        }
     }
 }
 

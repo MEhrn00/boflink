@@ -25,6 +25,7 @@ use crate::{
     context::LinkContext,
     error,
     symbols::{Symbol, SymbolId},
+    syncpool::BumpBox,
 };
 
 #[derive(Debug)]
@@ -296,8 +297,8 @@ impl<'a> ObjectFile<'a> {
             .with_context(|| format!("cannot parse {}", self.context.file.source()))
     }
 
-    pub fn resolve_symbols(&self, ctx: &LinkContext<'a>) {
-        self.variant.resolve_symbols(ctx, &self.context);
+    pub fn resolve_symbols(&self, ctx: &LinkContext<'a>, objs: &[BumpBox<'a, ObjectFile<'a>>]) {
+        self.variant.resolve_symbols(ctx, objs);
     }
 }
 
@@ -322,10 +323,10 @@ impl<'a> ObjectFileVariant<'a> {
         }
     }
 
-    fn resolve_symbols(&self, ctx: &LinkContext<'a>, obj: &ObjectFileContext<'a>) {
+    fn resolve_symbols(&self, ctx: &LinkContext<'a>, objs: &[BumpBox<'a, ObjectFile<'a>>]) {
         match self {
-            Self::Coff(coff) => coff.resolve_symbols(ctx, obj),
-            Self::Import(import) => import.resolve_symbols(ctx, obj),
+            Self::Coff(coff) => coff.resolve_symbols(ctx, objs),
+            Self::Import(import) => import.resolve_symbols(ctx, objs),
         }
     }
 }
@@ -425,7 +426,7 @@ impl<'a> CoffObjectFile<'a> {
                 characteristics,
                 coff_relocs: relocs,
                 associative: None,
-                live: AtomicBool::new(!ctx.options.gc_sections),
+                discarded: false.into(),
             });
 
             if name == b".idata" || name.starts_with(b".idata$") {
@@ -591,7 +592,7 @@ impl<'a> CoffObjectFile<'a> {
         Ok(())
     }
 
-    fn resolve_symbols(&self, ctx: &LinkContext<'a>, obj: &ObjectFileContext<'a>) {}
+    fn resolve_symbols(&self, ctx: &LinkContext<'a>, objs: &[BumpBox<'a, ObjectFile<'a>>]) {}
 }
 
 #[derive(Debug)]
@@ -603,7 +604,7 @@ struct Section<'a> {
     characteristics: SectionFlags,
     coff_relocs: &'a [pe::ImageRelocation],
     associative: Option<SectionIndex>,
-    live: AtomicBool,
+    discarded: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -700,7 +701,7 @@ impl<'a> ImportObjectFile<'a> {
         );
     }
 
-    fn resolve_symbols(&self, ctx: &LinkContext<'a>, obj: &ObjectFileContext<'a>) {}
+    fn resolve_symbols(&self, ctx: &LinkContext<'a>, objs: &[BumpBox<'a, ObjectFile<'a>>]) {}
 }
 
 impl<'a> std::default::Default for ImportObjectFile<'a> {

@@ -1,6 +1,4 @@
-use std::{
-    collections::HashSet, num::NonZeroUsize, path::Path, process::ExitCode, sync::atomic::Ordering,
-};
+use std::{collections::HashSet, num::NonZeroUsize, path::Path, process::ExitCode};
 
 use typed_arena::Arena;
 
@@ -89,9 +87,8 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
 
     setup_options(&mut args.options);
 
-    let ctx = LinkContext::new(&args.options, &bump_pool);
-
-    let linker = Linker::read_inputs(&ctx, &inputs, &mappings)?;
+    let mut ctx = LinkContext::new(&args.options, &bump_pool);
+    let mut linker = Linker::read_inputs(&ctx, &inputs, &mappings)?;
 
     if linker.objs.is_empty() {
         bail!("no input files");
@@ -101,9 +98,16 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
         bail!("unable to detect target architecture from input files");
     }
 
-    ctx.stats
-        .global_symbols
-        .store(ctx.symbol_map.len(), Ordering::Relaxed);
+    *ctx.stats.global_symbols.get_mut() = ctx.symbol_map.len();
+
+    let bump = ctx.bump_pool.get();
+    for symbol in [&args.options.entry]
+        .into_iter()
+        .chain(args.options.require_defined.iter())
+        .chain(args.options.undefined.iter())
+    {
+        linker.add_root_symbol(&mut ctx, &bump, symbol.as_bytes());
+    }
 
     if args.options.print_timing {
         let elapsed = std::time::Instant::now() - timer;
