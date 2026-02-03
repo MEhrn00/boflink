@@ -8,10 +8,7 @@ use std::{
 use memmap2::Mmap;
 use object::read::archive::ArchiveFile;
 use os_str_bytes::OsStrBytesExt;
-use rayon::{
-    Scope,
-    iter::{IntoParallelRefIterator, ParallelIterator},
-};
+use rayon::Scope;
 use typed_arena::Arena;
 
 use crate::{
@@ -21,8 +18,8 @@ use crate::{
     context::LinkContext,
     error,
     fsutils::{UniqueFileExt, UniqueFileId},
-    inputs::{FileKind, InputFile, ObjectFile, ObjectFileId, ObjectFileVariant},
-    symbols::SymbolId,
+    inputs::{FileKind, InputFile, ObjectFile, ObjectFileId},
+    symbols::ExternalId,
     syncpool::{BumpBox, BumpRef},
     timing::ScopedTimer,
 };
@@ -31,7 +28,7 @@ use crate::{
 pub struct Linker<'a> {
     pub architecture: ImageFileMachine,
     pub objs: Vec<BumpBox<'a, ObjectFile<'a>>>,
-    pub root_symbols: Vec<SymbolId>,
+    pub root_symbols: Vec<ExternalId>,
 }
 
 impl<'a> Linker<'a> {
@@ -86,14 +83,14 @@ impl<'a> Linker<'a> {
     ) {
         if let Some(symbol) = ctx
             .symbol_map
-            .get_exclusive_or_default_new(bump, self.mangle(bump, name))
+            .get_exclusive_or_default_new(self.mangle(bump, name))
         {
             self.root_symbols.push(symbol);
         }
     }
 }
 
-struct InputsReader<'r, 'a> {
+struct InputsReader<'r, 'a: 'r> {
     architecture: ImageFileMachine,
     bump: &'r BumpRef<'a>,
     mappings: &'a Arena<Mmap>,
@@ -103,7 +100,7 @@ struct InputsReader<'r, 'a> {
     unique_libraries: HashSet<(&'a OsStr, InputArgContext)>,
 }
 
-impl<'r, 'a> InputsReader<'r, 'a> {
+impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     fn read_cli_inputs<'scope>(
         &mut self,
         ctx: &'scope LinkContext<'a>,
@@ -111,7 +108,6 @@ impl<'r, 'a> InputsReader<'r, 'a> {
         inputs: &'a [InputArg],
     ) where
         'r: 'scope,
-        'a: 'scope,
     {
         for input in inputs {
             match input.variant {
@@ -142,7 +138,6 @@ impl<'r, 'a> InputsReader<'r, 'a> {
     ) -> crate::Result<()>
     where
         'r: 'scope,
-        'a: 'scope,
     {
         if let Some(file) = self.open_unique_path(path, input_ctx) {
             self.read_file(ctx, scope, input_ctx, path, file?)
@@ -160,7 +155,6 @@ impl<'r, 'a> InputsReader<'r, 'a> {
     ) -> crate::Result<()>
     where
         'r: 'scope,
-        'a: 'scope,
     {
         if let Some(found) = self.find_unique_library(ctx, library, input_ctx) {
             let (path, file) = found?;
@@ -185,7 +179,6 @@ impl<'r, 'a> InputsReader<'r, 'a> {
     ) -> crate::Result<()>
     where
         'r: 'scope,
-        'a: 'scope,
     {
         if let Some(mapping) = self.map_unique_file(path, file, input_ctx) {
             let mapping = mapping?;
@@ -214,29 +207,32 @@ impl<'r, 'a> InputsReader<'r, 'a> {
     ) -> crate::Result<()>
     where
         'r: 'scope,
-        'a: 'scope,
     {
         let kind = FileKind::detect(file.data)
             .with_context(|| format!("cannot parse {}", file.source()))?;
 
         match kind {
             FileKind::Coff => {
-                self.parse_object_file(
-                    ctx,
-                    scope,
-                    input_ctx,
-                    file,
-                    ObjectFileVariant::Coff(Default::default()),
-                )?;
+                let machine = ObjectFile::identify_coff_machine(file.data, 0)?;
+                self.validate_architecture(&file, machine)?;
+                let obj = self.make_new_object_file(ctx, input_ctx, file);
+                let obj = self.objs_arena.alloc(obj);
+                scope.spawn(move |_| {
+                    if let Err(e) = obj.parse_coff(ctx) {
+                        log::error!(logger: ctx, "cannot parse {}: {e}", obj.source());
+                    }
+                });
             }
             FileKind::Import => {
-                self.parse_object_file(
-                    ctx,
-                    scope,
-                    input_ctx,
-                    file,
-                    ObjectFileVariant::Import(Default::default()),
-                )?;
+                let machine = ObjectFile::identify_importfile_machine(file.data)?;
+                self.validate_architecture(&file, machine)?;
+                let obj = self.make_new_object_file(ctx, input_ctx, file);
+                let obj = self.objs_arena.alloc(obj);
+                scope.spawn(move |_| {
+                    if let Err(e) = obj.parse_importfile(ctx) {
+                        log::error!(logger: ctx, "cannot parse {}: {e}", obj.source());
+                    }
+                });
             }
             FileKind::Archive => {
                 if file.parent.is_some() {
@@ -254,19 +250,17 @@ impl<'r, 'a> InputsReader<'r, 'a> {
         Ok(())
     }
 
-    fn parse_object_file<'scope>(
+    fn make_new_object_file<'scope>(
         &mut self,
         ctx: &'scope LinkContext<'a>,
-        scope: &Scope<'scope>,
         input_ctx: InputArgContext,
         file: InputFile<'a>,
-        variant: ObjectFileVariant<'a>,
-    ) -> crate::Result<()>
+    ) -> BumpBox<'a, ObjectFile<'a>>
     where
         'r: 'scope,
-        'a: 'scope,
     {
-        if file.parent.is_some() {
+        let have_parent = file.parent.is_some();
+        if have_parent {
             ctx.stats
                 .input_archive_members
                 .fetch_add(1, Ordering::Relaxed);
@@ -274,35 +268,22 @@ impl<'r, 'a> InputsReader<'r, 'a> {
             ctx.stats.input_coffs.fetch_add(1, Ordering::Relaxed);
         }
 
-        let obj = {
-            let have_parent = file.parent.is_some();
-            let obj = self.bump.alloc_boxed(ObjectFile::new(
-                ObjectFileId::new(self.objs_arena.len()),
-                file,
-                input_ctx.in_lib || (have_parent && !input_ctx.in_whole_archive),
-                variant,
-            ));
-            self.objs_arena.alloc(obj)
-        };
-
-        self.validate_object_architecture(obj)?;
-
-        ctx.stats.parsed_coffs.fetch_add(1, Ordering::Relaxed);
-        scope.spawn(move |_| {
-            if let Err(e) = obj.parse(ctx) {
-                log::error!(logger: ctx, "{e}");
-            }
-        });
-
-        Ok(())
+        self.bump.alloc_boxed(ObjectFile::new(
+            ObjectFileId::new(self.objs_arena.len()),
+            file,
+            input_ctx.in_lib || (have_parent && !input_ctx.in_whole_archive),
+        ))
     }
 
-    fn validate_object_architecture(&mut self, obj: &ObjectFile) -> crate::Result<()> {
-        let machine = ObjectFile::identify_machine(obj.file().data)?;
+    fn validate_architecture(
+        &mut self,
+        file: &InputFile<'a>,
+        machine: ImageFileMachine,
+    ) -> crate::Result<()> {
         if !(machine == ImageFileMachine::Amd64 || machine == ImageFileMachine::I386) {
             bail!(
                 "cannot parse {}: unsupported COFF architecture '{machine:#}'",
-                obj.source(),
+                file.source(),
             );
         }
 
@@ -311,7 +292,7 @@ impl<'r, 'a> InputsReader<'r, 'a> {
         } else if self.architecture != machine {
             bail!(
                 "cannot parse {}: expected machine value '{}' but found '{machine}'",
-                obj.source(),
+                file.source(),
                 self.architecture,
             );
         }
@@ -328,7 +309,6 @@ impl<'r, 'a> InputsReader<'r, 'a> {
     ) -> crate::Result<()>
     where
         'r: 'scope,
-        'a: 'scope,
     {
         let archive = ArchiveFile::parse(file.data)
             .with_context(|| format!("cannot parse {}", file.source()))?;
@@ -382,7 +362,6 @@ impl<'r, 'a> InputsReader<'r, 'a> {
     ) -> crate::Result<()>
     where
         'r: 'scope,
-        'a: 'scope,
     {
         todo!("thin archives")
     }

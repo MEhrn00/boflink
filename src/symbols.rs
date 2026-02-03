@@ -11,7 +11,6 @@ use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelI
 use crate::{
     coff::{ComdatSelection, SectionNumber, StorageClass},
     inputs::ObjectFileId,
-    syncpool::{BumpBox, BumpRef},
 };
 
 const SLOT_BITS: u32 = 8;
@@ -23,30 +22,30 @@ const INDEX_MASK: u32 = MAX_INDEX as u32;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct SymbolId(u32);
+pub struct ExternalId(u32);
 
-impl std::fmt::Debug for SymbolId {
+impl std::fmt::Debug for ExternalId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SymbolId")
+        f.debug_struct("ExternalId")
             .field("slot", &self.slot())
             .field("index", &self.index())
             .finish()
     }
 }
 
-impl std::default::Default for SymbolId {
+impl std::default::Default for ExternalId {
     fn default() -> Self {
         Self::invalid()
     }
 }
 
-impl SymbolId {
+impl ExternalId {
     pub const fn invalid() -> Self {
         Self(u32::MAX)
     }
 
     pub const fn is_invalid(&self) -> bool {
-        self.0 == SymbolId::invalid().0
+        self.0 == ExternalId::invalid().0
     }
 
     fn new(slot: usize, idx: usize) -> Self {
@@ -115,8 +114,7 @@ impl<'a> Symbol<'a> {
     }
 }
 
-type MapEntry<'a> = BumpBox<'a, Symbol<'a>>;
-type MapSlot<'a> = IndexMap<&'a [u8], RwLock<MapEntry<'a>>>;
+type MapSlot<'a> = IndexMap<&'a [u8], RwLock<Symbol<'a>>>;
 
 #[derive(Debug)]
 pub struct SymbolMap<'a> {
@@ -138,7 +136,7 @@ impl<'a> SymbolMap<'a> {
             .fold(0, |acc, slot| acc + slot.read().unwrap().len())
     }
 
-    pub fn get_or_default(&self, arena: &BumpRef<'a>, name: &'a [u8]) -> SymbolId {
+    pub fn get_or_default(&self, name: &'a [u8]) -> ExternalId {
         let mut h = DefaultHasher::default();
         h.write(name);
         let slot_idx = (h.finish() as usize % self.slots.len()) as usize;
@@ -147,19 +145,15 @@ impl<'a> SymbolMap<'a> {
             let mut slot = slot_entry.write().expect("SymbolMap poisoned");
             let entry = slot.entry(name);
             let index = entry.index();
-            entry.or_insert_with(|| RwLock::new(arena.alloc_boxed(Symbol::default())));
+            entry.or_insert_with(|| RwLock::new(Symbol::default()));
             index
         };
 
         assert!(index <= MAX_INDEX, "SymbolMap overflowed");
-        SymbolId::new(slot_idx, index)
+        ExternalId::new(slot_idx, index)
     }
 
-    pub fn get_exclusive_or_default_new(
-        &mut self,
-        arena: &BumpRef<'a>,
-        name: &'a [u8],
-    ) -> Option<SymbolId> {
+    pub fn get_exclusive_or_default_new(&mut self, name: &'a [u8]) -> Option<ExternalId> {
         let mut h = DefaultHasher::default();
         h.write(name);
         let slot_idx = (h.finish() as usize % self.slots.len()) as usize;
@@ -168,16 +162,16 @@ impl<'a> SymbolMap<'a> {
         let index = match slot.entry(name) {
             Entry::Occupied(_) => return None,
             Entry::Vacant(entry) => {
-                let entry = entry.insert_entry(RwLock::new(arena.alloc_boxed(Symbol::default())));
+                let entry = entry.insert_entry(RwLock::new(Symbol::default()));
                 entry.index()
             }
         };
 
         assert!(index <= MAX_INDEX, "SymbolMap overflowed");
-        Some(SymbolId::new(slot_idx, index))
+        Some(ExternalId::new(slot_idx, index))
     }
 
-    pub fn get_exclusive(&mut self, symbol: SymbolId) -> Option<&mut BumpBox<'a, Symbol<'a>>> {
+    pub fn get_exclusive(&mut self, symbol: ExternalId) -> Option<&mut Symbol<'a>> {
         if symbol.is_invalid() {
             return None;
         }
@@ -187,7 +181,7 @@ impl<'a> SymbolMap<'a> {
         Some(entry.get_mut().unwrap())
     }
 
-    pub fn inspect(&self, symbol: SymbolId, f: impl FnOnce(&RwLock<BumpBox<'a, Symbol<'a>>>)) {
+    pub fn inspect(&self, symbol: ExternalId, f: impl FnOnce(&RwLock<Symbol<'a>>)) {
         if symbol.is_invalid() {
             return;
         }
@@ -198,7 +192,7 @@ impl<'a> SymbolMap<'a> {
         }
     }
 
-    pub fn par_for_each(&self, f: impl Fn(&RwLock<BumpBox<'a, Symbol<'a>>>) + Send + Sync) {
+    pub fn par_for_each(&self, f: impl Fn(&RwLock<Symbol<'a>>) + Send + Sync) {
         self.slots.par_iter().for_each(|slot| {
             let slot = slot.read().unwrap();
             slot.par_values().for_each(|symbol| f(symbol));
