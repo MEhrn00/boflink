@@ -81,7 +81,7 @@ fn try_main(mut args: CliArgs) -> Result<()> {
 
 fn run_boflink(mut args: CliArgs) -> Result<()> {
     let timer = std::time::Instant::now();
-    let bump_pool = SyncBumpPool::new();
+    let mut bump_pool = SyncBumpPool::new();
     let mappings = Arena::new();
     let inputs = std::mem::take(&mut args.inputs);
 
@@ -114,8 +114,14 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
         log::info!("link time: {}", elapsed.display());
     }
 
+    let mut stats = std::mem::take(&mut ctx.stats);
+    drop(bump);
+    drop(linker);
+    drop(ctx);
+    stats.arena_memory = bump_pool.allocated_bytes();
+
     if args.options.print_stats {
-        ctx.stats.print_yaml();
+        stats.print_yaml();
     }
 
     Ok(())

@@ -97,6 +97,13 @@ impl SyncBumpPool {
             pool: self,
         }
     }
+
+    pub fn allocated_bytes(&mut self) -> usize {
+        let bumps = self.0.get_mut().unwrap();
+        bumps
+            .iter()
+            .fold(0, |acc, bump| acc + bump.allocated_bytes())
+    }
 }
 
 /// Exclusive reference to a [`Bump`] from a [`SyncBumpPool`].

@@ -62,10 +62,8 @@ pub struct LinkStats {
     pub input_coffs: AtomicU32,
     pub input_archives: AtomicU32,
     pub input_archive_members: AtomicU32,
-    pub parsed_coffs: AtomicU32,
-    pub parsed_coff_sections: AtomicUsize,
-    pub parsed_coff_symbols: AtomicUsize,
     pub global_symbols: AtomicUsize,
+    pub arena_memory: usize,
 }
 
 impl LinkStats {
@@ -76,18 +74,14 @@ impl LinkStats {
   input_coffs: {input_coffs}
   input_archives: {input_archives}
   input_archive_members: {input_archive_members}
-  parsed_coffs: {parsed_coffs}
-  parsed_coff_sections: {parsed_coff_sections}
-  parsed_coff_symbols: {parsed_coff_symbols}
-  global_symbols: {global_symbols}"#,
+  global_symbols: {global_symbols}
+  arena_memory: {arena_memory} bytes"#,
             input_files = self.input_files.load(Ordering::Relaxed),
             input_coffs = self.input_coffs.load(Ordering::Relaxed),
             input_archives = self.input_archives.load(Ordering::Relaxed),
             input_archive_members = self.input_archive_members.load(Ordering::Relaxed),
-            parsed_coffs = self.parsed_coffs.load(Ordering::Relaxed),
-            parsed_coff_sections = self.parsed_coff_sections.load(Ordering::Relaxed),
-            parsed_coff_symbols = self.parsed_coff_symbols.load(Ordering::Relaxed),
             global_symbols = self.global_symbols.load(Ordering::Relaxed),
+            arena_memory = self.arena_memory,
         );
     }
 }
