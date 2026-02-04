@@ -3,14 +3,15 @@ use std::{collections::HashSet, num::NonZeroUsize, path::Path, process::ExitCode
 use typed_arena::Arena;
 
 use crate::{
+    arena::ArenaPool,
     cli::{CliArgs, CliOptions},
     coff::ImageFileMachine,
     context::LinkContext,
-    linker::Linker,
-    syncpool::SyncBumpPool,
+    linker::{InputsStore, Linker},
     timing::DurationExt,
 };
 
+mod arena;
 mod cli;
 mod coff;
 mod context;
@@ -20,7 +21,6 @@ mod inputs;
 mod linker;
 mod logging;
 mod symbols;
-mod syncpool;
 mod timing;
 
 #[cfg(windows)]
@@ -65,30 +65,36 @@ fn main() -> ExitCode {
 }
 
 fn try_main(mut args: CliArgs) -> Result<()> {
-    let threads = args.options.threads.get_or_insert_with(|| {
+    // Get the number of threads and update the configuration to reflect the
+    // number of active threads being used
+    let num_threads = args.options.threads.get_or_insert_with(|| {
         std::thread::available_parallelism()
             .ok()
             .unwrap_or(NonZeroUsize::new(1).unwrap_or_else(|| unreachable!()))
     });
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads.get())
+    let thread_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads.get())
         .build()
         .context("cannot create thread pool")?;
 
-    pool.install(|| run_boflink(args))
+    thread_pool.install(|| run_boflink(args))
 }
 
 fn run_boflink(mut args: CliArgs) -> Result<()> {
     let timer = std::time::Instant::now();
-    let mut bump_pool = SyncBumpPool::new();
-    let mappings = Arena::new();
+
+    let mut string_pool = ArenaPool::new();
+    let store = InputsStore::default();
+
     let inputs = std::mem::take(&mut args.inputs);
 
     setup_options(&mut args.options);
 
-    let mut ctx = LinkContext::new(&args.options, &bump_pool);
-    let mut linker = Linker::read_inputs(&ctx, &inputs, &mappings)?;
+    let mut ctx = LinkContext::new(&args.options, &string_pool);
+
+    let mut linker = Linker::read_inputs(&ctx, &inputs, &store)?;
+    ctx.exclusive_check_errored();
 
     if linker.objs.is_empty() {
         bail!("no input files");
@@ -100,13 +106,13 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
 
     *ctx.stats.global_symbols.get_mut() = ctx.symbol_map.len();
 
-    let bump = ctx.bump_pool.get();
+    let bump = ctx.string_pool.get();
     for symbol in [&args.options.entry]
         .into_iter()
         .chain(args.options.require_defined.iter())
         .chain(args.options.undefined.iter())
     {
-        linker.add_root_symbol(&mut ctx, &bump, symbol.as_bytes());
+        linker.add_root_symbol(&mut ctx, symbol.as_bytes());
     }
 
     linker.resolve_symbols(&mut ctx);
@@ -120,7 +126,7 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
     drop(bump);
     drop(linker);
     drop(ctx);
-    stats.arena_memory = bump_pool.allocated_bytes();
+    stats.arena_memory = string_pool.allocation_count();
 
     if args.options.print_stats {
         stats.print_yaml();

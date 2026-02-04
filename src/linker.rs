@@ -12,10 +12,11 @@ use rayon::{
     Scope,
     iter::{IntoParallelRefIterator, ParallelIterator},
 };
-use typed_arena::Arena;
 
 use crate::{
-    ErrorContext, bail,
+    ErrorContext,
+    arena::{ArenaBox, ArenaRef, TypedArena},
+    bail,
     cli::{InputArg, InputArgContext, InputArgVariant},
     coff::ImageFileMachine,
     context::LinkContext,
@@ -23,14 +24,13 @@ use crate::{
     inputs::{FileKind, InputFile, ObjectFile, ObjectFileId},
     make_error,
     symbols::ExternalId,
-    syncpool::{BumpBox, BumpRef},
     timing::ScopedTimer,
 };
 
-#[derive(Debug, Default)]
 pub struct Linker<'a> {
     pub architecture: ImageFileMachine,
-    pub objs: Vec<BumpBox<'a, ObjectFile<'a>>>,
+    strings: ArenaRef<'a, u8>,
+    pub objs: Vec<ArenaBox<'a, ObjectFile<'a>>>,
     pub root_symbols: Vec<ExternalId>,
 }
 
@@ -38,12 +38,12 @@ impl<'a> Linker<'a> {
     pub fn read_inputs(
         ctx: &LinkContext<'a>,
         inputs: &'a [InputArg],
-        mappings: &'a Arena<Mmap>,
+        store: &'a InputsStore<'a>,
     ) -> crate::Result<Self> {
         let _timer = ScopedTimer::msg("read inputs");
 
-        let objs: Arena<BumpBox<ObjectFile>> = Arena::new();
-        let bump = ctx.bump_pool.get();
+        let input_objs = TypedArena::new();
+        let strings = ctx.string_pool.get();
 
         let mut reader = InputsReader {
             architecture: ctx
@@ -51,9 +51,9 @@ impl<'a> Linker<'a> {
                 .machine
                 .map(|machine| machine.into_machine())
                 .unwrap_or(ImageFileMachine::Unknown),
-            bump: &bump,
-            mappings,
-            objs_arena: &objs,
+            strings: &strings,
+            store,
+            input_objs: &input_objs,
             unique_paths: HashSet::new(),
             unique_mappings: HashSet::new(),
             unique_libraries: HashSet::new(),
@@ -66,28 +66,24 @@ impl<'a> Linker<'a> {
 
         Ok(Self {
             architecture: reader.architecture,
-            objs: objs.into_vec(),
+            strings,
+            objs: input_objs.into_vec(),
             root_symbols: Vec::new(),
         })
     }
 
-    pub fn mangle(&self, arena: &BumpRef<'a>, name: &'a [u8]) -> &'a [u8] {
+    pub fn mangle(&self, name: &'a [u8]) -> &'a [u8] {
         if self.architecture != ImageFileMachine::I386 {
             return name;
         }
 
-        arena.alloc_bytes([b"_", name].concat().as_slice())
+        self.strings.alloc_bytes([b"_", name].concat().as_slice())
     }
 
-    pub fn add_root_symbol(
-        &mut self,
-        ctx: &mut LinkContext<'a>,
-        bump: &BumpRef<'a>,
-        name: &'a [u8],
-    ) {
+    pub fn add_root_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
         if let Some(symbol) = ctx
             .symbol_map
-            .get_exclusive_or_default_new(self.mangle(bump, name))
+            .get_exclusive_or_default_new(self.mangle(name))
         {
             self.root_symbols.push(symbol);
         }
@@ -100,11 +96,18 @@ impl<'a> Linker<'a> {
     }
 }
 
+#[derive(Default)]
+pub struct InputsStore<'a> {
+    pub files: TypedArena<InputFile<'a>>,
+    pub mappings: TypedArena<Mmap>,
+    pub objs: TypedArena<ObjectFile<'a>>,
+}
+
 struct InputsReader<'r, 'a: 'r> {
     architecture: ImageFileMachine,
-    bump: &'r BumpRef<'a>,
-    mappings: &'a Arena<Mmap>,
-    objs_arena: &'r Arena<BumpBox<'a, ObjectFile<'a>>>,
+    strings: &'r ArenaRef<'a, u8>,
+    store: &'a InputsStore<'a>,
+    input_objs: &'r TypedArena<ArenaBox<'a, ObjectFile<'a>>>,
     unique_paths: HashSet<(&'a Path, InputArgContext)>,
     unique_mappings: HashSet<(UniqueFileId, InputArgContext)>,
     unique_libraries: HashSet<(&'a OsStr, InputArgContext)>,
@@ -113,15 +116,12 @@ struct InputsReader<'r, 'a: 'r> {
 impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     fn create_internal_file(&self) {
         assert!(
-            self.objs_arena.len() == 0,
+            self.input_objs.len() == 0,
             "InputsReader::create_internal_file() must be called before inputs are added"
         );
 
-        self.objs_arena.alloc(self.bump.alloc_boxed(ObjectFile::new(
-            ObjectFileId::internal(),
-            InputFile::internal(),
-            true,
-        )));
+        let obj = ArenaBox::new_in(ObjectFile::new_internal(), &self.store.objs);
+        self.input_objs.alloc(obj);
     }
 
     fn read_cli_inputs<'scope>(
@@ -148,8 +148,6 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
                 }
             }
         }
-
-        ctx.check_errored();
     }
 
     fn read_path<'scope>(
@@ -181,11 +179,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     {
         if let Some(found) = self.find_unique_library(ctx, library, input_ctx) {
             let (path, file) = found?;
-            let path = {
-                let path_bytes = &*self.bump.alloc_bytes(path.as_os_str().as_encoded_bytes());
-                Path::new(unsafe { OsStr::from_encoded_bytes_unchecked(path_bytes) })
-            };
-
+            let path = Path::new(*self.strings.alloc_os_str(path.as_os_str()));
             self.read_file(ctx, scope, input_ctx, path, file)
         } else {
             Ok(())
@@ -239,7 +233,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
                 let machine = ObjectFile::identify_coff_machine(file.data, 0)?;
                 self.validate_architecture(&file, machine)?;
                 let obj = self.make_new_object_file(ctx, input_ctx, file);
-                let obj = self.objs_arena.alloc(obj);
+                let obj = self.input_objs.alloc(obj);
                 scope.spawn(move |_| {
                     if let Err(e) = obj.parse_coff(ctx) {
                         log::error!(logger: ctx, "cannot parse {}: {e}", obj.source());
@@ -250,7 +244,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
                 let machine = ObjectFile::identify_importfile_machine(file.data)?;
                 self.validate_architecture(&file, machine)?;
                 let obj = self.make_new_object_file(ctx, input_ctx, file);
-                let obj = self.objs_arena.alloc(obj);
+                let obj = self.input_objs.alloc(obj);
                 scope.spawn(move |_| {
                     if let Err(e) = obj.parse_importfile(ctx) {
                         log::error!(logger: ctx, "cannot parse {}: {e}", obj.source());
@@ -278,7 +272,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
         ctx: &'scope LinkContext<'a>,
         input_ctx: InputArgContext,
         file: InputFile<'a>,
-    ) -> BumpBox<'a, ObjectFile<'a>>
+    ) -> ArenaBox<'a, ObjectFile<'a>>
     where
         'r: 'scope,
     {
@@ -291,11 +285,12 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
             ctx.stats.input_coffs.fetch_add(1, Ordering::Relaxed);
         }
 
-        self.bump.alloc_boxed(ObjectFile::new(
-            ObjectFileId::new(self.objs_arena.len()),
+        let obj = ObjectFile::new(
+            ObjectFileId::new(self.input_objs.len()),
             file,
             input_ctx.in_lib || (have_parent && !input_ctx.in_whole_archive),
-        ))
+        );
+        ArenaBox::new_in(obj, &self.store.objs)
     }
 
     fn validate_architecture(
@@ -341,7 +336,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
             return self.parse_thin_archive(ctx, scope, input_ctx, file, archive);
         }
 
-        let file = &*self.bump.alloc(file);
+        let file = &*self.store.files.alloc(file);
 
         for member in archive.members() {
             let member = member.with_context(|| format!("cannot parse {}", file.source()))?;
@@ -422,7 +417,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
             Some(
                 unsafe { Mmap::map(&file) }
                     .with_context(|| format!("cannot open {}", path.display()))
-                    .map(|mapping| &*self.mappings.alloc(mapping)),
+                    .map(|mapping| &*self.store.mappings.alloc(mapping)),
             )
         } else {
             None

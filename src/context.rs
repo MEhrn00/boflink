@@ -1,39 +1,57 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use crate::{cli::CliOptions, symbols::SymbolMap, syncpool::SyncBumpPool};
+use crate::{arena::ArenaPool, cli::CliOptions, symbols::SymbolMap};
 
-/// Structure which holds "global-state" used throughout the linker.
+/// Context structure which holds miscellaneous the program context used
+/// throughout the entire program.
 ///
-/// The fields inside this structure are meant to be passed through to various
-/// functions for different uses. The majority of the fields in this structure
-/// should either be thread-safe or only need to be mutable in limited contexts.
+/// This is designed as a replacement for using static global variables in areas
+/// where it would be useful.
+/// Global variables are generally a bad idea unless absolutely necessary as a
+/// last resort. This structure helps solve a lot of those issues while also
+/// "simulating" having them.
 pub struct LinkContext<'a> {
+    /// The raw command line options passed to the program
     pub options: &'a CliOptions,
-    pub errored: AtomicBool,
-    pub bump_pool: &'a SyncBumpPool,
     pub symbol_map: SymbolMap<'a>,
+
+    /// Flag indicating if the program has encountered an error.
+    ///
+    /// This structure implements the [`log::Log`] trait. This flag will get
+    /// set if any error records have passed through this logger.
+    errored: AtomicBool,
+
+    pub string_pool: &'a ArenaPool<u8>,
     pub stats: LinkStats,
 }
 
 impl<'a> LinkContext<'a> {
-    /// Creates a new [`LinkContext`] with everything set to the defaults.
-    pub fn new(options: &'a CliOptions, bump_pool: &'a SyncBumpPool) -> Self {
+    pub fn new(options: &'a CliOptions, string_pool: &'a ArenaPool<u8>) -> Self {
+        // This should already be set to reflect the active thread count but
+        // fall back to 1 if it is not.
+        let active_threads = options.threads.map(|num| num.get()).unwrap_or(1);
+
         Self {
             options,
-            errored: false.into(),
-            bump_pool,
-            symbol_map: SymbolMap::with_slot_count(
-                options.threads.map(|num| num.get()).unwrap_or(1),
-            ),
+            string_pool,
+            errored: AtomicBool::new(false),
+            symbol_map: SymbolMap::with_slot_count(active_threads),
             stats: Default::default(),
         }
     }
 
-    /// Checks if an error log record was emitted and exits if one was seen.
-    /// This uses an [`Ordering::Relaxed`] load of the atomic flag for checking
-    /// errors.
-    pub fn check_errored(&self) {
-        if self.errored.load(Ordering::Relaxed) {
+    /// Function which checks if an error message was logged using this logger
+    /// and exits the program if it has.
+    ///
+    /// This can be used for doing a simple check after a multi-threaded linker
+    /// pass to see if any threads encountered an error. It is generally helpful
+    /// to log all errors that occur during a pass for the user instead of
+    /// short-circuiting and terminating on the first one.
+    ///
+    /// This method takes `self` as `&mut self` to ensure that only a single
+    /// thread is performing this check.
+    pub fn exclusive_check_errored(&mut self) {
+        if *self.errored.get_mut() {
             std::process::exit(1);
         }
     }
@@ -67,21 +85,31 @@ pub struct LinkStats {
 }
 
 impl LinkStats {
-    pub fn print_yaml(&self) {
-        println!(
+    pub fn print_yaml(&mut self) {
+        self.write_yaml(std::io::stdout().lock()).unwrap();
+    }
+
+    /// Writes the current link states to the specified writer.
+    ///
+    /// This method takes `self` as `&mut self` to ensure that only a single
+    /// thread is accessing the link stats during printing.
+    pub fn write_yaml(&mut self, mut w: impl std::io::Write) -> std::io::Result<()> {
+        write!(
+            w,
             r#"stats:
   input_files: {input_files}
   input_coffs: {input_coffs}
   input_archives: {input_archives}
   input_archive_members: {input_archive_members}
   global_symbols: {global_symbols}
-  arena_memory: {arena_memory} bytes"#,
+  arena_memory: {arena_memory} bytes
+"#,
             input_files = self.input_files.load(Ordering::Relaxed),
             input_coffs = self.input_coffs.load(Ordering::Relaxed),
             input_archives = self.input_archives.load(Ordering::Relaxed),
             input_archive_members = self.input_archive_members.load(Ordering::Relaxed),
             global_symbols = self.global_symbols.load(Ordering::Relaxed),
             arena_memory = self.arena_memory,
-        );
+        )
     }
 }

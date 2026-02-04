@@ -16,13 +16,13 @@ use object::{
 
 use crate::{
     ErrorContext,
+    arena::ArenaBox,
     coff::{
         CoffFlags, ComdatSelection, ImageFileMachine, SectionFlags, SectionNumber, StorageClass,
     },
     context::LinkContext,
     make_error,
     symbols::{ExternalId, Symbol},
-    syncpool::BumpBox,
 };
 
 #[derive(Debug)]
@@ -42,19 +42,109 @@ impl<'a> InputFile<'a> {
         }
     }
 
+    pub fn is_internal(&self) -> bool {
+        self.path.as_os_str().is_empty()
+    }
+
     pub fn source(&self) -> InputFileSource<'a> {
         self.parent
-            .map(|parent| InputFileSource::PathedMember {
-                parent: parent.path,
+            .map(|parent| InputFileSource::Member {
+                archive: parent.path,
                 path: self.path,
             })
             .unwrap_or_else(|| {
-                if self.path.as_os_str().is_empty() {
+                if self.is_internal() {
                     InputFileSource::Internal
                 } else {
                     InputFileSource::Disk(self.path)
                 }
             })
+    }
+}
+
+/// Full source of an input file.
+///
+/// Used for diagnostic messages.
+///
+/// The [`std::fmt::Display`] implementation will display the file path if the
+/// file was read directly from disk or it will display `path(member)` if
+/// the file is a member of an archive.
+///
+/// [`InputFileSource::to_short()`] can be used for only displaying the file name
+/// parts instead of the full paths.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum InputFileSource<'a> {
+    /// Internal file that is created for misc usage
+    Internal,
+
+    /// An input file read directly from disk.
+    Disk(&'a Path),
+
+    /// An archive member.
+    Member { archive: &'a Path, path: &'a Path },
+}
+
+impl<'a> InputFileSource<'a> {
+    /// Returns the [`ShortInputFileSource`] from of this input source
+    pub fn to_short(&self) -> ShortInputFileSource<'a> {
+        let fname_or_path =
+            |path: &'a Path| -> &'a OsStr { path.file_name().unwrap_or(path.as_os_str()) };
+
+        match self {
+            Self::Internal => ShortInputFileSource::Internal,
+            Self::Disk(path) => ShortInputFileSource::Disk(fname_or_path(path)),
+            Self::Member { archive, path } => ShortInputFileSource::Member {
+                archive: fname_or_path(archive),
+                filename: fname_or_path(path),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for InputFileSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Internal => write!(f, "<internal>"),
+            Self::Disk(path) => write!(f, "{}", path.display()),
+            Self::Member {
+                archive: parent,
+                path,
+            } => {
+                write!(f, "{}({})", parent.display(), path.display())
+            }
+        }
+    }
+}
+
+/// A short form version of an input source with only the filename components.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ShortInputFileSource<'a> {
+    Internal,
+
+    /// The name of the file read from disk.
+    Disk(&'a OsStr),
+
+    /// An archive member
+    Member {
+        archive: &'a OsStr,
+        filename: &'a OsStr,
+    },
+}
+
+impl std::fmt::Display for ShortInputFileSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Internal => write!(f, "<internal>"),
+            Self::Disk(file) => write!(f, "{}", file.to_string_lossy()),
+            Self::Member { archive, filename } => {
+                write!(
+                    f,
+                    "{}({})",
+                    archive.to_string_lossy(),
+                    filename.to_string_lossy()
+                )
+            }
+        }
     }
 }
 
@@ -75,7 +165,7 @@ pub enum FileKind {
 }
 
 impl FileKind {
-    /// Attempts to detect the [`InputFileKind`] based on the passed in data.
+    /// Attempts to detect the [`FileKind`] based on the passed in data.
     pub fn detect(data: &[u8]) -> Result<FileKind, UnknownFileError> {
         let Some(magic) = data.get(..18) else {
             return Err(UnknownFileError);
@@ -135,91 +225,6 @@ impl std::fmt::Display for UnknownFileError {
 
 impl std::error::Error for UnknownFileError {}
 
-/// Full source of an input file.
-///
-/// Used for diagnostic messages.
-///
-/// The [`std::fmt::Display`] implementation will display the file path if the
-/// file was read directly from disk or it will display `path(member)` if
-/// the file is a member of an archive.
-///
-/// [`InputSource::to_short()`] can be used for only displaying the file names
-/// for each path instead of the full paths.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum InputFileSource<'a> {
-    Internal,
-
-    /// An input file read directly from disk.
-    Disk(&'a Path),
-
-    /// Pathed archive member.
-    PathedMember {
-        parent: &'a Path,
-        path: &'a Path,
-    },
-}
-
-impl<'a> InputFileSource<'a> {
-    /// Returns the [`ShortInputSource`] from of this input source
-    pub fn to_short(&self) -> ShortFileSource<'a> {
-        let fname_or_path =
-            |path: &'a Path| -> &'a OsStr { path.file_name().unwrap_or(path.as_os_str()) };
-
-        match self {
-            Self::Internal => ShortFileSource::Internal,
-            Self::Disk(path) => ShortFileSource::Disk(fname_or_path(path)),
-            Self::PathedMember { parent, path } => ShortFileSource::PathedMember {
-                parent: fname_or_path(parent),
-                filename: fname_or_path(path),
-            },
-        }
-    }
-}
-
-impl std::fmt::Display for InputFileSource<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Internal => write!(f, "<internal>"),
-            Self::Disk(path) => write!(f, "{}", path.display()),
-            Self::PathedMember { parent, path } => {
-                write!(f, "{}({})", parent.display(), path.display())
-            }
-        }
-    }
-}
-
-/// A short form version of an input source with only the filename components.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ShortFileSource<'a> {
-    Internal,
-
-    /// The name of the file read from disk.
-    Disk(&'a OsStr),
-
-    /// Pathed member
-    PathedMember {
-        parent: &'a OsStr,
-        filename: &'a OsStr,
-    },
-}
-
-impl std::fmt::Display for ShortFileSource<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Internal => write!(f, "<internal>"),
-            Self::Disk(file) => write!(f, "{}", file.to_string_lossy()),
-            Self::PathedMember { parent, filename } => {
-                write!(
-                    f,
-                    "{}({})",
-                    parent.to_string_lossy(),
-                    filename.to_string_lossy()
-                )
-            }
-        }
-    }
-}
-
 /// Id for an object file. This is a tagged index using a `u32`.
 /// - Index 0 is reserved for the internal file used for adding linker-synthesized
 /// sections/symbols.
@@ -276,6 +281,10 @@ pub struct ObjectFile<'a> {
 }
 
 impl<'a> ObjectFile<'a> {
+    pub fn new_internal() -> ObjectFile<'a> {
+        Self::new(ObjectFileId::internal(), InputFile::internal(), true)
+    }
+
     pub fn new(id: ObjectFileId, file: InputFile<'a>, lazy: bool) -> ObjectFile<'a> {
         Self {
             id,
@@ -549,7 +558,7 @@ impl<'a> ObjectFile<'a> {
         self.characteristics = CoffFlags::LineNumsStripped | CoffFlags::Reserved40;
         self.dll = file.dll();
 
-        let bump = ctx.bump_pool.get();
+        let bump = ctx.string_pool.get();
 
         let import_name = if let ImportName::Name(name) = file.import() {
             name
@@ -628,7 +637,7 @@ impl<'a> ObjectFile<'a> {
         Ok(())
     }
 
-    pub fn resolve_symbols(&self, ctx: &LinkContext<'a>, objs: &[BumpBox<'a, ObjectFile<'a>>]) {}
+    pub fn resolve_symbols(&self, ctx: &LinkContext<'a>, objs: &[ArenaBox<'a, ObjectFile<'a>>]) {}
 }
 
 #[derive(Debug)]

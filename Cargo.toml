@@ -20,7 +20,6 @@ publish = false
 [dependencies]
 argfile = "0.2.1"
 bitflags = "2.9.0"
-bumpalo = { version = "3.17.0", features = ["boxed"] }
 cpp_demangle = "0.5.0"
 crc32fast = "1.5.0"
 crossbeam-utils = "0.8.21"
