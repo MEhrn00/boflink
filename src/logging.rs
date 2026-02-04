@@ -14,7 +14,7 @@ const CARGO_PKG_NAME: &str = env!("CARGO_PKG_NAME");
 /// The log crate sets these to all uppercase letters which is great for doing
 /// more general purpose logging in bulk but lowercase letters look nicer in
 /// a console window.
-/// https://github.com/rust-lang/log/blob/43f2c2837f93be1c6ff9ce672a940d28152b09cf/src/lib.rs#L460
+/// <https://github.com/rust-lang/log/blob/43f2c2837f93be1c6ff9ce672a940d28152b09cf/src/lib.rs#L460>
 const LEVEL_NAMES: [&str; 6] = ["", "error:", "warning:", "info:", "debug:", "trace:"];
 
 const LEVEL_COLORS: [&str; 6] = [
@@ -217,7 +217,7 @@ fn should_use_colors(color: ColorOption) -> bool {
 /// Returns `true` if the `NO_COLOR` environment variable is set to a non-empty
 /// value that is not 0.
 ///
-/// Used for following https://no-color.org/.
+/// Used for following <https://no-color.org/>.
 fn have_nocolor_env() -> bool {
     std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty() && v != "0")
 }
@@ -225,7 +225,7 @@ fn have_nocolor_env() -> bool {
 /// Returns `true` if the `CLICOLOR_FORCE` environment variable is set to a
 /// non-empty value that is not 0.
 ///
-/// Used for following https://bixense.com/clicolors/
+/// Used for following <https://bixense.com/clicolors/>.
 fn have_clicolor_force() -> bool {
     std::env::var_os("CLICOLOR_FORCE").is_some_and(|v| !v.is_empty() && v != "0")
 }
@@ -236,7 +236,7 @@ fn have_clicolor_force() -> bool {
 /// - Returns `Some(true)` if present and set to a non-empty value other than 0.
 /// - Returns `Some(false)` if present and set to 0 or is empty.
 ///
-/// Used for following https://bixense.com/clicolors/
+/// Used for following <https://bixense.com/clicolors/>.
 fn clicolor() -> Option<bool> {
     let clicolor = std::env::var_os("CLICOLOR")?;
     Some(!clicolor.is_empty() && clicolor != "0")

@@ -31,7 +31,7 @@ impl ScopedTimer {
         }
     }
 
-    /// Creates a new [`ScopedTimer`] that prints out "<msg> tool <time>" in
+    /// Creates a new [`ScopedTimer`] that prints out `<msg> tool <time>` in
     /// a [`log::trace!`] record.
     #[track_caller]
     pub fn msg(msg: impl std::fmt::Display + 'static) -> ScopedTimer {

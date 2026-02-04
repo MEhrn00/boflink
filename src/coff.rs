@@ -397,7 +397,7 @@ impl TryFrom<u8> for ComdatSelection {
 /// @feat.00 symbol flags.
 ///
 /// Flags are from
-/// https://github.com/llvm/llvm-project/blob/544c300f4396119bf5a2ea4239d32774908a882d/llvm/include/llvm/BinaryFormat/COFF.h#L845.
+/// <https://github.com/llvm/llvm-project/blob/544c300f4396119bf5a2ea4239d32774908a882d/llvm/include/llvm/BinaryFormat/COFF.h#L845>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Feat00Flags(u32);
