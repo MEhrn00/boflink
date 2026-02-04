@@ -16,7 +16,7 @@ use object::{
 
 use crate::{
     ErrorContext,
-    arena::ArenaBox,
+    arena::ArenaRef,
     coff::{
         CoffFlags, ComdatSelection, ImageFileMachine, SectionFlags, SectionNumber, StorageClass,
     },
@@ -637,7 +637,7 @@ impl<'a> ObjectFile<'a> {
         Ok(())
     }
 
-    pub fn resolve_symbols(&self, ctx: &LinkContext<'a>, objs: &[ArenaBox<'a, ObjectFile<'a>>]) {}
+    pub fn resolve_symbols(&self, ctx: &LinkContext<'a>, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {}
 }
 
 #[derive(Debug)]

@@ -84,7 +84,7 @@ fn try_main(mut args: CliArgs) -> Result<()> {
 fn run_boflink(mut args: CliArgs) -> Result<()> {
     let timer = std::time::Instant::now();
 
-    let mut string_pool = ArenaPool::new();
+    let string_pool = ArenaPool::new();
     let store = InputsStore::default();
 
     let inputs = std::mem::take(&mut args.inputs);
@@ -106,7 +106,6 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
 
     *ctx.stats.global_symbols.get_mut() = ctx.symbol_map.len();
 
-    let bump = ctx.string_pool.get();
     for symbol in [&args.options.entry]
         .into_iter()
         .chain(args.options.require_defined.iter())
@@ -117,19 +116,17 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
 
     linker.resolve_symbols(&mut ctx);
 
-    if args.options.print_timing {
-        let elapsed = std::time::Instant::now() - timer;
-        log::info!("link time: {}", elapsed.display());
-    }
-
     let mut stats = std::mem::take(&mut ctx.stats);
-    drop(bump);
     drop(linker);
     drop(ctx);
-    stats.arena_memory = string_pool.allocation_count();
 
     if args.options.print_stats {
         stats.print_yaml();
+    }
+
+    if args.options.print_timing {
+        let elapsed = std::time::Instant::now() - timer;
+        log::info!("link time: {}", elapsed.display());
     }
 
     Ok(())

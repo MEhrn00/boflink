@@ -115,16 +115,8 @@ impl<T> ArenaPool<T> {
         ))
     }
 
-    pub fn allocation_count(&mut self) -> usize {
-        self.0
-            .get_mut()
-            .expect("ArenaPool Mutex poisoned")
-            .iter()
-            .fold(0, |acc, arena| acc + arena.len())
-    }
-
-    pub fn get(&self) -> ArenaRef<'_, T> {
-        ArenaRef {
+    pub fn get(&self) -> ArenaHandle<'_, T> {
+        ArenaHandle {
             inner: ManuallyDrop::new(
                 self.0
                     .lock()
@@ -137,20 +129,20 @@ impl<T> ArenaPool<T> {
     }
 }
 
-pub struct ArenaRef<'a, T> {
+pub struct ArenaHandle<'a, T> {
     inner: ManuallyDrop<Box<TypedArena<T>>>,
     pool: &'a ArenaPool<T>,
 }
 
-impl<'a, T> ArenaRef<'a, T> {
+impl<'a, T> ArenaHandle<'a, T> {
     pub fn alloc(&self, value: T) -> &'a mut T {
         let allocated = self.inner.alloc(value) as *mut _;
         unsafe { &mut *allocated }
     }
 
-    pub fn alloc_boxed(&self, value: T) -> ArenaBox<'a, T> {
+    pub fn alloc_ref(&self, value: T) -> ArenaRef<'a, T> {
         let allocated = self.inner.alloc(value) as *mut _;
-        unsafe { ArenaBox(&mut *allocated) }
+        unsafe { ArenaRef(&mut *allocated) }
     }
 
     pub fn alloc_extend<I>(&self, iterator: I) -> &'a mut [T]
@@ -166,7 +158,7 @@ impl<'a, T> ArenaRef<'a, T> {
     }
 }
 
-impl<'a> ArenaRef<'a, u8> {
+impl<'a> ArenaHandle<'a, u8> {
     pub fn alloc_str(&self, s: &str) -> &'a mut str {
         let allocated = self.inner.alloc_str(s) as *mut _;
         unsafe { &mut *allocated }
@@ -185,7 +177,7 @@ impl<'a> ArenaRef<'a, u8> {
     }
 }
 
-impl<T> Drop for ArenaRef<'_, T> {
+impl<T> Drop for ArenaHandle<'_, T> {
     fn drop(&mut self) {
         let mut pool = self.pool.0.lock().expect("ArenaPool Mutex poisoned");
         pool.push(unsafe { ManuallyDrop::take(&mut self.inner) });
@@ -193,15 +185,15 @@ impl<T> Drop for ArenaRef<'_, T> {
 }
 
 #[repr(transparent)]
-pub struct ArenaBox<'a, T: ?Sized>(&'a mut T);
+pub struct ArenaRef<'a, T: ?Sized>(&'a mut T);
 
-impl<'a, T> ArenaBox<'a, T> {
-    pub fn new_in(value: T, arena: &'a TypedArena<T>) -> ArenaBox<'a, T> {
+impl<'a, T> ArenaRef<'a, T> {
+    pub fn new_in(value: T, arena: &'a TypedArena<T>) -> ArenaRef<'a, T> {
         Self(arena.alloc(value))
     }
 }
 
-impl<'a, T: ?Sized> std::ops::Deref for ArenaBox<'a, T> {
+impl<'a, T: ?Sized> std::ops::Deref for ArenaRef<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -209,27 +201,19 @@ impl<'a, T: ?Sized> std::ops::Deref for ArenaBox<'a, T> {
     }
 }
 
-impl<'a, T: ?Sized> std::ops::DerefMut for ArenaBox<'a, T> {
+impl<'a, T: ?Sized> std::ops::DerefMut for ArenaRef<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0
     }
 }
 
-impl<'a, T: ?Sized> Drop for ArenaBox<'a, T> {
-    fn drop(&mut self) {
-        unsafe {
-            std::ptr::drop_in_place(self.0);
-        }
-    }
-}
-
-impl<'a, T: ?Sized + std::fmt::Debug> std::fmt::Debug for ArenaBox<'a, T> {
+impl<'a, T: ?Sized + std::fmt::Debug> std::fmt::Debug for ArenaRef<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&*self.0, f)
     }
 }
 
-impl<'a, T: ?Sized + std::fmt::Display> std::fmt::Display for ArenaBox<'a, T> {
+impl<'a, T: ?Sized + std::fmt::Display> std::fmt::Display for ArenaRef<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(&*self.0, f)
     }

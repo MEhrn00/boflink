@@ -81,7 +81,6 @@ pub struct LinkStats {
     pub input_archives: AtomicU32,
     pub input_archive_members: AtomicU32,
     pub global_symbols: AtomicUsize,
-    pub arena_memory: usize,
 }
 
 impl LinkStats {
@@ -102,14 +101,12 @@ impl LinkStats {
   input_archives: {input_archives}
   input_archive_members: {input_archive_members}
   global_symbols: {global_symbols}
-  arena_memory: {arena_memory} bytes
 "#,
             input_files = self.input_files.load(Ordering::Relaxed),
             input_coffs = self.input_coffs.load(Ordering::Relaxed),
             input_archives = self.input_archives.load(Ordering::Relaxed),
             input_archive_members = self.input_archive_members.load(Ordering::Relaxed),
             global_symbols = self.global_symbols.load(Ordering::Relaxed),
-            arena_memory = self.arena_memory,
         )
     }
 }

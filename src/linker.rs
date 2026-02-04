@@ -15,7 +15,7 @@ use rayon::{
 
 use crate::{
     ErrorContext,
-    arena::{ArenaBox, ArenaRef, TypedArena},
+    arena::{ArenaHandle, ArenaRef, TypedArena},
     bail,
     cli::{InputArg, InputArgContext, InputArgVariant},
     coff::ImageFileMachine,
@@ -29,8 +29,8 @@ use crate::{
 
 pub struct Linker<'a> {
     pub architecture: ImageFileMachine,
-    strings: ArenaRef<'a, u8>,
-    pub objs: Vec<ArenaBox<'a, ObjectFile<'a>>>,
+    strings: ArenaHandle<'a, u8>,
+    pub objs: Vec<ArenaRef<'a, ObjectFile<'a>>>,
     pub root_symbols: Vec<SymbolId>,
 }
 
@@ -105,9 +105,9 @@ pub struct InputsStore<'a> {
 
 struct InputsReader<'r, 'a: 'r> {
     architecture: ImageFileMachine,
-    strings: &'r ArenaRef<'a, u8>,
+    strings: &'r ArenaHandle<'a, u8>,
     store: &'a InputsStore<'a>,
-    input_objs: &'r TypedArena<ArenaBox<'a, ObjectFile<'a>>>,
+    input_objs: &'r TypedArena<ArenaRef<'a, ObjectFile<'a>>>,
     unique_paths: HashSet<(&'a Path, InputArgContext)>,
     unique_mappings: HashSet<(UniqueFileId, InputArgContext)>,
     unique_libraries: HashSet<(&'a OsStr, InputArgContext)>,
@@ -120,7 +120,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
             "InputsReader::create_internal_file() must be called before inputs are added"
         );
 
-        let obj = ArenaBox::new_in(ObjectFile::new_internal(), &self.store.objs);
+        let obj = ArenaRef::new_in(ObjectFile::new_internal(), &self.store.objs);
         self.input_objs.alloc(obj);
     }
 
@@ -272,7 +272,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
         ctx: &'scope LinkContext<'a>,
         input_ctx: InputArgContext,
         file: InputFile<'a>,
-    ) -> ArenaBox<'a, ObjectFile<'a>>
+    ) -> ArenaRef<'a, ObjectFile<'a>>
     where
         'r: 'scope,
     {
@@ -290,7 +290,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
             file,
             input_ctx.in_lib || (have_parent && !input_ctx.in_whole_archive),
         );
-        ArenaBox::new_in(obj, &self.store.objs)
+        ArenaRef::new_in(obj, &self.store.objs)
     }
 
     fn validate_architecture(
