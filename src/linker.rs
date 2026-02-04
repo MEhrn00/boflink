@@ -8,7 +8,10 @@ use std::{
 use memmap2::Mmap;
 use object::read::archive::ArchiveFile;
 use os_str_bytes::OsStrBytesExt;
-use rayon::Scope;
+use rayon::{
+    Scope,
+    iter::{IntoParallelRefIterator, ParallelIterator},
+};
 use typed_arena::Arena;
 
 use crate::{
@@ -16,9 +19,9 @@ use crate::{
     cli::{InputArg, InputArgContext, InputArgVariant},
     coff::ImageFileMachine,
     context::LinkContext,
-    error,
     fsutils::{UniqueFileExt, UniqueFileId},
     inputs::{FileKind, InputFile, ObjectFile, ObjectFileId},
+    make_error,
     symbols::ExternalId,
     syncpool::{BumpBox, BumpRef},
     timing::ScopedTimer,
@@ -57,6 +60,7 @@ impl<'a> Linker<'a> {
         };
 
         rayon::in_place_scope(|scope| {
+            reader.create_internal_file();
             reader.read_cli_inputs(ctx, scope, inputs);
         });
 
@@ -88,6 +92,12 @@ impl<'a> Linker<'a> {
             self.root_symbols.push(symbol);
         }
     }
+
+    pub fn resolve_symbols(&mut self, ctx: &mut LinkContext<'a>) {
+        self.objs.par_iter().for_each(|obj| {
+            obj.resolve_symbols(ctx, &self.objs);
+        });
+    }
 }
 
 struct InputsReader<'r, 'a: 'r> {
@@ -101,6 +111,19 @@ struct InputsReader<'r, 'a: 'r> {
 }
 
 impl<'r, 'a: 'r> InputsReader<'r, 'a> {
+    fn create_internal_file(&self) {
+        assert!(
+            self.objs_arena.len() == 0,
+            "InputsReader::create_internal_file() must be called before inputs are added"
+        );
+
+        self.objs_arena.alloc(self.bump.alloc_boxed(ObjectFile::new(
+            ObjectFileId::internal(),
+            InputFile::internal(),
+            true,
+        )));
+    }
+
     fn read_cli_inputs<'scope>(
         &mut self,
         ctx: &'scope LinkContext<'a>,
@@ -324,7 +347,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
             let member = member.with_context(|| format!("cannot parse {}", file.source()))?;
             let offset = member.file_range().0;
             let member_name = std::str::from_utf8(member.name()).map_err(|_| {
-                error!(
+                make_error!(
                     "cannot parse {}({offset}): member name is not a valid utf8 string",
                     file.path.display()
                 )

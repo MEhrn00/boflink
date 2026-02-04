@@ -27,18 +27,15 @@ crossbeam-utils = "0.8.21"
 indexmap = { version = "2.7.1", features = ["rayon"] }
 log = { version = "0.4.26", features = ["std"] }
 memmap2 = "0.9.9"
-nom = "8.0.0"
-num_enum = "0.7.3"
 os_str_bytes = "7.1.1"
 rayon = "1.11.0"
 rustc-demangle = "0.1.26"
-thiserror = "2.0.18"
 typed-arena = "2.0.2"
 
 [dependencies.object]
 version = "0.38.0"
 default-features = false
-features = ["archive", "coff", "write", "read_core", "unaligned"]
+features = ["archive", "coff", "write_core", "read_core", "unaligned"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [

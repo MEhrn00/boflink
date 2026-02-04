@@ -7,10 +7,23 @@
 //! and strongly typed bit flags for handling PE characteristics.
 //!
 //! This module contains a lot of boilerplate stuff due to the nature of new
-//! types and bit flags.
+//! types and bit flags. Some crates exist to help reduce the boilerplate stuff.
+//! Namely num_enum and thiserror.
+//!
+//! num_enum's derive crate pulls in 8 additional transitive dependencies one
+//! of which is a pretty heavy toml parser for parsing the Cargo.toml file.
+//! This is so that the proc macro works in cases where the num_enum dependency
+//! was renamed. It would not be renamed if used here and there is no way to
+//! exclude that dependency with a feature flag.
+//!
+//! Both the thiserror and num_enum crates pull in syn with all of the feature
+//! flags enabled. Syn takes about 3s to build. That is not a lot of time in
+//! reality but the source code in this project only takes about 1.5s to build.
+//! These crates also do not include any feature flags to help reduce their
+//! build times so the added overhead did not seem worth it compared to the
+//! boilerplate needed here.
 
 use bitflags::bitflags;
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 use object::{
     SectionIndex,
     pe::{
@@ -45,18 +58,23 @@ use object::{
     },
 };
 
-#[derive(Debug, thiserror::Error)]
-#[error("unknown 'IMAGE_FILE_MACHINE_*' value '{}'", .0)]
+#[derive(Debug)]
 pub struct TryFromImageFileMachineError(u16);
 
+impl std::fmt::Display for TryFromImageFileMachineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown 'IMAGE_FILE_MACHINE_*' value '{}'", self.0)
+    }
+}
+
+impl std::error::Error for TryFromImageFileMachineError {}
+
 /// PE `IMAGE_FILE_MACHINE_*` constants.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive, IntoPrimitive)]
-#[num_enum(error_type(name = TryFromImageFileMachineError, constructor = TryFromImageFileMachineError))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum ImageFileMachine {
     #[default]
     Unknown = IMAGE_FILE_MACHINE_UNKNOWN,
-
     Alpha = IMAGE_FILE_MACHINE_ALPHA,
     Alpha64 = IMAGE_FILE_MACHINE_ALPHA64,
     Am33 = IMAGE_FILE_MACHINE_AM33,
@@ -96,6 +114,47 @@ impl std::fmt::Display for ImageFileMachine {
         } else {
             panic!("unhandled MachineDisplay variant {}", *self as u16);
         }
+    }
+}
+
+impl TryFrom<u16> for ImageFileMachine {
+    type Error = TryFromImageFileMachineError;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Ok(match value {
+            IMAGE_FILE_MACHINE_UNKNOWN => Self::Unknown,
+            IMAGE_FILE_MACHINE_ALPHA => Self::Alpha,
+            IMAGE_FILE_MACHINE_ALPHA64 => Self::Alpha64,
+            IMAGE_FILE_MACHINE_AM33 => Self::Am33,
+            IMAGE_FILE_MACHINE_AMD64 => Self::Amd64,
+            IMAGE_FILE_MACHINE_ARM => Self::Arm,
+            IMAGE_FILE_MACHINE_ARM64 => Self::Arm64,
+            IMAGE_FILE_MACHINE_ARM64EC => Self::Arm64Ec,
+            IMAGE_FILE_MACHINE_ARM64X => Self::Arm64X,
+            IMAGE_FILE_MACHINE_ARMNT => Self::ArmNt,
+            IMAGE_FILE_MACHINE_EBC => Self::Ebc,
+            IMAGE_FILE_MACHINE_I386 => Self::I386,
+            IMAGE_FILE_MACHINE_IA64 => Self::Ia64,
+            IMAGE_FILE_MACHINE_M32R => Self::M32R,
+            IMAGE_FILE_MACHINE_MIPS16 => Self::Mips16,
+            IMAGE_FILE_MACHINE_MIPSFPU => Self::MipsFpu,
+            IMAGE_FILE_MACHINE_MIPSFPU16 => Self::Mips16,
+            IMAGE_FILE_MACHINE_POWERPC => Self::PowerPc,
+            IMAGE_FILE_MACHINE_POWERPCFP => Self::PowerPcFp,
+            IMAGE_FILE_MACHINE_R3000 => Self::R3000,
+            IMAGE_FILE_MACHINE_R4000 => Self::R4000,
+            IMAGE_FILE_MACHINE_R10000 => Self::R10000,
+            IMAGE_FILE_MACHINE_RISCV32 => Self::RiscV32,
+            IMAGE_FILE_MACHINE_RISCV64 => Self::RiscV64,
+            IMAGE_FILE_MACHINE_RISCV128 => Self::RiscV128,
+            IMAGE_FILE_MACHINE_SH3 => Self::Sh3,
+            IMAGE_FILE_MACHINE_SH3DSP => Self::Sh3Dsp,
+            IMAGE_FILE_MACHINE_SH4 => Self::Sh4,
+            IMAGE_FILE_MACHINE_SH5 => Self::Sh5,
+            IMAGE_FILE_MACHINE_THUMB => Self::Thumb,
+            IMAGE_FILE_MACHINE_WCEMIPSV2 => Self::WceMipsV2,
+            o => return Err(TryFromImageFileMachineError(o)),
+        })
     }
 }
 
@@ -218,13 +277,19 @@ impl SectionNumber {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("unknown 'IMAGE_SYM_CLASS_*' value '{}'", .0)]
+#[derive(Debug)]
 pub struct TryFromStorageClassError(u8);
 
+impl std::fmt::Display for TryFromStorageClassError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown 'IMAGE_SYM_CLASS_*' value '{}'", self.0)
+    }
+}
+
+impl std::error::Error for TryFromStorageClassError {}
+
 /// Symbol storage class values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive, IntoPrimitive)]
-#[num_enum(error_type(name = TryFromStorageClassError, constructor = TryFromStorageClassError))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum StorageClass {
     EndOfFunction = IMAGE_SYM_CLASS_END_OF_FUNCTION,
@@ -256,12 +321,55 @@ pub enum StorageClass {
     ClrToken = IMAGE_SYM_CLASS_CLR_TOKEN,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("unknown 'IMAGE_COMDAT_SELECT_*' value '{}'", .0)]
+impl TryFrom<u8> for StorageClass {
+    type Error = TryFromStorageClassError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Ok(match value {
+            IMAGE_SYM_CLASS_END_OF_FUNCTION => Self::EndOfFunction,
+            IMAGE_SYM_CLASS_NULL => Self::Null,
+            IMAGE_SYM_CLASS_AUTOMATIC => Self::Automatic,
+            IMAGE_SYM_CLASS_EXTERNAL => Self::External,
+            IMAGE_SYM_CLASS_STATIC => Self::Static,
+            IMAGE_SYM_CLASS_REGISTER => Self::Register,
+            IMAGE_SYM_CLASS_EXTERNAL_DEF => Self::ExternalDef,
+            IMAGE_SYM_CLASS_LABEL => Self::Label,
+            IMAGE_SYM_CLASS_UNDEFINED_LABEL => Self::UndefinedLabel,
+            IMAGE_SYM_CLASS_MEMBER_OF_STRUCT => Self::MemberOfStruct,
+            IMAGE_SYM_CLASS_ARGUMENT => Self::Argument,
+            IMAGE_SYM_CLASS_STRUCT_TAG => Self::StructTag,
+            IMAGE_SYM_CLASS_MEMBER_OF_UNION => Self::MemberOfUnion,
+            IMAGE_SYM_CLASS_UNION_TAG => Self::UnionTag,
+            IMAGE_SYM_CLASS_TYPE_DEFINITION => Self::TypeDefinition,
+            IMAGE_SYM_CLASS_UNDEFINED_STATIC => Self::UndefinedStatic,
+            IMAGE_SYM_CLASS_ENUM_TAG => Self::EnumTag,
+            IMAGE_SYM_CLASS_MEMBER_OF_ENUM => Self::MemberOfEnum,
+            IMAGE_SYM_CLASS_REGISTER_PARAM => Self::RegisterParam,
+            IMAGE_SYM_CLASS_BIT_FIELD => Self::BitField,
+            IMAGE_SYM_CLASS_BLOCK => Self::Block,
+            IMAGE_SYM_CLASS_FUNCTION => Self::Function,
+            IMAGE_SYM_CLASS_END_OF_STRUCT => Self::EndOfStruct,
+            IMAGE_SYM_CLASS_FILE => Self::File,
+            IMAGE_SYM_CLASS_SECTION => Self::Section,
+            IMAGE_SYM_CLASS_WEAK_EXTERNAL => Self::WeakExternal,
+            IMAGE_SYM_CLASS_CLR_TOKEN => Self::ClrToken,
+            o => return Err(TryFromStorageClassError(o)),
+        })
+    }
+}
+
+#[derive(Debug)]
 pub struct TryFromComdatSelectionError(u8);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive, IntoPrimitive)]
-#[num_enum(error_type(name = TryFromComdatSelectionError, constructor = TryFromComdatSelectionError))]
+impl std::fmt::Display for TryFromComdatSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown 'IMAGE_COMDAT_SELECT_*' value '{}'", self.0)
+    }
+}
+
+impl std::error::Error for TryFromComdatSelectionError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ComdatSelection {
     NoDuplicates = IMAGE_COMDAT_SELECT_NODUPLICATES,
@@ -269,6 +377,21 @@ pub enum ComdatSelection {
     SameSize = IMAGE_COMDAT_SELECT_SAME_SIZE,
     ExactMatch = IMAGE_COMDAT_SELECT_EXACT_MATCH,
     Largest = IMAGE_COMDAT_SELECT_LARGEST,
+}
+
+impl TryFrom<u8> for ComdatSelection {
+    type Error = TryFromComdatSelectionError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Ok(match value {
+            IMAGE_COMDAT_SELECT_NODUPLICATES => Self::NoDuplicates,
+            IMAGE_COMDAT_SELECT_ANY => Self::Any,
+            IMAGE_COMDAT_SELECT_SAME_SIZE => Self::SameSize,
+            IMAGE_COMDAT_SELECT_EXACT_MATCH => Self::ExactMatch,
+            IMAGE_COMDAT_SELECT_LARGEST => Self::Largest,
+            o => return Err(TryFromComdatSelectionError(o)),
+        })
+    }
 }
 
 /// @feat.00 symbol flags.

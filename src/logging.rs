@@ -174,6 +174,26 @@ pub fn init(
         .map(|()| log::set_max_level(max_level.to_level_filter()))
 }
 
+#[macro_export]
+macro_rules! fatal {
+    (logger: $logger:expr, target: $target:expr, $($arg:tt)+) => {{
+        log::log!(logger: $logger, target: $target, log::Level::Error, $($arg)+);
+        std::process::exit(1);
+    }};
+    (logger: $logger:expr, $($arg:tt)+) => {{
+        log::log!(logger: $logger, log::Level::Error, $($arg)+);
+        std::process::exit(1);
+    }};
+    (target: $target:expr, $($arg:tt)+) => {{
+        log::log!(target: $target, log::Level::Error, $($arg)+);
+        std::process::exit(1);
+    }};
+    ($($arg:tt)+) => {{
+        log::log!(log::Level::Error, $($arg)+);
+        std::process::exit(1);
+    }};
+}
+
 /// Returns `true` if colors should be used in log messages given the specified
 /// color option and environment variable values.
 fn should_use_colors(color: ColorOption) -> bool {

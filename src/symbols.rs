@@ -1,3 +1,45 @@
+//! Symbol types and global symbol handling.
+//!
+//! The global symbol map is internally represented as a concurrent [`IndexMap`].
+//! The symbol map requires concurrent read/write access and can contain well over
+//! 12000 entries in a typical scenario.
+//!
+//! Since the symbol name strings can potentially be very long with C++/Rust name
+//! mangling, the goal here is to use [String interning](https://en.wikipedia.org/wiki/String_interning).
+//! A symbol name should only be added into the symbol map once at the beginning
+//! of the program and a unique [`ExternalId`] value returned is used for later
+//! referencing it. The advantage here is that this id value can be used as a
+//! more efficient reference to a symbol inside the map compared to using a
+//! hash table with symbol names. Doing a lookup by name in a hash table may
+//! cause hash collisions which requires a potentially expensive string comparison.
+//! Using an id value to get a symbol does not require handling collisions and
+//! is essentially the same has doing a constant-time array index.
+//!
+//! ## Concurrency
+//! The symbol map is internally represented as a collection of slots with each
+//! slot containing an [`IndexMap`] wrapped behind a [`RwLock`]. Inserting a
+//! string for the first time will get hashed to determine what slot it should
+//! be placed in. This should hopefully mean that the number of entries in each
+//! indexmap is relatively evenly distributed when the full symbol map is built.
+//!
+//! This should help reduce lock contention when accessing entries since the
+//! RwLock being acquired is "random" when two threads access two separate
+//! entries.
+//!
+//! ## Id tagging
+//! The [`ExternalId`] value is a tagged index that internally uses a `u32`.
+//! The most-significant 8 bits (1 byte) is used to denote the slot index with
+//! the indexmap that contains the entry and the least-significant 24 bits (3 bytes)
+//! is the index into the indexmap where the entry lies. An id value of [`u32::MAX`]
+//! represents an invalid index or an index for a non-existent entry.
+//!
+//! The limitation here is that there can only be a maximum of 255 slots in
+//! use and each slot can only contain a maximum of 2^24 - 1 entries (16777215)
+//! minus 1 for the invalid index [`u32::MAX`].
+//! This should be acceptable because in worst case with only 1 slot in use,
+//! the symbol map still has enough capacity to hold 16777214 unique symbol
+//! names.
+
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     sync::RwLock,
@@ -10,13 +52,13 @@ use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelI
 
 use crate::{
     coff::{ComdatSelection, SectionNumber, StorageClass},
+    fatal,
     inputs::ObjectFileId,
 };
 
 const SLOT_BITS: u32 = 8;
-const SLOT_SHIFT: u32 = 32 - SLOT_BITS;
+const SLOT_SHIFT: u32 = u32::BITS - SLOT_BITS;
 const MAX_SLOTS: usize = 2usize.pow(SLOT_BITS as u32) - 1;
-
 const MAX_INDEX: usize = !((MAX_SLOTS << SLOT_SHIFT) as u32) as usize;
 const INDEX_MASK: u32 = MAX_INDEX as u32;
 
@@ -49,6 +91,16 @@ impl ExternalId {
     }
 
     fn new(slot: usize, idx: usize) -> Self {
+        // Debug assert here because an invalid slot index indicates there is
+        // a bug in the code since this should never occur from external factors.
+        debug_assert!(slot < MAX_SLOTS, "ExternalId slot index >= MAX_SLOTS");
+
+        // Although highly improbable, there is a chance that over 16.7 million
+        // unique symbol names were inserted into a single slot which is a fatal
+        // error.
+        if idx > MAX_INDEX {
+            fatal!("symbol map insertion for slot {slot} overflowed max");
+        }
         Self(((slot as u32) << SLOT_SHIFT) | idx as u32)
     }
 
@@ -112,6 +164,10 @@ impl<'a> Symbol<'a> {
     pub fn is_comdat_leader(&self) -> bool {
         self.selection.is_some()
     }
+
+    pub fn priority(&self) -> u64 {
+        0
+    }
 }
 
 type MapSlot<'a> = IndexMap<&'a [u8], RwLock<Symbol<'a>>>;
@@ -131,15 +187,13 @@ impl<'a> SymbolMap<'a> {
     }
 
     pub fn len(&self) -> usize {
-        self.slots
-            .iter()
-            .fold(0, |acc, slot| acc + slot.read().unwrap().len())
+        self.slots.iter().fold(0, |acc, slot| {
+            acc + slot.read().expect("SymbolMap poisoned").len()
+        })
     }
 
     pub fn get_or_default(&self, name: &'a [u8]) -> ExternalId {
-        let mut h = DefaultHasher::default();
-        h.write(name);
-        let slot_idx = (h.finish() as usize % self.slots.len()) as usize;
+        let slot_idx = self.compute_slot(name);
         let slot_entry = &self.slots[slot_idx];
         let index = {
             let mut slot = slot_entry.write().expect("SymbolMap poisoned");
@@ -149,16 +203,12 @@ impl<'a> SymbolMap<'a> {
             index
         };
 
-        assert!(index <= MAX_INDEX, "SymbolMap overflowed");
         ExternalId::new(slot_idx, index)
     }
 
     pub fn get_exclusive_or_default_new(&mut self, name: &'a [u8]) -> Option<ExternalId> {
-        let mut h = DefaultHasher::default();
-        h.write(name);
-        let slot_idx = (h.finish() as usize % self.slots.len()) as usize;
-
-        let slot = self.slots[slot_idx].get_mut().unwrap();
+        let slot_idx = self.compute_slot(name);
+        let slot = self.slots[slot_idx].get_mut().expect("SymbolMap poisoned");
         let index = match slot.entry(name) {
             Entry::Occupied(_) => return None,
             Entry::Vacant(entry) => {
@@ -167,7 +217,6 @@ impl<'a> SymbolMap<'a> {
             }
         };
 
-        assert!(index <= MAX_INDEX, "SymbolMap overflowed");
         Some(ExternalId::new(slot_idx, index))
     }
 
@@ -176,9 +225,11 @@ impl<'a> SymbolMap<'a> {
             return None;
         }
 
-        let slot = self.slots[symbol.slot()].get_mut().unwrap();
+        let slot = self.slots[symbol.slot()]
+            .get_mut()
+            .expect("SymbolMap poisoned");
         let entry = slot.get_index_mut(symbol.index())?.1;
-        Some(entry.get_mut().unwrap())
+        Some(entry.get_mut().expect("SymbolMap entry poisoned"))
     }
 
     pub fn inspect(&self, symbol: ExternalId, f: impl FnOnce(&RwLock<Symbol<'a>>)) {
@@ -186,7 +237,9 @@ impl<'a> SymbolMap<'a> {
             return;
         }
 
-        let slot = self.slots[symbol.slot()].read().unwrap();
+        let slot = self.slots[symbol.slot()]
+            .read()
+            .expect("SymbolMap poisoned");
         if let Some(entry) = slot.get_index(symbol.index()).map(|entry| entry.1) {
             f(entry);
         }
@@ -194,16 +247,22 @@ impl<'a> SymbolMap<'a> {
 
     pub fn par_for_each(&self, f: impl Fn(&RwLock<Symbol<'a>>) + Send + Sync) {
         self.slots.par_iter().for_each(|slot| {
-            let slot = slot.read().unwrap();
+            let slot = slot.read().expect("SymbolMap poisoned");
             slot.par_values().for_each(|symbol| f(symbol));
         });
     }
 
-    pub fn par_for_each_mut(&mut self, f: impl Fn(&mut Symbol<'a>) + Send + Sync) {
+    pub fn par_for_each_exclusive(&mut self, f: impl Fn(&mut Symbol<'a>) + Send + Sync) {
         self.slots.par_iter_mut().for_each(|slot| {
-            let slot = slot.get_mut().unwrap();
+            let slot = slot.get_mut().expect("SymbolMap poisoned");
             slot.par_values_mut()
-                .for_each(|symbol| f(symbol.get_mut().unwrap()));
+                .for_each(|symbol| f(symbol.get_mut().expect("SymbolMap entry poisoned")));
         });
+    }
+
+    fn compute_slot(&self, name: &[u8]) -> usize {
+        let mut h = DefaultHasher::default();
+        h.write(name);
+        (h.finish() as usize % self.slots.len()) as usize
     }
 }

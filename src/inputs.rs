@@ -1,9 +1,7 @@
-use std::{borrow::Cow, collections::BTreeMap, ffi::OsStr, path::Path, sync::atomic::AtomicBool};
+use std::{borrow::Cow, ffi::OsStr, path::Path, sync::atomic::AtomicBool};
 
-use num_enum::TryFromPrimitive;
 use object::{
-    Object as _, ObjectSection, ObjectSymbol as _, ReadRef, SectionIndex, SymbolIndex, U16Bytes,
-    U32Bytes,
+    Object as _, ObjectSection, ObjectSymbol as _, ReadRef, SectionIndex, U16Bytes, U32Bytes,
     coff::{
         CoffFile, CoffHeader, ImageSymbol, ImportFile, ImportName, ImportType, SectionTable,
         SymbolTable,
@@ -22,8 +20,9 @@ use crate::{
         CoffFlags, ComdatSelection, ImageFileMachine, SectionFlags, SectionNumber, StorageClass,
     },
     context::LinkContext,
-    error,
+    make_error,
     symbols::{ExternalId, Symbol},
+    syncpool::BumpBox,
 };
 
 #[derive(Debug)]
@@ -34,13 +33,28 @@ pub struct InputFile<'a> {
 }
 
 impl<'a> InputFile<'a> {
+    /// Makes a new internal input file
+    pub fn internal() -> InputFile<'a> {
+        InputFile {
+            data: &[],
+            path: Path::new(""),
+            parent: None,
+        }
+    }
+
     pub fn source(&self) -> InputFileSource<'a> {
         self.parent
             .map(|parent| InputFileSource::PathedMember {
                 parent: parent.path,
                 path: self.path,
             })
-            .unwrap_or(InputFileSource::Disk(self.path))
+            .unwrap_or_else(|| {
+                if self.path.as_os_str().is_empty() {
+                    InputFileSource::Internal
+                } else {
+                    InputFileSource::Disk(self.path)
+                }
+            })
     }
 }
 
@@ -115,7 +129,7 @@ pub struct UnknownFileError;
 
 impl std::fmt::Display for UnknownFileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown file type")
+        f.write_str("unknown file type")
     }
 }
 
@@ -206,20 +220,32 @@ impl std::fmt::Display for ShortFileSource<'_> {
     }
 }
 
+/// Id for an object file. This is a tagged index using a `u32`.
+/// - Index 0 is reserved for the internal file used for adding linker-synthesized
+/// sections/symbols.
+/// - [`u32::MAX`] is for an invalid index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectFileId(u32);
 
 impl ObjectFileId {
+    pub const fn internal() -> Self {
+        Self(0)
+    }
+
+    pub const fn is_internal(&self) -> bool {
+        self.0 == Self::internal().0
+    }
+
     pub const fn invalid() -> Self {
-        ObjectFileId(u32::MAX)
+        Self(u32::MAX)
     }
 
     pub const fn is_invalid(&self) -> bool {
-        self.0 == ObjectFileId::invalid().0
+        self.0 == Self::invalid().0
     }
 
     pub fn new(idx: usize) -> Self {
-        let idx: u32 = u32::try_from(idx).unwrap_or_else(|_| panic!("object file ID overflowed"));
+        let idx = u32::try_from(idx).unwrap_or_else(|_| panic!("object file ID overflowed"));
         if idx == u32::MAX {
             panic!("object file ID overflowed");
         }
@@ -237,16 +263,14 @@ pub struct ObjectFile<'a> {
     pub id: ObjectFileId,
     pub file: InputFile<'a>,
     pub lazy: bool,
-    pub reachable: AtomicBool,
+    pub live: AtomicBool,
     pub machine: ImageFileMachine,
     pub characteristics: CoffFlags,
     pub coff_sections: SectionTable<'a>,
     pub coff_symbols: SymbolTable<'a>,
     pub sections: Vec<Option<InputSection<'a>>>,
     pub symbols: Vec<Option<(Symbol<'a>, ExternalId)>>,
-    pub externals: BTreeMap<SymbolIndex, ExternalId>,
     pub has_idata: bool,
-    pub is_short_import: bool,
     pub dll: &'a [u8],
     pub directives: &'a [u8],
 }
@@ -257,16 +281,14 @@ impl<'a> ObjectFile<'a> {
             id,
             file,
             lazy,
-            reachable: false.into(),
+            live: false.into(),
             machine: ImageFileMachine::Unknown,
             characteristics: CoffFlags::empty(),
             coff_sections: Default::default(),
             coff_symbols: Default::default(),
             sections: Vec::new(),
             symbols: Vec::new(),
-            externals: BTreeMap::new(),
             has_idata: false,
-            is_short_import: false,
             dll: &[],
             directives: &[],
         }
@@ -279,7 +301,7 @@ impl<'a> ObjectFile<'a> {
     pub fn identify_coff_machine(data: &'a [u8], offset: u64) -> crate::Result<ImageFileMachine> {
         let machine = data
             .read_at::<U16Bytes<_>>(offset)
-            .map_err(|_| error!("data is not large enough to be a COFF"))?
+            .map_err(|_| make_error!("data is not large enough to be a COFF"))?
             .get(object::LittleEndian);
 
         Ok(ImageFileMachine::try_from(machine)?)
@@ -288,7 +310,7 @@ impl<'a> ObjectFile<'a> {
     pub fn identify_importfile_machine(data: &'a [u8]) -> crate::Result<ImageFileMachine> {
         let machine = data
             .read_at::<U16Bytes<_>>(6)
-            .map_err(|_| error!("data is not large enough to be an import file"))?
+            .map_err(|_| make_error!("data is not large enough to be an import file"))?
             .get(object::LittleEndian);
 
         Ok(ImageFileMachine::try_from(machine)?)
@@ -297,7 +319,7 @@ impl<'a> ObjectFile<'a> {
     pub fn parse_coff(&mut self, ctx: &LinkContext<'a>) -> crate::Result<()> {
         let coff: CoffFile = CoffFile::parse(self.file.data)?;
         let header = coff.coff_header();
-        self.machine = ImageFileMachine::try_from_primitive(header.machine())?;
+        self.machine = ImageFileMachine::try_from(header.machine())?;
         self.characteristics = CoffFlags::from_bits_retain(header.characteristics());
 
         self.coff_sections = coff.coff_section_table();
@@ -323,7 +345,7 @@ impl<'a> ObjectFile<'a> {
 
             if name == b".drectve" {
                 self.directives = coff_section.data().map_err(|_| {
-                    error!("section at index {i}: section data size exceeds file bounds")
+                    make_error!("section at index {i}: section data size exceeds file bounds")
                 })?;
                 continue;
             } else if name == b".llvm_addrsig" || name == b".llvm.call-graph-profile" {
@@ -410,10 +432,8 @@ impl<'a> ObjectFile<'a> {
                             IMAGE_SYM_ABSOLUTE => SectionNumber::Absolute,
                             o => SectionNumber::from(o as u16),
                         },
-                        storage_class: StorageClass::try_from_primitive(
-                            symbol.coff_symbol().storage_class(),
-                        )
-                        .with_context(|| format!("symbol at index {}", symbol.index()))?,
+                        storage_class: StorageClass::try_from(symbol.coff_symbol().storage_class())
+                            .with_context(|| format!("symbol at index {}", symbol.index()))?,
                         typ: symbol.coff_symbol().typ(),
                         owner: self.id,
                         table_index: symbol.index(),
@@ -462,7 +482,7 @@ impl<'a> ObjectFile<'a> {
 
             let section = {
                 let section = self.sections.get_mut(section_index).ok_or_else(|| {
-                    error!(
+                    make_error!(
                         "symbol at index {}: section number is invalid {}",
                         symbol.index(),
                         section_index
@@ -528,7 +548,6 @@ impl<'a> ObjectFile<'a> {
         self.machine = Self::identify_importfile_machine(self.file.data)?;
         self.characteristics = CoffFlags::LineNumsStripped | CoffFlags::Reserved40;
         self.dll = file.dll();
-        self.is_short_import = true;
 
         let bump = ctx.bump_pool.get();
 
@@ -604,8 +623,12 @@ impl<'a> ObjectFile<'a> {
             discarded: AtomicBool::new(false),
         }));
 
+        // TODO: Finish
+
         Ok(())
     }
+
+    pub fn resolve_symbols(&self, ctx: &LinkContext<'a>, objs: &[BumpBox<'a, ObjectFile<'a>>]) {}
 }
 
 #[derive(Debug)]

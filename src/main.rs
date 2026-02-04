@@ -109,6 +109,8 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
         linker.add_root_symbol(&mut ctx, &bump, symbol.as_bytes());
     }
 
+    linker.resolve_symbols(&mut ctx);
+
     if args.options.print_timing {
         let elapsed = std::time::Instant::now() - timer;
         log::info!("link time: {}", elapsed.display());
