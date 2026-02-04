@@ -22,7 +22,7 @@ use crate::{
     },
     context::LinkContext,
     make_error,
-    symbols::{ExternalId, Symbol},
+    symbols::{Symbol, SymbolId},
 };
 
 #[derive(Debug)]
@@ -274,7 +274,7 @@ pub struct ObjectFile<'a> {
     pub coff_sections: SectionTable<'a>,
     pub coff_symbols: SymbolTable<'a>,
     pub sections: Vec<Option<InputSection<'a>>>,
-    pub symbols: Vec<Option<(Symbol<'a>, ExternalId)>>,
+    pub symbols: Vec<Option<(Symbol<'a>, SymbolId)>>,
     pub has_idata: bool,
     pub dll: &'a [u8],
     pub directives: &'a [u8],
@@ -448,7 +448,7 @@ impl<'a> ObjectFile<'a> {
                         table_index: symbol.index(),
                         selection: None,
                     },
-                    ExternalId::invalid(),
+                    SymbolId::invalid(),
                 ));
 
                 let Some(obj_symbol) = &mut self.symbols[symbol.index().0] else {
@@ -540,7 +540,7 @@ impl<'a> ObjectFile<'a> {
             if weak_default.storage_class == StorageClass::External
                 && weak_search == IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY
             {
-                *external_id = ExternalId::invalid();
+                *external_id = SymbolId::invalid();
             } else if weak_default.storage_class != StorageClass::External
                 && (weak_search == IMAGE_WEAK_EXTERN_SEARCH_LIBRARY
                     || weak_search == IMAGE_WEAK_EXTERN_SEARCH_ALIAS)

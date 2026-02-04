@@ -7,7 +7,7 @@
 //! Since the symbol name strings can potentially be very long with C++/Rust name
 //! mangling, the goal here is to use [String interning](https://en.wikipedia.org/wiki/String_interning).
 //! A symbol name should only be added into the symbol map once at the beginning
-//! of the program and a unique [`ExternalId`] value returned is used for later
+//! of the program and a unique [`SymbolId`] value returned is used for later
 //! referencing it. The advantage here is that this id value can be used as a
 //! more efficient reference to a symbol inside the map compared to using a
 //! hash table with symbol names. Doing a lookup by name in a hash table may
@@ -15,7 +15,7 @@
 //! Using an id value to get a symbol does not require handling collisions and
 //! is essentially the same has doing a constant-time array index.
 //!
-//! ## Concurrency
+//! # Concurrency
 //! The symbol map is internally represented as a collection of slots with each
 //! slot containing an [`IndexMap`] wrapped behind a [`RwLock`]. Inserting a
 //! string for the first time will get hashed to determine what slot it should
@@ -26,8 +26,8 @@
 //! RwLock being acquired is "random" when two threads access two separate
 //! entries.
 //!
-//! ## Id tagging
-//! The [`ExternalId`] value is a tagged index that internally uses a `u32`.
+//! # ID Tagging
+//! The [`SymbolId`] value is a tagged index that internally uses a `u32`.
 //! The most-significant 8 bits (1 byte) is used to denote the slot index with
 //! the indexmap that contains the entry and the least-significant 24 bits (3 bytes)
 //! is the index into the indexmap where the entry lies. An id value of [`u32::MAX`]
@@ -64,9 +64,9 @@ const INDEX_MASK: u32 = MAX_INDEX as u32;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct ExternalId(u32);
+pub struct SymbolId(u32);
 
-impl std::fmt::Debug for ExternalId {
+impl std::fmt::Debug for SymbolId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExternalId")
             .field("slot", &self.slot())
@@ -75,19 +75,19 @@ impl std::fmt::Debug for ExternalId {
     }
 }
 
-impl std::default::Default for ExternalId {
+impl std::default::Default for SymbolId {
     fn default() -> Self {
         Self::invalid()
     }
 }
 
-impl ExternalId {
+impl SymbolId {
     pub const fn invalid() -> Self {
         Self(u32::MAX)
     }
 
     pub const fn is_invalid(&self) -> bool {
-        self.0 == ExternalId::invalid().0
+        self.0 == SymbolId::invalid().0
     }
 
     fn new(slot: usize, idx: usize) -> Self {
@@ -192,7 +192,7 @@ impl<'a> SymbolMap<'a> {
         })
     }
 
-    pub fn get_or_default(&self, name: &'a [u8]) -> ExternalId {
+    pub fn get_or_default(&self, name: &'a [u8]) -> SymbolId {
         let slot_idx = self.compute_slot(name);
         let slot_entry = &self.slots[slot_idx];
         let index = {
@@ -203,10 +203,10 @@ impl<'a> SymbolMap<'a> {
             index
         };
 
-        ExternalId::new(slot_idx, index)
+        SymbolId::new(slot_idx, index)
     }
 
-    pub fn get_exclusive_or_default_new(&mut self, name: &'a [u8]) -> Option<ExternalId> {
+    pub fn get_exclusive_or_default_new(&mut self, name: &'a [u8]) -> Option<SymbolId> {
         let slot_idx = self.compute_slot(name);
         let slot = self.slots[slot_idx].get_mut().expect("SymbolMap poisoned");
         let index = match slot.entry(name) {
@@ -217,10 +217,10 @@ impl<'a> SymbolMap<'a> {
             }
         };
 
-        Some(ExternalId::new(slot_idx, index))
+        Some(SymbolId::new(slot_idx, index))
     }
 
-    pub fn get_exclusive(&mut self, symbol: ExternalId) -> Option<&mut Symbol<'a>> {
+    pub fn get_exclusive(&mut self, symbol: SymbolId) -> Option<&mut Symbol<'a>> {
         if symbol.is_invalid() {
             return None;
         }
@@ -232,7 +232,7 @@ impl<'a> SymbolMap<'a> {
         Some(entry.get_mut().expect("SymbolMap entry poisoned"))
     }
 
-    pub fn inspect(&self, symbol: ExternalId, f: impl FnOnce(&RwLock<Symbol<'a>>)) {
+    pub fn inspect(&self, symbol: SymbolId, f: impl FnOnce(&RwLock<Symbol<'a>>)) {
         if symbol.is_invalid() {
             return;
         }

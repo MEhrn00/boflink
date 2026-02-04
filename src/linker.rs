@@ -23,7 +23,7 @@ use crate::{
     fsutils::{UniqueFileExt, UniqueFileId},
     inputs::{FileKind, InputFile, ObjectFile, ObjectFileId},
     make_error,
-    symbols::ExternalId,
+    symbols::SymbolId,
     timing::ScopedTimer,
 };
 
@@ -31,7 +31,7 @@ pub struct Linker<'a> {
     pub architecture: ImageFileMachine,
     strings: ArenaRef<'a, u8>,
     pub objs: Vec<ArenaBox<'a, ObjectFile<'a>>>,
-    pub root_symbols: Vec<ExternalId>,
+    pub root_symbols: Vec<SymbolId>,
 }
 
 impl<'a> Linker<'a> {
