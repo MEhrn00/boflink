@@ -10,7 +10,7 @@ use object::read::archive::ArchiveFile;
 use os_str_bytes::OsStrBytesExt;
 use rayon::{
     Scope,
-    iter::{IntoParallelRefIterator, ParallelIterator},
+    iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator},
 };
 
 use crate::{
@@ -90,6 +90,7 @@ impl<'a> Linker<'a> {
     }
 
     pub fn resolve_symbols(&mut self, ctx: &mut LinkContext<'a>) {
+        let _timer = ScopedTimer::msg("symbol resolution");
         self.objs.par_iter().for_each(|obj| {
             obj.resolve_symbols(ctx, &self.objs);
         });

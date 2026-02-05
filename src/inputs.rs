@@ -1,7 +1,13 @@
-use std::{borrow::Cow, ffi::OsStr, path::Path, sync::atomic::AtomicBool};
+use std::{
+    borrow::Cow,
+    ffi::OsStr,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use object::{
-    Object as _, ObjectSection, ObjectSymbol as _, ReadRef, SectionIndex, U16Bytes, U32Bytes,
+    Object as _, ObjectSection, ObjectSymbol as _, ReadRef, SectionIndex, SymbolIndex, U16Bytes,
+    U32Bytes,
     coff::{
         CoffFile, CoffHeader, ImageSymbol, ImportFile, ImportName, ImportType, SectionTable,
         SymbolTable,
@@ -263,20 +269,54 @@ impl ObjectFileId {
     }
 }
 
+/// An object file being linked.
 #[derive(Debug)]
 pub struct ObjectFile<'a> {
+    /// The id of this file.
     pub id: ObjectFileId,
+
+    /// The file path and data associated with this object file.
     pub file: InputFile<'a>,
+
+    /// If this file was lazy during initialization.
     pub lazy: bool,
+
+    /// If this file is being included.
     pub live: AtomicBool,
+
+    /// The machine file of the file
     pub machine: ImageFileMachine,
+
+    /// The COFF flags
     pub characteristics: CoffFlags,
+
+    /// Raw COFF section headers
     pub coff_sections: SectionTable<'a>,
+
+    /// Raw COFF symbol table
     pub coff_symbols: SymbolTable<'a>,
+
+    /// Input sections from the COFF.
+    ///
+    /// The sections are indexable by symbol section numbers. The first section will
+    /// always be `None` and acts as a section for undefined symbols.
     pub sections: Vec<Option<InputSection<'a>>>,
+
+    /// The COFF symbols
+    ///
+    /// This vec retains the same indicies as the original symbol table.
     pub symbols: Vec<Option<(Symbol<'a>, SymbolId)>>,
+
+    /// If this object file has a .idata section with import information.
     pub has_idata: bool,
+
+    /// The DLL name that the symbols in this file refer to.
+    ///
+    /// This will be set if this object file was created from an import file. It will
+    /// also be set when handling legacy MinGW import files
     pub dll: &'a [u8],
+
+    /// Data from the .drectve section
     pub directives: &'a [u8],
 }
 
@@ -558,7 +598,7 @@ impl<'a> ObjectFile<'a> {
         self.characteristics = CoffFlags::LineNumsStripped | CoffFlags::Reserved40;
         self.dll = file.dll();
 
-        let bump = ctx.string_pool.get();
+        let strings = ctx.string_pool.get();
 
         let import_name = if let ImportName::Name(name) = file.import() {
             name
@@ -582,7 +622,7 @@ impl<'a> ObjectFile<'a> {
             ImportType::Data => ".data",
         };
 
-        let section_name = bump.alloc_bytes(
+        let section_name = strings.alloc_bytes(
             [thunk_section_name.as_bytes(), b"$", import_name]
                 .concat()
                 .as_slice(),
@@ -637,7 +677,31 @@ impl<'a> ObjectFile<'a> {
         Ok(())
     }
 
-    pub fn resolve_symbols(&self, ctx: &LinkContext<'a>, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {}
+    pub fn resolve_symbols(&self, ctx: &LinkContext<'a>, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
+        for (local_symbol, symbol_id) in self.symbols.iter().flatten() {
+            if local_symbol.is_local() || local_symbol.is_undefined() || symbol_id.is_invalid() {
+                continue;
+            }
+
+            let section_index = local_symbol
+                .section
+                .index()
+                .unwrap_or_else(|| unreachable!());
+
+            if let Some(section) = self.sections[section_index.0].as_ref() {
+                if section.discarded.load(Ordering::Relaxed) {
+                    continue;
+                }
+            }
+
+            ctx.symbol_map.inspect(*symbol_id, |global_ref| {
+                let mut global = global_ref.write().unwrap();
+                if local_symbol.should_claim(&global, self.live.load(Ordering::Relaxed), objs) {
+                    local_symbol.claim(&mut global);
+                }
+            });
+        }
+    }
 }
 
 #[derive(Debug)]

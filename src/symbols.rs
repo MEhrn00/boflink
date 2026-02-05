@@ -39,21 +39,46 @@
 //! This should be acceptable because in worst case with only 1 slot in use,
 //! the symbol map still has enough capacity to hold 16777214 unique symbol
 //! names.
+//!
+//! # Symbol Types
+//! The handling of symbol types in the MS COFF/PE spec is a little peculiar.
+//!
+//! Firstly, most tools only use the `IMAGE_SYM_TYPE_NULL` and `IMAGE_SYM_DTYPE_FUNCTION`
+//! values. This largely leaves the rest of the type values unused.
+//!
+//! Secondly, the type representation states that the complex and base types are
+//! the "most significant byte" and "least significant byte" values in the field.
+//! The reality is that these do not refer to the most significant and least
+//! significant "bytes" but instead 4 bit nibbles. The complex type is really
+//! just the upper 4 bits of the base type. This means that only 6 bits of the
+//! entire 2 byte field are actually being used.
+//!
+//! The Microsoft docs also include a clause stating:
+//! "However, other tools can use this field to communicate more information."
+//!
+//! ...so we're going to exploit this and do exactly that.
+//!
+//! The most significant byte (upper 8 bits) of the symbol type are used to store
+//! additional flags during global symbol resolution. These flags will get reset
+//! to the original value in the final COFF. This is done instead of adding an
+//! extra field to help keep the size of the symbol structure small.
 
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     sync::RwLock,
 };
 
+use bitflags::bitflags;
 use crossbeam_utils::CachePadded;
 use indexmap::{IndexMap, map::Entry};
-use object::SymbolIndex;
+use object::{SymbolIndex, pe::IMAGE_SYM_DTYPE_SHIFT};
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
 
 use crate::{
+    arena::ArenaRef,
     coff::{ComdatSelection, SectionNumber, StorageClass},
     fatal,
-    inputs::ObjectFileId,
+    inputs::{ObjectFile, ObjectFileId},
 };
 
 const SLOT_BITS: u32 = 8;
@@ -61,6 +86,9 @@ const SLOT_SHIFT: u32 = u32::BITS - SLOT_BITS;
 const MAX_SLOTS: usize = 2usize.pow(SLOT_BITS as u32) - 1;
 const MAX_INDEX: usize = !((MAX_SLOTS << SLOT_SHIFT) as u32) as usize;
 const INDEX_MASK: u32 = MAX_INDEX as u32;
+
+const GLOBAL_SYMBOL_FLAGS_SHIFT: usize = 8;
+const GLOBAL_SYMBOL_FLAGS_MASK: u16 = 0xff00;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -88,6 +116,10 @@ impl SymbolId {
 
     pub const fn is_invalid(&self) -> bool {
         self.0 == SymbolId::invalid().0
+    }
+
+    pub const fn is_valid(&self) -> bool {
+        !self.is_invalid()
     }
 
     fn new(slot: usize, idx: usize) -> Self {
@@ -141,16 +173,30 @@ impl<'a> std::default::Default for Symbol<'a> {
 }
 
 impl<'a> Symbol<'a> {
+    /// Returns `true` if this is a globally scoped symbol.
+    pub fn is_global(&self) -> bool {
+        self.storage_class == StorageClass::External
+            || self.storage_class == StorageClass::WeakExternal
+    }
+
+    /// Returns `true` if this is a local symbol.
+    pub fn is_local(&self) -> bool {
+        !self.is_global()
+    }
+
+    /// Returns `true` if this is an undefined global symbol.
     pub fn is_undefined(&self) -> bool {
         self.storage_class == StorageClass::External
             && self.section == SectionNumber::Undefined
             && self.value == 0
     }
 
+    /// Returns `true` if this symbol is defined
     pub fn is_defined(&self) -> bool {
         self.section > SectionNumber::Undefined && self.section < SectionNumber::Debug
     }
 
+    /// Returns `true` if this is a COMMON symbol
     pub fn is_common(&self) -> bool {
         self.storage_class == StorageClass::External
             && self.section == SectionNumber::Undefined
@@ -165,8 +211,94 @@ impl<'a> Symbol<'a> {
         self.selection.is_some()
     }
 
-    pub fn priority(&self) -> u64 {
-        0
+    /// Returns `true` if this symbol is imported from a DLL
+    pub fn is_imported(&self) -> bool {
+        self.global_flags().contains(GlobalSymbolFlags::Imported)
+    }
+
+    pub fn set_imported(&mut self, value: bool) {
+        self.set_global_flag(GlobalSymbolFlags::Imported, value);
+    }
+
+    pub fn base_type(&self) -> u16 {
+        self.typ & 0xff
+    }
+
+    pub fn derived_type(&self) -> u16 {
+        // Unset the global symbol flags
+        (self.typ & !GLOBAL_SYMBOL_FLAGS_MASK) >> IMAGE_SYM_DTYPE_SHIFT
+    }
+
+    fn priority(&self, lazy: bool) -> u64 {
+        let mut prio = 7u64;
+        if self.is_defined() && !lazy {
+            prio = 1;
+        } else if self.is_weak() && !lazy {
+            prio = 2;
+        } else if self.is_defined() {
+            prio = 3;
+        } else if self.is_weak() {
+            prio = 4;
+        } else if self.is_common() {
+            prio = 5;
+            if lazy {
+                prio = 6;
+            }
+        }
+        (prio << 31) | self.owner.index() as u64
+    }
+
+    /// Returns `true` if `self` should claim `other`.
+    pub fn should_claim(
+        &self,
+        other: &Symbol,
+        live: bool,
+        objs: &[ArenaRef<'a, ObjectFile<'a>>],
+    ) -> bool {
+        if other.owner.is_invalid() {
+            if self.owner.is_invalid() {
+                return false;
+            }
+
+            return true;
+        }
+
+        self.priority(!live) < other.priority(!objs[self.owner.index()].lazy)
+    }
+
+    /// Copies `self` into `other`
+    pub fn claim(&self, other: &mut Symbol) {
+        other.value = self.value;
+        other.section = self.section;
+        other.storage_class = self.storage_class;
+        other.typ = self.typ;
+        other.owner = self.owner;
+        other.table_index = self.table_index;
+        other.selection = self.selection;
+    }
+
+    const fn global_flags(&self) -> GlobalSymbolFlags {
+        GlobalSymbolFlags::from_bits_retain(
+            ((self.typ & GLOBAL_SYMBOL_FLAGS_MASK) >> GLOBAL_SYMBOL_FLAGS_SHIFT) as u8,
+        )
+    }
+
+    fn set_global_flag(&mut self, flag: GlobalSymbolFlags, state: bool) {
+        let mut flags = self.global_flags();
+        flags.set(flag, state);
+        self.typ |= (flag.bits() as u16) << GLOBAL_SYMBOL_FLAGS_SHIFT
+    }
+}
+
+/// Flags used for global symbols
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+struct GlobalSymbolFlags(u8);
+
+bitflags! {
+    impl GlobalSymbolFlags: u8 {
+        /// Symbol is imported from an import file
+        const Imported = 1;
     }
 }
 
