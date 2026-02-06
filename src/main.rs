@@ -45,6 +45,9 @@ fn main() -> ExitCode {
     } else if args.options.version {
         cli::print_version();
         return ExitCode::SUCCESS;
+    } else if args.options.print_gcc_specs {
+        cli::print_gcc_specs();
+        return ExitCode::SUCCESS;
     }
 
     if args.options.color_used {

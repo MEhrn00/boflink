@@ -1,9 +1,9 @@
 use std::{
     collections::{HashSet, VecDeque},
     ffi::{OsStr, OsString},
+    io::IsTerminal,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use os_str_bytes::OsStrBytesExt;
@@ -55,13 +55,11 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
     --no-merge-bss
   --merge-groups             Alias for --force-group-allocation
     --no-merge-groups
-  --mingw=<executable>       Include MinGW GCC link libraries and search paths from <executable>
-  --mingw32                  Alias for --mingw=i686-w64-mingw32-gcc
-  --mingw64                  Alias for --mingw=x86_64-w64-mingw32-gcc
   -m <emulation>             Set the target emulation [possible values: i386pep, i386pe]
   -o <file>, --output=<file>
                              Path to write the output file [default: a.bof]
   --pop-state                Restore the previous state of positional significant arguments
+  --print-gcc-specs          Print out a GCC spec file for using boflink with MinGW GCC
   --print-gc-sections        Print sections discarded during '--gc-sections'
   --print-stats              Print input statistics
   --print-timing             Print timing information
@@ -75,8 +73,6 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
   --threads=<number>         Number of threads. Defaults to available hardware threads
   -y <symbol>, --trace-symbol=<symbol>
                              Trace mentions of <symbol>
-  --ucrt32                   Alias for --mingw=i686-w64-mingw32ucrt-gcc
-  --ucrt64                   Alias for --mingw=x86_64-w64-mingw32ucrt-gcc
   -u <symbol>, --undefined=<symbol>
                              Start with an undefined reference to <symbol>
   --warn-unresolved-symbols  Report unresolved symbols as warnings
@@ -300,12 +296,12 @@ impl CliArgs {
         while let Some(arg) = arg_iter.next()
             && !self.options.help
             && !self.options.version
+            && !self.options.print_gcc_specs
         {
             let arg = arg.into();
 
             if self.try_update_inputs_from(&arg, arg_iter.by_ref())?
                 || self.options.try_update_from(&arg, arg_iter.by_ref())?
-                || self.try_update_from_mingw_arg(&arg, arg_iter.by_ref())?
             {
             } else {
                 bail!("unknown argument: {}", arg.display());
@@ -374,42 +370,6 @@ impl CliArgs {
 
         Ok(true)
     }
-
-    fn try_update_from_mingw_arg<I>(&mut self, arg: &OsStr, mut it: I) -> crate::Result<bool>
-    where
-        I: Iterator,
-        <I as Iterator>::Item: Into<OsString>,
-    {
-        let mut anyval = |s1, s2| anyval(s1, s2)(arg, it.by_ref());
-        let long_opt = |s| long_opt(s)(arg);
-
-        if let Some(v) = anyval("mingw", "") {
-            let gcc = v?;
-            let args = query_gcc(&gcc).with_context(|| format!("--mingw={}", gcc.display()))?;
-            self.try_update_from(args.into_iter())
-                .with_context(|| format!("handling '--mingw={}' argument", gcc.display()))?;
-        } else if long_opt("mingw64") {
-            let args = query_gcc("x86_64-w64-mingw32-gcc").context("--mingw64")?;
-            self.try_update_from(args.into_iter())
-                .context("handling '--mingw64' argument")?;
-        } else if long_opt("mingw32") {
-            let args = query_gcc("i686-w64-mingw32-gcc").context("--mingw32")?;
-            self.try_update_from(args.into_iter())
-                .context("handling '--mingw32' argument")?;
-        } else if long_opt("ucrt64") {
-            let args = query_gcc("x86_64-w64-mingw32ucrt-gcc").context("--ucrt64")?;
-            self.try_update_from(args.into_iter())
-                .context("handling '--ucrt64' argument")?;
-        } else if long_opt("ucrt32") {
-            let args = query_gcc("i686-w64-mingw32ucrt-gcc").context("--ucrt32")?;
-            self.try_update_from(args.into_iter())
-                .context("handling '--ucrt32' argument")?;
-        } else {
-            return Ok(false);
-        }
-
-        Ok(true)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -458,6 +418,7 @@ pub struct CliOptions {
     pub out_implib: Option<PathBuf>,
     pub plugin: Option<PathBuf>,
     pub plugin_opt: Vec<OsString>,
+    pub print_gcc_specs: bool,
     pub print_gc_sections: bool,
     pub print_timing: bool,
     pub print_stats: bool,
@@ -502,6 +463,7 @@ impl std::default::Default for CliOptions {
             out_implib: None,
             plugin: None,
             plugin_opt: Vec::new(),
+            print_gcc_specs: false,
             print_gc_sections: false,
             print_timing: false,
             print_stats: false,
@@ -630,6 +592,8 @@ impl CliOptions {
             self.plugin = Some(v?.into());
         } else if let Some(v) = anyval("plugin-opt", "-plugin-opt") {
             self.plugin_opt.push(v?);
+        } else if long_opt("print-gcc-specs") {
+            self.print_gcc_specs = true;
         } else if long_opt("print-gc-sections") {
             self.print_gc_sections = true;
         } else if long_opt("print-stats") {
@@ -743,6 +707,27 @@ pub fn log_cmdline(args: &[OsString]) {
     log::info!("command line: {}", args.join(" "));
 }
 
+pub fn print_gcc_specs() {
+    // Print out a header with instructions only if printing to a terminal.
+    // Just print out the raw spec file content if the output is potentially being redirected to a
+    // file.
+    if std::io::stdout().is_terminal() {
+        println!(
+            "# Copy the text below '---' to a file named \"boflink.specs\" and run \"x86_64-w64-mingw32-gcc -specs=boflink.specs ...\"\n---"
+        );
+    }
+
+    let current_exe = std::env::current_exe()
+        .map(|exe| exe.into_os_string())
+        .unwrap_or_else(|_| OsString::from(CARGO_PKG_NAME));
+
+    println!(
+        "*linker:\n\
+        {current_exe}",
+        current_exe = current_exe.display()
+    );
+}
+
 pub fn expand_response_files(cmdline: impl Iterator<Item = OsString>) -> Vec<OsString> {
     let mut expanded = Vec::new();
 
@@ -781,104 +766,4 @@ pub fn expand_response_files(cmdline: impl Iterator<Item = OsString>) -> Vec<OsS
     }
 
     expanded
-}
-
-fn query_gcc(gcc: impl AsRef<OsStr>) -> crate::Result<Vec<OsString>> {
-    let mut args = Vec::new();
-
-    let output = Command::new(gcc.as_ref())
-        .args(["-###", "-nostartfiles", "-fno-lto", "a.o"])
-        .output()
-        .with_context(|| {
-            format!(
-                "failed running '{} -### -nostartfiles -fno-lto a.o'",
-                gcc.as_ref().display()
-            )
-        })?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    for line in stderr.lines() {
-        if let Some(cmdline) = line.strip_prefix(' ') {
-            args.extend(parse_gcc_cmdline(cmdline));
-        }
-    }
-
-    Ok(args)
-}
-
-fn parse_gcc_cmdline(cmdline: &str) -> Vec<OsString> {
-    shell_split(cmdline)
-        .into_iter()
-        .filter_map(|arg| {
-            if arg.starts_with("-l") || arg.starts_with("-L") {
-                Some(arg.into())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn shell_split(cmdline: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-
-    let mut chars = cmdline.chars();
-    let mut state = SplitState::Space;
-    let mut token = String::new();
-    while let Some(ch) = chars.next() {
-        match state {
-            SplitState::Space => {
-                if ch.is_whitespace() {
-                } else if ch == '\\' {
-                    if let Some(ch) = chars.next() {
-                        token.push(ch);
-                    }
-                    state = SplitState::None;
-                } else if ch == '"' || ch == '\'' {
-                    state = SplitState::Quote(ch);
-                } else {
-                    token.push(ch);
-                    state = SplitState::None;
-                }
-            }
-            SplitState::None => {
-                if ch.is_whitespace() {
-                    tokens.push(std::mem::take(&mut token));
-                    state = SplitState::Space;
-                } else if ch == '\\' {
-                    if let Some(ch) = chars.next() {
-                        token.push(ch);
-                    }
-                } else if ch == '"' || ch == '\'' {
-                    state = SplitState::Quote(ch);
-                } else {
-                    token.push(ch);
-                }
-            }
-            SplitState::Quote(q) => {
-                if ch == '\\' {
-                    if let Some(ch) = chars.next() {
-                        token.push(ch);
-                    }
-                } else if ch == q {
-                    state = SplitState::None;
-                } else {
-                    token.push(ch);
-                }
-            }
-        }
-    }
-
-    if !token.is_empty() {
-        tokens.push(token);
-    }
-
-    tokens
-}
-
-enum SplitState {
-    None,
-    Space,
-    Quote(char),
 }
