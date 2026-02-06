@@ -20,9 +20,12 @@ use crate::{
     cli::{InputArg, InputArgContext, InputArgVariant},
     coff::ImageFileMachine,
     context::LinkContext,
-    inputs::{FileKind, InputFile, ObjectFile, ObjectFileId},
+    inputs::{FileKind, InputFile, InputFileSource, ObjectFile, ObjectFileId},
     make_error,
-    stdext::fs::{FileExt, UniqueFileId},
+    stdext::{
+        fs::{FileExt, UniqueFileId},
+        path::PathExt,
+    },
     symbols::{ExclusiveEntry, GlobalSymbol, SymbolId},
     timing::ScopedTimer,
 };
@@ -278,8 +281,8 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     where
         'r: 'scope,
     {
-        if let Some(mapping) = self.map_unique_file(path, file, input_ctx) {
-            let mapping = mapping?;
+        if let Some(mapping) = self.map_unique_file(file, input_ctx) {
+            let mapping = mapping.with_context(|| format!("cannot open {}", path.display()))?;
             ctx.stats.input_files.fetch_add(1, Ordering::Relaxed);
             self.parse_input_file(
                 ctx,
@@ -413,12 +416,26 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
             .with_context(|| format!("cannot parse {}", file.source()))?;
 
         ctx.stats.input_archives.fetch_add(1, Ordering::Relaxed);
-        if archive.is_thin() {
-            return self.parse_thin_archive(ctx, scope, input_ctx, file, archive);
-        }
 
         let file = &*self.store.files.alloc(file);
+        if archive.is_thin() {
+            self.parse_thin_archive_members(ctx, scope, input_ctx, file, archive)
+        } else {
+            self.parse_archive_members(ctx, scope, input_ctx, file, archive)
+        }
+    }
 
+    fn parse_archive_members<'scope>(
+        &mut self,
+        ctx: &'scope LinkContext<'a>,
+        scope: &Scope<'scope>,
+        input_ctx: InputArgContext,
+        file: &'a InputFile<'a>,
+        archive: ArchiveFile<'a>,
+    ) -> crate::Result<()>
+    where
+        'r: 'scope,
+    {
         for member in archive.members() {
             let member = member.with_context(|| format!("cannot parse {}", file.source()))?;
             let offset = member.file_range().0;
@@ -448,21 +465,64 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
                 },
             )?;
         }
+
         Ok(())
     }
 
-    fn parse_thin_archive<'scope>(
+    fn parse_thin_archive_members<'scope>(
         &mut self,
         ctx: &'scope LinkContext<'a>,
         scope: &Scope<'scope>,
         input_ctx: InputArgContext,
-        file: InputFile<'a>,
+        file: &'a InputFile<'a>,
         archive: ArchiveFile<'a>,
     ) -> crate::Result<()>
     where
         'r: 'scope,
     {
-        todo!("thin archives")
+        for member in archive.members() {
+            let member = member.with_context(|| format!("cannot parse {}", file.source()))?;
+            let offset = member.file_range().0;
+            let member_name = std::str::from_utf8(member.name()).map_err(|_| {
+                make_error!(
+                    "cannot parse {}({offset}): member name is not a valid utf8 string",
+                    file.path.display()
+                )
+            })?;
+            let member_path = {
+                let member_path = Path::new(member_name);
+                let normalized = member_path.normalize_lexically_cpp();
+                if normalized == member_path {
+                    member_path
+                } else {
+                    Path::new(*self.strings.alloc_os_str(normalized.as_os_str()))
+                }
+            };
+
+            let source = InputFileSource::Member {
+                archive: file.path,
+                path: member_path,
+            };
+            let disk_path = file.path.join(member_path.normalize_lexically_cpp());
+            let handle = std::fs::File::open(&disk_path)
+                .with_context(|| format!("cannot open {source}: thin archive member"))?;
+            if let Some(mapping) = self.map_unique_file(handle, input_ctx) {
+                let mapping = mapping
+                    .with_context(|| format!("cannot open {source}: thin archive member"))?;
+                self.parse_input_file(
+                    ctx,
+                    scope,
+                    input_ctx,
+                    InputFile {
+                        path: member_path,
+                        parent: Some(file),
+                        data: mapping,
+                    },
+                )?;
+            }
+        }
+
+        Ok(())
     }
 
     fn open_unique_path(
@@ -482,23 +542,19 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
 
     fn map_unique_file(
         &mut self,
-        path: &'a Path,
         file: std::fs::File,
         input_ctx: InputArgContext,
     ) -> Option<crate::Result<&'a Mmap>> {
-        let ufid = match file
-            .unique_id()
-            .with_context(|| format!("cannot open {}", path.display()))
-        {
+        let ufid = match file.unique_id() {
             Ok(ufid) => ufid,
-            Err(e) => return Some(Err(e)),
+            Err(e) => return Some(Err(e.into())),
         };
 
         if self.unique_mappings.insert((ufid, input_ctx)) {
             Some(
                 unsafe { Mmap::map(&file) }
-                    .with_context(|| format!("cannot open {}", path.display()))
-                    .map(|mapping| &*self.store.mappings.alloc(mapping)),
+                    .map(|mapping| &*self.store.mappings.alloc(mapping))
+                    .map_err(crate::Error::from),
             )
         } else {
             None
