@@ -62,16 +62,16 @@ impl ScopedTimer {
 
 impl Drop for ScopedTimer {
     fn drop(&mut self) {
-        if !std::thread::panicking() {
-            if let Some(mut callback) = self.callback.take() {
-                let elapsed = std::time::Instant::now() - self.start;
-                callback(
-                    Emitter {
-                        caller: self.caller,
-                    },
-                    elapsed,
-                )
-            }
+        if !std::thread::panicking()
+            && let Some(mut callback) = self.callback.take()
+        {
+            let elapsed = std::time::Instant::now() - self.start;
+            callback(
+                Emitter {
+                    caller: self.caller,
+                },
+                elapsed,
+            )
         }
     }
 }

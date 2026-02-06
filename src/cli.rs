@@ -201,10 +201,9 @@ where
                     .with_context(|| report_missing_value(arg)),
             );
         } else if let Some((flag, val)) = arg.strip_prefix("--").and_then(|arg| arg.split_once("="))
+            && name == flag
         {
-            if name == flag {
-                return Some(Ok(val.to_owned()));
-            }
+            return Some(Ok(val.to_owned()));
         }
 
         None
@@ -228,10 +227,9 @@ where
                     .with_context(|| report_missing_value(arg)),
             );
         } else if let Some((flag, val)) = arg.strip_prefix('-').and_then(|arg| arg.split_once("="))
+            && name == flag
         {
-            if name == flag {
-                return Some(Ok(val.to_owned()));
-            }
+            return Some(Ok(val.to_owned()));
         }
 
         None
@@ -281,8 +279,8 @@ fn anyopt(short_: char, long_: &str) -> impl for<'a> FnOnce(&'a OsStr) -> bool {
     move |arg| short_opt(short_)(arg) || long_opt(long_)(arg)
 }
 
-fn report_missing_value(arg: impl AsRef<OsStr>) -> String {
-    format!("missing argument value for '{}'", arg.as_ref().display())
+fn report_missing_value(arg: &OsStr) -> String {
+    format!("missing argument value for '{}'", arg.display())
 }
 
 #[derive(Debug, Default)]

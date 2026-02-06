@@ -549,13 +549,12 @@ impl<'a> ObjectFile<'a> {
                 }
             } else if coff_symbol.is_global()
                 && section.characteristics.contains(SectionFlags::LnkComdat)
+                && let Some(aux_section) = comdat_aux[section_index].take()
             {
-                if let Some(aux_section) = comdat_aux[section_index].take() {
-                    local_symbol.selection = Some(
-                        ComdatSelection::try_from(aux_section.selection)
-                            .with_context(|| format!("symbol at index {}", coff_symbol.index()))?,
-                    );
-                }
+                local_symbol.selection = Some(
+                    ComdatSelection::try_from(aux_section.selection)
+                        .with_context(|| format!("symbol at index {}", coff_symbol.index()))?,
+                );
             }
         }
 
@@ -676,10 +675,9 @@ impl<'a> ObjectFile<'a> {
                 .section_number
                 .index()
                 .and_then(|index| self.sections[index.0].as_ref())
+                && section.discarded.load(Ordering::Relaxed)
             {
-                if section.discarded.load(Ordering::Relaxed) {
-                    continue;
-                }
+                continue;
             }
 
             let external_ref = symbol.external_id;
