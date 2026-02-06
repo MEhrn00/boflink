@@ -23,6 +23,7 @@ impl ScopedTimer {
     /// If the thread that handles dropping this timer panics, the callback
     /// function will not be executed.
     #[track_caller]
+    #[allow(unused)]
     pub fn with_callback(f: impl FnMut(Emitter, Duration) + 'static) -> ScopedTimer {
         Self {
             caller: std::panic::Location::caller(),
@@ -45,6 +46,7 @@ impl ScopedTimer {
     }
 
     /// Stops the timer and executes the passed in callback function.
+    #[allow(unused)]
     pub fn stop(mut self) {
         let elapsed = std::time::Instant::now() - self.start;
         if let Some(mut callback) = self.callback.take() {
@@ -60,16 +62,16 @@ impl ScopedTimer {
 
 impl Drop for ScopedTimer {
     fn drop(&mut self) {
-        if !std::thread::panicking()
-            && let Some(mut callback) = self.callback.take()
-        {
-            let elapsed = std::time::Instant::now() - self.start;
-            callback(
-                Emitter {
-                    caller: self.caller,
-                },
-                elapsed,
-            )
+        if !std::thread::panicking() {
+            if let Some(mut callback) = self.callback.take() {
+                let elapsed = std::time::Instant::now() - self.start;
+                callback(
+                    Emitter {
+                        caller: self.caller,
+                    },
+                    elapsed,
+                )
+            }
         }
     }
 }
