@@ -6,7 +6,7 @@ name = "boflink"
 version = "0.6.2"
 authors = ["Matt Ehrnschwender <matthewe2020@gmail.com>"]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.91"
 description = """
 Linker for Beacon Object Files.
 """

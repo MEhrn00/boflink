@@ -513,11 +513,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     ) -> Option<crate::Result<(PathBuf, std::fs::File)>> {
         if self.unique_libraries.insert((name, input_ctx)) {
             let found = find_library(&ctx.options.library_path, input_ctx.in_static, name);
-            Some(
-                found.with_context(|| {
-                    format!("unable to find library -l{}", name.to_string_lossy())
-                }),
-            )
+            Some(found.with_context(|| format!("unable to find library -l{}", name.display())))
         } else {
             None
         }

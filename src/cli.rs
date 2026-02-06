@@ -282,10 +282,7 @@ fn anyopt(short_: char, long_: &str) -> impl for<'a> FnOnce(&'a OsStr) -> bool {
 }
 
 fn report_missing_value(arg: impl AsRef<OsStr>) -> String {
-    format!(
-        "missing argument value for '{}'",
-        arg.as_ref().to_string_lossy()
-    )
+    format!("missing argument value for '{}'", arg.as_ref().display())
 }
 
 #[derive(Debug, Default)]
@@ -313,7 +310,7 @@ impl CliArgs {
                 || self.try_update_from_mingw_arg(&arg, arg_iter.by_ref())?
             {
             } else {
-                bail!("unknown argument: {}", arg.to_string_lossy());
+                bail!("unknown argument: {}", arg.display());
             }
         }
 
@@ -390,11 +387,9 @@ impl CliArgs {
 
         if let Some(v) = anyval("mingw", "") {
             let gcc = v?;
-            let args =
-                query_gcc(&gcc).with_context(|| format!("--mingw={}", gcc.to_string_lossy()))?;
-            self.try_update_from(args.into_iter()).with_context(|| {
-                format!("handling '--mingw={}' argument", gcc.to_string_lossy())
-            })?;
+            let args = query_gcc(&gcc).with_context(|| format!("--mingw={}", gcc.display()))?;
+            self.try_update_from(args.into_iter())
+                .with_context(|| format!("handling '--mingw={}' argument", gcc.display()))?;
         } else if long_opt("mingw64") {
             let args = query_gcc("x86_64-w64-mingw32-gcc").context("--mingw64")?;
             self.try_update_from(args.into_iter())
@@ -545,22 +540,14 @@ impl CliOptions {
             self.auto_image_base = false;
         } else if let Some(v) = anyval("color", "") {
             let v = v?;
-            self.color_diagnostics = ColorOption::parse(&v, true).with_context(|| {
-                format!(
-                    "unknown '--color-diagnostics' value: {}",
-                    v.to_string_lossy()
-                )
-            })?;
+            self.color_diagnostics = ColorOption::parse(&v, true)
+                .with_context(|| format!("unknown '--color-diagnostics' value: {}", v.display()))?;
             self.color_used = true;
         } else if long_opt("color-diagnostics") {
             self.color_diagnostics = ColorOption::Auto;
         } else if let Some(v) = arg.strip_prefix("--color-diagnostics=") {
-            self.color_diagnostics = ColorOption::parse(v, true).with_context(|| {
-                format!(
-                    "unknown '--color-diagnostics' value: {}",
-                    v.to_string_lossy()
-                )
-            })?;
+            self.color_diagnostics = ColorOption::parse(v, true)
+                .with_context(|| format!("unknown '--color-diagnostics' value: {}", v.display()))?;
         } else if let Some(v) = anyval("custom-api", "api") {
             self.custom_api = Some(v?);
         } else if let Some(v) = long_bool("define-common") {
@@ -605,9 +592,10 @@ impl CliOptions {
                 .push(Path::new(&v).normalize_lexically_cpp());
         } else if let Some(v) = anyval("m", "") {
             let v = v?;
-            self.machine = Some(Emulation::parse(&v).with_context(|| {
-                format!("unknown emulation '-m' value: {}", v.to_string_lossy())
-            })?);
+            self.machine = Some(
+                Emulation::parse(&v)
+                    .with_context(|| format!("unknown emulation '-m' value: {}", v.display()))?,
+            );
         } else if let Some(v) = anyval("major-image-version", "") {
             self.major_image_version = v?
                 .to_str()
@@ -782,9 +770,9 @@ pub fn expand_response_files(cmdline: impl Iterator<Item = OsString>) -> Vec<OsS
 
                 visited.insert(path.clone());
                 let Ok(content) = std::fs::read_to_string(&path) else {
-                    args.push_front(argfile::Argument::PassThrough(
-                        format!("@{}", path.to_string_lossy()).into(),
-                    ));
+                    let mut resp_arg = OsString::from("@");
+                    resp_arg.push(path.as_os_str());
+                    args.push_front(argfile::Argument::PassThrough(resp_arg));
                     continue;
                 };
 
@@ -806,7 +794,7 @@ fn query_gcc(gcc: impl AsRef<OsStr>) -> crate::Result<Vec<OsString>> {
         .with_context(|| {
             format!(
                 "failed running '{} -### -nostartfiles -fno-lto a.o'",
-                gcc.as_ref().to_string_lossy()
+                gcc.as_ref().display()
             )
         })?;
 

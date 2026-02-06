@@ -60,11 +60,11 @@ pub fn run_echo<I: IntoIterator<Item = S>, S: AsRef<OsStr>>(
         .file_name()
         .unwrap_or_else(|| prog.as_ref());
 
-    print!("{}", prog_exe.to_string_lossy());
+    print!("{}", prog_exe.display());
 
     if !args.is_empty() {
         for arg in &args {
-            print!(" {}", arg.as_ref().to_string_lossy());
+            print!(" {}", arg.as_ref().display());
         }
     }
 

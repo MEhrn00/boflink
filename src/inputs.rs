@@ -141,14 +141,9 @@ impl std::fmt::Display for ShortInputFileSource<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Internal => write!(f, "<internal>"),
-            Self::Disk(file) => write!(f, "{}", file.to_string_lossy()),
+            Self::Disk(file) => write!(f, "{}", file.display()),
             Self::Member { archive, filename } => {
-                write!(
-                    f,
-                    "{}({})",
-                    archive.to_string_lossy(),
-                    filename.to_string_lossy()
-                )
+                write!(f, "{}({})", archive.display(), filename.display())
             }
         }
     }
