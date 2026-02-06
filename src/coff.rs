@@ -210,6 +210,9 @@ bitflags! {
         const RelocsStripped = IMAGE_FILE_RELOCS_STRIPPED;
         const LineNumsStripped = IMAGE_FILE_LINE_NUMS_STRIPPED;
         const Reserved40 = 0x40;
+
+        // Allow externally set flags
+        const _ = !0;
     }
 }
 
@@ -235,42 +238,49 @@ bitflags! {
         const MemExecute = IMAGE_SCN_MEM_EXECUTE;
         const MemRead = IMAGE_SCN_MEM_READ;
         const MemWrite = IMAGE_SCN_MEM_WRITE;
+
+        // Allow externally set flags
+        const _ = !0;
     }
 }
 
-/// A section **number** for a symbol
+/// A section **number** for a symbol.
 ///
-/// The section number is used to denote undefined, absolute, or debug symbols
-/// while also containing the section for a symbol definition.
+/// Section numbers a little confusing because certain values are not used as
+/// section indicies but for denoting the type of symbol definition. Section
+/// numbers also refer to 1-based indicies if the symbol is defined.
 ///
-/// Section references in the symbol table are 1-based indicies instead of 0-based.
-/// This is used to help prevent issues when using these section references to
-/// index into the symbol table.
+/// Section handling follows similarly to how ELF handles sections.
+/// Section initialization will create an empty section at index 0 that acts
+/// as an `SHT_NULL` section. Indexing into the section table can be done directly
+/// using the number value after checking if it is negative since the NULL section
+/// will just be empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct SectionNumber(u16);
+pub struct SectionNumber(i32);
 
 #[allow(non_upper_case_globals)]
 impl SectionNumber {
     pub const Undefined: Self = Self(0);
-    pub const Absolute: Self = Self(u16::MAX - 1);
-    pub const Debug: Self = Self(u16::MAX - 2);
+    pub const Absolute: Self = Self(-1);
+    pub const Debug: Self = Self(-2);
 }
 
-impl From<u16> for SectionNumber {
-    fn from(value: u16) -> Self {
+impl From<i32> for SectionNumber {
+    fn from(value: i32) -> Self {
         Self(value)
     }
 }
 
 impl SectionNumber {
-    pub const fn as_u16(self) -> u16 {
+    pub const fn as_i32(self) -> i32 {
         self.0
     }
 
+    /// Returns the 1-based section index if the section number refers to a section
     pub const fn index(self) -> Option<SectionIndex> {
-        if self.0 > Self::Undefined.0 && self.0 < Self::Debug.0 {
-            Some(SectionIndex((self.0 - 1) as usize))
+        if self.0 > 0 {
+            Some(SectionIndex(self.0 as usize))
         } else {
             None
         }
@@ -394,6 +404,18 @@ impl TryFrom<u8> for ComdatSelection {
     }
 }
 
+impl From<ComdatSelection> for u8 {
+    fn from(value: ComdatSelection) -> Self {
+        match value {
+            ComdatSelection::NoDuplicates => IMAGE_COMDAT_SELECT_NODUPLICATES,
+            ComdatSelection::Any => IMAGE_COMDAT_SELECT_ANY,
+            ComdatSelection::SameSize => IMAGE_COMDAT_SELECT_SAME_SIZE,
+            ComdatSelection::ExactMatch => IMAGE_COMDAT_SELECT_EXACT_MATCH,
+            ComdatSelection::Largest => IMAGE_COMDAT_SELECT_LARGEST,
+        }
+    }
+}
+
 /// @feat.00 symbol flags.
 ///
 /// Flags are from
@@ -421,6 +443,9 @@ bitflags! {
 
         /// Object was compiled with /kernel.
         const Kernel = 0x40000000;
+
+        // Allow externally set flags
+        const _ = !0;
     }
 }
 

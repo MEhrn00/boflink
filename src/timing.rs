@@ -88,6 +88,7 @@ impl Emitter {
         let record = RecordBuilder::new()
             .args(args)
             .level(log::Level::Trace)
+            .target("boflink::timing")
             .file(Some(self.caller.file()))
             .line(Some(self.caller.line()))
             .build();

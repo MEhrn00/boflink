@@ -23,7 +23,7 @@ use crate::{
     fsutils::{UniqueFileExt, UniqueFileId},
     inputs::{FileKind, InputFile, ObjectFile, ObjectFileId},
     make_error,
-    symbols::SymbolId,
+    symbols::{ExclusiveEntry, GlobalSymbol, SymbolId},
     timing::ScopedTimer,
 };
 
@@ -81,19 +81,99 @@ impl<'a> Linker<'a> {
     }
 
     pub fn add_root_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
-        if let Some(symbol) = ctx
-            .symbol_map
-            .get_exclusive_or_default_new(self.mangle(name))
+        if let ExclusiveEntry::Vacant(entry) = ctx.symbol_map.get_exclusive_entry(self.mangle(name))
         {
-            self.root_symbols.push(symbol);
+            let symbol = entry.insert_default();
+            self.root_symbols.push(symbol.id());
         }
+    }
+
+    pub fn add_traced_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
+        let symbol = ctx
+            .symbol_map
+            .get_exclusive_entry(self.mangle(name))
+            .or_default();
+        symbol.traced = true;
     }
 
     pub fn resolve_symbols(&mut self, ctx: &mut LinkContext<'a>) {
         let _timer = ScopedTimer::msg("symbol resolution");
+
+        // First symbol resolution round is used to populate the global symbol map
+        // with symbol information and figure out which object file should claim
+        // the symbol. All object files are in a lazy state which means that only
+        // the input order is used to figure out which object file should be
+        // the owner of a duplicate symbol
         self.objs.par_iter().for_each(|obj| {
             obj.resolve_symbols(ctx, &self.objs);
         });
+
+        // Include object files if they have a definition for a needed symbol
+        // from command line args (--entry, --require-defined, --undefined).
+        for root_symbol in self.root_symbols.iter().copied() {
+            let symbol = ctx.symbol_map.get_exclusive_symbol(root_symbol).unwrap();
+            if let Some(owner) = symbol.owner.index() {
+                *self.objs[owner].live.get_mut() = true;
+            }
+        }
+
+        // Collect the list of "primary" object files. These are either object
+        // files that are included from command line input files or needed objects
+        // from root symbols
+        let primary_objs = self
+            .objs
+            .par_iter_mut()
+            .filter_map(|obj| {
+                // Set command line input object files or `--whole-archive` members
+                // as live
+                if !obj.lazy {
+                    *obj.live.get_mut() = true;
+                }
+
+                (*obj.live.get_mut() == true).then_some(obj.id)
+            })
+            .collect::<Vec<_>>();
+
+        // Go through the primary object files and do a DFS pass over all the
+        // undefined symbols to include additional object files that have definitions
+        // for these needed symbols
+        rayon::in_place_scope(|scope| {
+            primary_objs.par_iter().for_each(|id| {
+                let obj = &self.objs[id.index().unwrap()];
+                obj.include_needed_objects(ctx, &self.objs, scope);
+            });
+        });
+
+        // Redo symbol resolution from a clean slate only with the selected
+        // object files. The first symbol resolution round only selected symbol
+        // definitions based on input ordering. Now that the list of needed object
+        // files is known, duplicate symbols may have been claimed by files
+        // specified earlier on the command line while the real definition
+        // being used is from a later file and needs to be set properly
+        ctx.symbol_map.par_for_each_exclusive(|symbol| {
+            let name = symbol.name;
+            let traced = symbol.traced;
+            *symbol = GlobalSymbol::default();
+            symbol.name = name;
+            symbol.traced = traced;
+        });
+
+        self.objs.par_iter().for_each(|obj| {
+            if obj.live.load(Ordering::Relaxed) {
+                obj.resolve_symbols(ctx, &self.objs);
+            }
+        });
+
+        if log::log_enabled!(logger: &*ctx, log::Level::Trace) {
+            let live_count = self
+                .objs
+                .par_iter_mut()
+                .map(|obj| *obj.live.get_mut())
+                .filter(|live| *live)
+                .count();
+
+            log::trace!("found {live_count} live objects after symbol resolution");
+        }
     }
 }
 

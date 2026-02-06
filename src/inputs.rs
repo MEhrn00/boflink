@@ -14,11 +14,11 @@ use object::{
     },
     pe::{
         self, IMAGE_COMDAT_SELECT_ASSOCIATIVE, IMAGE_REL_AMD64_REL32, IMAGE_REL_I386_DIR32,
-        IMAGE_SYM_ABSOLUTE, IMAGE_SYM_CLASS_FILE, IMAGE_SYM_DEBUG, IMAGE_SYM_UNDEFINED,
-        IMAGE_WEAK_EXTERN_SEARCH_ALIAS, IMAGE_WEAK_EXTERN_SEARCH_LIBRARY,
+        IMAGE_SYM_CLASS_FILE, IMAGE_WEAK_EXTERN_SEARCH_ALIAS, IMAGE_WEAK_EXTERN_SEARCH_LIBRARY,
         IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY, ImageAuxSymbolSection,
     },
 };
+use rayon::Scope;
 
 use crate::{
     ErrorContext,
@@ -28,7 +28,7 @@ use crate::{
     },
     context::LinkContext,
     make_error,
-    symbols::{Symbol, SymbolId},
+    symbols::{SymbolId, SymbolKind, SymbolPriority},
 };
 
 #[derive(Debug)]
@@ -255,6 +255,10 @@ impl ObjectFileId {
         self.0 == Self::invalid().0
     }
 
+    pub const fn is_valid(&self) -> bool {
+        !self.is_invalid()
+    }
+
     pub fn new(idx: usize) -> Self {
         let idx = u32::try_from(idx).unwrap_or_else(|_| panic!("object file ID overflowed"));
         if idx == u32::MAX {
@@ -264,8 +268,12 @@ impl ObjectFileId {
         Self(idx)
     }
 
-    pub fn index(self) -> usize {
-        self.0 as usize
+    pub const fn index(self) -> Option<usize> {
+        if self.is_valid() {
+            Some(self.0 as usize)
+        } else {
+            None
+        }
     }
 }
 
@@ -305,10 +313,7 @@ pub struct ObjectFile<'a> {
     /// The COFF symbols
     ///
     /// This vec retains the same indicies as the original symbol table.
-    pub symbols: Vec<Option<(Symbol<'a>, SymbolId)>>,
-
-    /// If this object file has a .idata section with import information.
-    pub has_idata: bool,
+    pub symbols: Vec<Option<InputSymbol<'a>>>,
 
     /// The DLL name that the symbols in this file refer to.
     ///
@@ -337,7 +342,6 @@ impl<'a> ObjectFile<'a> {
             coff_symbols: Default::default(),
             sections: Vec::new(),
             symbols: Vec::new(),
-            has_idata: false,
             dll: &[],
             directives: &[],
         }
@@ -440,10 +444,6 @@ impl<'a> ObjectFile<'a> {
                 associative: None,
                 discarded: AtomicBool::new(false),
             });
-
-            if name == b".idata" || name.starts_with(b".idata$") {
-                self.has_idata = true;
-            }
         }
 
         Ok(())
@@ -461,51 +461,44 @@ impl<'a> ObjectFile<'a> {
 
         let mut pending_weak = Vec::new();
 
-        for symbol in coff.symbols() {
-            if symbol.coff_symbol().storage_class() == IMAGE_SYM_CLASS_FILE {
+        for coff_symbol in coff.symbols() {
+            if coff_symbol.coff_symbol().storage_class() == IMAGE_SYM_CLASS_FILE {
                 continue;
             }
 
-            let name = symbol
+            let name = coff_symbol
                 .name_bytes()
-                .with_context(|| format!("symbol at index {}", symbol.index()))?;
+                .with_context(|| format!("symbol at index {}", coff_symbol.index()))?;
 
-            let (obj_symbol, external_id) = {
-                self.symbols[symbol.index().0] = Some((
-                    Symbol {
-                        name,
-                        value: symbol.coff_symbol().value(),
-                        section: match symbol.coff_symbol().section_number() {
-                            IMAGE_SYM_UNDEFINED => SectionNumber::Undefined,
-                            IMAGE_SYM_DEBUG => SectionNumber::Debug,
-                            IMAGE_SYM_ABSOLUTE => SectionNumber::Absolute,
-                            o => SectionNumber::from(o as u16),
-                        },
-                        storage_class: StorageClass::try_from(symbol.coff_symbol().storage_class())
-                            .with_context(|| format!("symbol at index {}", symbol.index()))?,
-                        typ: symbol.coff_symbol().typ(),
-                        owner: self.id,
-                        table_index: symbol.index(),
-                        selection: None,
-                    },
-                    SymbolId::invalid(),
-                ));
-
-                let Some(obj_symbol) = &mut self.symbols[symbol.index().0] else {
-                    unreachable!();
+            let local_symbol = {
+                let index = coff_symbol.index();
+                let coff_symbol = coff_symbol.coff_symbol();
+                let local_symbol = InputSymbol {
+                    name,
+                    index,
+                    value: coff_symbol.value(),
+                    section_number: coff_symbol.section_number().into(),
+                    storage_class: coff_symbol
+                        .storage_class()
+                        .try_into()
+                        .with_context(|| format!("symbol at index {index}"))?,
+                    selection: None,
+                    typ: coff_symbol.typ(),
+                    external_id: SymbolId::invalid(),
                 };
-                obj_symbol
+                self.symbols[index.0] = Some(local_symbol);
+                self.symbols[index.0].as_mut().unwrap()
             };
 
-            if symbol.is_global() {
-                *external_id = ctx.symbol_map.get_or_default(name);
+            if coff_symbol.is_global() {
+                local_symbol.external_id = ctx.symbol_map.get_or_create_default(name);
             }
 
-            if symbol.is_weak() {
+            if coff_symbol.is_weak() {
                 let weak_aux = self
                     .coff_symbols
-                    .aux_weak_external(symbol.index())
-                    .with_context(|| format!("symbol at index {}", symbol.index()))?;
+                    .aux_weak_external(coff_symbol.index())
+                    .with_context(|| format!("symbol at index {}", coff_symbol.index()))?;
 
                 let default_idx = weak_aux.default_symbol();
 
@@ -517,7 +510,7 @@ impl<'a> ObjectFile<'a> {
 
                 if (weak_default.is_global() && weak_search == IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY)
                     || (weak_default.is_local() && weak_search == IMAGE_WEAK_EXTERN_SEARCH_LIBRARY)
-                    || (symbol.is_global()
+                    || (coff_symbol.is_global()
                         && weak_default.is_local()
                         && weak_search == IMAGE_WEAK_EXTERN_SEARCH_ALIAS)
                 {
@@ -525,7 +518,7 @@ impl<'a> ObjectFile<'a> {
                 }
             }
 
-            let Some(section_index) = symbol.section_index().map(|index| index.0 - 1) else {
+            let Some(section_index) = coff_symbol.section_index().map(|index| index.0 - 1) else {
                 continue;
             };
 
@@ -533,7 +526,7 @@ impl<'a> ObjectFile<'a> {
                 let section = self.sections.get_mut(section_index).ok_or_else(|| {
                     make_error!(
                         "symbol at index {}: section number is invalid {}",
-                        symbol.index(),
+                        coff_symbol.index(),
                         section_index
                     )
                 })?;
@@ -544,11 +537,11 @@ impl<'a> ObjectFile<'a> {
                 section
             };
 
-            if symbol.coff_symbol().has_aux_section() {
+            if coff_symbol.coff_symbol().has_aux_section() {
                 let aux_section = self
                     .coff_symbols
-                    .aux_section(symbol.index())
-                    .with_context(|| format!("symbol at index {}", symbol.index()))?;
+                    .aux_section(coff_symbol.index())
+                    .with_context(|| format!("symbol at index {}", coff_symbol.index()))?;
                 section.length = aux_section.length.get(object::LittleEndian);
                 section.checksum = aux_section.check_sum.get(object::LittleEndian);
 
@@ -559,20 +552,20 @@ impl<'a> ObjectFile<'a> {
                 } else if section.characteristics.contains(SectionFlags::LnkComdat) {
                     comdat_aux[section_index] = Some(aux_section);
                 }
-            } else if symbol.is_global()
+            } else if coff_symbol.is_global()
                 && section.characteristics.contains(SectionFlags::LnkComdat)
             {
                 if let Some(aux_section) = comdat_aux[section_index].take() {
-                    obj_symbol.selection = Some(
+                    local_symbol.selection = Some(
                         ComdatSelection::try_from(aux_section.selection)
-                            .with_context(|| format!("symbol at index {}", symbol.index()))?,
+                            .with_context(|| format!("symbol at index {}", coff_symbol.index()))?,
                     );
                 }
             }
         }
 
         for (default_idx, weak_aux) in pending_weak {
-            let Some((weak_default, external_id)) = &mut self.symbols[default_idx] else {
+            let Some(weak_default) = &mut self.symbols[default_idx] else {
                 unreachable!();
             };
 
@@ -580,12 +573,12 @@ impl<'a> ObjectFile<'a> {
             if weak_default.storage_class == StorageClass::External
                 && weak_search == IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY
             {
-                *external_id = SymbolId::invalid();
+                weak_default.external_id = SymbolId::invalid();
             } else if weak_default.storage_class != StorageClass::External
                 && (weak_search == IMAGE_WEAK_EXTERN_SEARCH_LIBRARY
                     || weak_search == IMAGE_WEAK_EXTERN_SEARCH_ALIAS)
             {
-                *external_id = ctx.symbol_map.get_or_default(weak_default.name);
+                weak_default.external_id = ctx.symbol_map.get_or_create_default(weak_default.name);
             }
         }
 
@@ -678,29 +671,93 @@ impl<'a> ObjectFile<'a> {
     }
 
     pub fn resolve_symbols(&self, ctx: &LinkContext<'a>, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
-        for (local_symbol, symbol_id) in self.symbols.iter().flatten() {
-            if local_symbol.is_local() || local_symbol.is_undefined() || symbol_id.is_invalid() {
+        let live = self.live.load(Ordering::Relaxed);
+        for symbol in self.symbols.iter().flatten() {
+            if symbol.is_local() || symbol.is_undefined() {
                 continue;
             }
 
-            let section_index = local_symbol
-                .section
+            if let Some(section) = symbol
+                .section_number
                 .index()
-                .unwrap_or_else(|| unreachable!());
-
-            if let Some(section) = self.sections[section_index.0].as_ref() {
+                .and_then(|index| self.sections[index.0].as_ref())
+            {
                 if section.discarded.load(Ordering::Relaxed) {
                     continue;
                 }
             }
 
-            ctx.symbol_map.inspect(*symbol_id, |global_ref| {
+            let external_ref = symbol.external_id;
+            ctx.symbol_map.inspect(external_ref, |global_ref| {
                 let mut global = global_ref.write().unwrap();
-                if local_symbol.should_claim(&global, self.live.load(Ordering::Relaxed), objs) {
-                    local_symbol.claim(&mut global);
+                if symbol.priority(live, self.id) < global.priority(objs) {
+                    global.value = symbol.value;
+                    global.section_number = symbol.section_number;
+                    global.storage_class = symbol.storage_class;
+                    global.index = symbol.index;
+                    global.owner = self.id;
                 }
             });
         }
+    }
+
+    pub fn include_needed_objects<'scope>(
+        &self,
+        ctx: &'scope LinkContext<'a>,
+        objs: &'scope [ArenaRef<'a, ObjectFile<'a>>],
+        scope: &Scope<'scope>,
+    ) where
+        'a: 'scope,
+    {
+        assert!(self.live.load(Ordering::Relaxed));
+        for symbol in self.symbols.iter().flatten() {
+            if symbol.is_local() {
+                continue;
+            }
+
+            let external_ref = symbol.external_id;
+            ctx.symbol_map.inspect(external_ref, |global_ref| {
+                let global = global_ref.read().unwrap();
+
+                if global.traced {
+                    if symbol.is_defined() {
+                        log::info!(logger: ctx, "{}: definition of {}", self.source(), global.demangle(ctx, self.machine));
+                    } else if symbol.is_weak_external() {
+                        log::info!(logger: ctx, "{}: weak external for {}", self.source(), global.demangle(ctx, self.machine));
+                    } else {
+                        log::info!(logger: ctx, "{}: reference to {}", self.source(), global.demangle(ctx, self.machine));
+                    }
+                }
+
+                let Some(owner) = global.owner.index().map(|index| &objs[index]) else {
+                    return;
+                };
+
+                let symbol_is_needed = symbol.is_undefined() || symbol.is_common();
+                let should_visit = |obj: &ArenaRef<'a, ObjectFile>| {
+                    obj.live
+                        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .map(|live| !live)
+                        .unwrap_or(false)
+                };
+
+                if symbol_is_needed && should_visit(owner) {
+                    if global.traced {
+                        log::info!(logger: ctx, "{}: needs {} from {}", self.source(), global.demangle(ctx, self.machine), owner.source());
+                    }
+
+                    scope.spawn(move |scope| {
+                        owner.include_needed_objects(ctx, objs, scope);
+                    });
+                }
+            });
+        }
+    }
+
+    pub fn input_section(&self, index: SectionIndex) -> Option<&InputSection<'a>> {
+        self.sections
+            .get(index.0)
+            .and_then(|section| section.as_ref())
     }
 }
 
@@ -714,4 +771,73 @@ pub struct InputSection<'a> {
     pub coff_relocs: Cow<'a, [pe::ImageRelocation]>,
     pub associative: Option<SectionIndex>,
     pub discarded: AtomicBool,
+}
+
+#[derive(Debug)]
+pub struct InputSymbol<'a> {
+    pub name: &'a [u8],
+    pub value: u32,
+    pub section_number: SectionNumber,
+    pub storage_class: StorageClass,
+    pub typ: u16,
+    pub selection: Option<ComdatSelection>,
+    pub index: SymbolIndex,
+    pub external_id: SymbolId,
+}
+
+impl<'a> InputSymbol<'a> {
+    /// Returns `true` if this is a globally scoped symbol.
+    pub fn is_global(&self) -> bool {
+        self.storage_class == StorageClass::External
+            || self.storage_class == StorageClass::WeakExternal
+    }
+
+    /// Returns `true` if this is a local symbol.
+    pub fn is_local(&self) -> bool {
+        !self.is_global()
+    }
+
+    /// Returns `true` if this is an undefined global symbol.
+    pub fn is_undefined(&self) -> bool {
+        self.storage_class == StorageClass::External
+            && self.section_number == SectionNumber::Undefined
+            && self.value == 0
+    }
+
+    /// Returns `true` if this symbol is defined.
+    ///
+    /// This only returns `true` for symbols with external or static storage
+    /// class
+    pub fn is_defined(&self) -> bool {
+        self.section_number > SectionNumber::Undefined
+            && (self.is_global() || self.storage_class == StorageClass::Static)
+    }
+
+    /// Returns `true` if this is a COMMON symbol
+    pub fn is_common(&self) -> bool {
+        self.storage_class == StorageClass::External
+            && self.section_number == SectionNumber::Undefined
+            && self.value != 0
+    }
+
+    /// Returns `true` if this is a weak external symbol
+    pub fn is_weak_external(&self) -> bool {
+        self.storage_class == StorageClass::WeakExternal
+    }
+
+    pub fn kind(&self) -> SymbolKind {
+        if self.is_defined() {
+            SymbolKind::Defined
+        } else if self.is_weak_external() {
+            SymbolKind::Weak
+        } else if self.is_common() {
+            SymbolKind::Common
+        } else {
+            SymbolKind::Unknown
+        }
+    }
+
+    pub fn priority(&self, live: bool, id: ObjectFileId) -> SymbolPriority {
+        SymbolPriority::new(id, self.kind(), live)
+    }
 }

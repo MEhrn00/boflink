@@ -106,12 +106,18 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
 
     *ctx.stats.global_symbols.get_mut() = ctx.symbol_map.len();
 
+    // Add entrypoint, require defined and undefined GC roots
     for symbol in [&args.options.entry]
         .into_iter()
         .chain(args.options.require_defined.iter())
         .chain(args.options.undefined.iter())
     {
         linker.add_root_symbol(&mut ctx, symbol.as_bytes());
+    }
+
+    // Add traced symbols
+    for symbol in args.options.trace_symbol.iter() {
+        linker.add_traced_symbol(&mut ctx, symbol.as_bytes());
     }
 
     linker.resolve_symbols(&mut ctx);

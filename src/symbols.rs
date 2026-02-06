@@ -5,7 +5,8 @@
 //! 12000 entries in a typical scenario.
 //!
 //! Since the symbol name strings can potentially be very long with C++/Rust name
-//! mangling, the goal here is to use [String interning](https://en.wikipedia.org/wiki/String_interning).
+//! mangling, the goal here is to use
+//! [String interning](https://en.wikipedia.org/wiki/String_interning).
 //! A symbol name should only be added into the symbol map once at the beginning
 //! of the program and a unique [`SymbolId`] value returned is used for later
 //! referencing it. The advantage here is that this id value can be used as a
@@ -39,44 +40,21 @@
 //! This should be acceptable because in worst case with only 1 slot in use,
 //! the symbol map still has enough capacity to hold 16777214 unique symbol
 //! names.
-//!
-//! # Symbol Types
-//! The handling of symbol types in the MS COFF/PE spec is a little peculiar.
-//!
-//! Firstly, most tools only use the `IMAGE_SYM_TYPE_NULL` and `IMAGE_SYM_DTYPE_FUNCTION`
-//! values. This largely leaves the rest of the type values unused.
-//!
-//! Secondly, the type representation states that the complex and base types are
-//! the "most significant byte" and "least significant byte" values in the field.
-//! The reality is that these do not refer to the most significant and least
-//! significant "bytes" but instead 4 bit nibbles. The complex type is really
-//! just the upper 4 bits of the base type. This means that only 6 bits of the
-//! entire 2 byte field are actually being used.
-//!
-//! The Microsoft docs also include a clause stating:
-//! "However, other tools can use this field to communicate more information."
-//!
-//! ...so we're going to exploit this and do exactly that.
-//!
-//! The most significant byte (upper 8 bits) of the symbol type are used to store
-//! additional flags during global symbol resolution. These flags will get reset
-//! to the original value in the final COFF. This is done instead of adding an
-//! extra field to help keep the size of the symbol structure small.
 
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
-    sync::RwLock,
+    sync::{RwLock, atomic::Ordering},
 };
 
-use bitflags::bitflags;
 use crossbeam_utils::CachePadded;
-use indexmap::{IndexMap, map::Entry};
-use object::{SymbolIndex, pe::IMAGE_SYM_DTYPE_SHIFT};
+use indexmap::IndexMap;
+use object::SymbolIndex;
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
 
 use crate::{
     arena::ArenaRef,
-    coff::{ComdatSelection, SectionNumber, StorageClass},
+    coff::{ImageFileMachine, SectionNumber, StorageClass},
+    context::LinkContext,
     fatal,
     inputs::{ObjectFile, ObjectFileId},
 };
@@ -87,19 +65,13 @@ const MAX_SLOTS: usize = 2usize.pow(SLOT_BITS as u32) - 1;
 const MAX_INDEX: usize = !((MAX_SLOTS << SLOT_SHIFT) as u32) as usize;
 const INDEX_MASK: u32 = MAX_INDEX as u32;
 
-const GLOBAL_SYMBOL_FLAGS_SHIFT: usize = 8;
-const GLOBAL_SYMBOL_FLAGS_MASK: u16 = 0xff00;
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct SymbolId(u32);
 
 impl std::fmt::Debug for SymbolId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExternalId")
-            .field("slot", &self.slot())
-            .field("index", &self.index())
-            .finish()
+        f.debug_tuple("SymbolId").field(&self.location()).finish()
     }
 }
 
@@ -136,43 +108,44 @@ impl SymbolId {
         Self(((slot as u32) << SLOT_SHIFT) | idx as u32)
     }
 
-    const fn slot(self) -> usize {
-        (self.0 >> SLOT_SHIFT) as usize
-    }
-
-    const fn index(self) -> usize {
-        (self.0 & INDEX_MASK) as usize
-    }
-}
-
-#[derive(Debug)]
-pub struct Symbol<'a> {
-    pub name: &'a [u8],
-    pub value: u32,
-    pub section: SectionNumber,
-    pub storage_class: StorageClass,
-    pub typ: u16,
-    pub owner: ObjectFileId,
-    pub table_index: SymbolIndex,
-    pub selection: Option<ComdatSelection>,
-}
-
-impl<'a> std::default::Default for Symbol<'a> {
-    fn default() -> Self {
-        Self {
-            name: &[],
-            value: 0,
-            section: SectionNumber::Undefined,
-            typ: 0,
-            storage_class: StorageClass::Null,
-            owner: ObjectFileId::invalid(),
-            table_index: object::SymbolIndex(0),
-            selection: None,
+    /// Returns the (slot, index) pair if this symbol id is valid
+    const fn location(&self) -> Option<(usize, usize)> {
+        if self.is_valid() {
+            let slot = (self.0 >> SLOT_SHIFT) as usize;
+            let index = (self.0 & INDEX_MASK) as usize;
+            Some((slot, index))
+        } else {
+            None
         }
     }
 }
 
-impl<'a> Symbol<'a> {
+#[derive(Debug)]
+pub struct GlobalSymbol<'a> {
+    pub name: &'a [u8],
+    pub value: u32,
+    pub section_number: SectionNumber,
+    pub storage_class: StorageClass,
+    pub index: SymbolIndex,
+    pub owner: ObjectFileId,
+    pub traced: bool,
+}
+
+impl<'a> std::default::Default for GlobalSymbol<'a> {
+    fn default() -> Self {
+        Self {
+            name: &[],
+            value: 0,
+            section_number: SectionNumber::Undefined,
+            storage_class: StorageClass::Null,
+            owner: ObjectFileId::invalid(),
+            index: object::SymbolIndex(0),
+            traced: false,
+        }
+    }
+}
+
+impl<'a> GlobalSymbol<'a> {
     /// Returns `true` if this is a globally scoped symbol.
     pub fn is_global(&self) -> bool {
         self.storage_class == StorageClass::External
@@ -187,122 +160,116 @@ impl<'a> Symbol<'a> {
     /// Returns `true` if this is an undefined global symbol.
     pub fn is_undefined(&self) -> bool {
         self.storage_class == StorageClass::External
-            && self.section == SectionNumber::Undefined
+            && self.section_number == SectionNumber::Undefined
             && self.value == 0
     }
 
-    /// Returns `true` if this symbol is defined
+    /// Returns `true` if this symbol is defined.
+    ///
+    /// This only returns `true` for symbols with external or static storage
+    /// class
     pub fn is_defined(&self) -> bool {
-        self.section > SectionNumber::Undefined && self.section < SectionNumber::Debug
+        self.section_number > SectionNumber::Undefined
+            && (self.is_global() || self.storage_class == StorageClass::Static)
     }
 
     /// Returns `true` if this is a COMMON symbol
     pub fn is_common(&self) -> bool {
         self.storage_class == StorageClass::External
-            && self.section == SectionNumber::Undefined
+            && self.section_number == SectionNumber::Undefined
             && self.value != 0
     }
 
-    pub fn is_weak(&self) -> bool {
+    /// Returns `true` if this is a weak external symbol
+    pub fn is_weak_external(&self) -> bool {
         self.storage_class == StorageClass::WeakExternal
     }
 
-    pub fn is_comdat_leader(&self) -> bool {
-        self.selection.is_some()
-    }
-
-    /// Returns `true` if this symbol is imported from a DLL
-    pub fn is_imported(&self) -> bool {
-        self.global_flags().contains(GlobalSymbolFlags::Imported)
-    }
-
-    pub fn set_imported(&mut self, value: bool) {
-        self.set_global_flag(GlobalSymbolFlags::Imported, value);
-    }
-
-    pub fn base_type(&self) -> u16 {
-        self.typ & 0xff
-    }
-
-    pub fn derived_type(&self) -> u16 {
-        // Unset the global symbol flags
-        (self.typ & !GLOBAL_SYMBOL_FLAGS_MASK) >> IMAGE_SYM_DTYPE_SHIFT
-    }
-
-    fn priority(&self, lazy: bool) -> u64 {
-        let mut prio = 7u64;
-        if self.is_defined() && !lazy {
-            prio = 1;
-        } else if self.is_weak() && !lazy {
-            prio = 2;
-        } else if self.is_defined() {
-            prio = 3;
-        } else if self.is_weak() {
-            prio = 4;
+    pub fn kind(&self) -> SymbolKind {
+        if self.is_defined() {
+            SymbolKind::Defined
+        } else if self.is_weak_external() {
+            SymbolKind::Weak
         } else if self.is_common() {
-            prio = 5;
-            if lazy {
-                prio = 6;
-            }
+            SymbolKind::Common
+        } else {
+            SymbolKind::Unknown
         }
-        (prio << 31) | self.owner.index() as u64
     }
 
-    /// Returns `true` if `self` should claim `other`.
-    pub fn should_claim(
+    pub fn priority(&self, objs: &[ArenaRef<'a, ObjectFile<'a>>]) -> SymbolPriority {
+        if let Some(index) = self.owner.index() {
+            SymbolPriority {
+                obj: self.owner,
+                kind: self.kind(),
+                live: objs[index].live.load(Ordering::Relaxed),
+            }
+        } else {
+            SymbolPriority {
+                obj: self.owner,
+                kind: SymbolKind::Unknown,
+                live: false,
+            }
+        }
+    }
+
+    pub fn demangle(
         &self,
-        other: &Symbol,
-        live: bool,
-        objs: &[ArenaRef<'a, ObjectFile<'a>>],
-    ) -> bool {
-        if other.owner.is_invalid() {
-            if self.owner.is_invalid() {
-                return false;
+        ctx: &LinkContext<'a>,
+        architecture: ImageFileMachine,
+    ) -> SymbolDemangler<'a> {
+        demangle_symbol(ctx, self, architecture)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum SymbolKind {
+    Defined,
+    Weak,
+    Common,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SymbolPriority {
+    obj: ObjectFileId,
+    kind: SymbolKind,
+    live: bool,
+}
+
+impl SymbolPriority {
+    pub fn new(obj: ObjectFileId, kind: SymbolKind, live: bool) -> Self {
+        Self { obj, kind, live }
+    }
+}
+
+impl PartialOrd for SymbolPriority {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let scalar_priority = |symbol: &SymbolPriority| {
+            if symbol.obj.is_invalid() {
+                return 7;
             }
 
-            return true;
+            match symbol.kind {
+                SymbolKind::Common if symbol.live => 5,
+                SymbolKind::Common => 6,
+                SymbolKind::Defined if symbol.live => 1,
+                SymbolKind::Defined => 3,
+                SymbolKind::Weak if symbol.live => 2,
+                SymbolKind::Weak => 4,
+                SymbolKind::Unknown => 7,
+            }
+        };
+
+        match scalar_priority(self).cmp(&scalar_priority(other)) {
+            std::cmp::Ordering::Equal => self.obj.partial_cmp(&other.obj),
+            o => Some(o),
         }
-
-        self.priority(!live) < other.priority(!objs[self.owner.index()].lazy)
-    }
-
-    /// Copies `self` into `other`
-    pub fn claim(&self, other: &mut Symbol) {
-        other.value = self.value;
-        other.section = self.section;
-        other.storage_class = self.storage_class;
-        other.typ = self.typ;
-        other.owner = self.owner;
-        other.table_index = self.table_index;
-        other.selection = self.selection;
-    }
-
-    const fn global_flags(&self) -> GlobalSymbolFlags {
-        GlobalSymbolFlags::from_bits_retain(
-            ((self.typ & GLOBAL_SYMBOL_FLAGS_MASK) >> GLOBAL_SYMBOL_FLAGS_SHIFT) as u8,
-        )
-    }
-
-    fn set_global_flag(&mut self, flag: GlobalSymbolFlags, state: bool) {
-        let mut flags = self.global_flags();
-        flags.set(flag, state);
-        self.typ |= (flag.bits() as u16) << GLOBAL_SYMBOL_FLAGS_SHIFT
     }
 }
 
-/// Flags used for global symbols
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-struct GlobalSymbolFlags(u8);
-
-bitflags! {
-    impl GlobalSymbolFlags: u8 {
-        /// Symbol is imported from an import file
-        const Imported = 1;
-    }
-}
-
-type MapSlot<'a> = IndexMap<&'a [u8], RwLock<Symbol<'a>>>;
+type MapSlot<'a> = IndexMap<&'a [u8], RwLock<GlobalSymbol<'a>>>;
 
 #[derive(Debug)]
 pub struct SymbolMap<'a> {
@@ -324,67 +291,70 @@ impl<'a> SymbolMap<'a> {
         })
     }
 
-    pub fn get_or_default(&self, name: &'a [u8]) -> SymbolId {
+    /// Gets the symbol id for `name` or inserts a new default symbol if not
+    /// already present.
+    pub fn get_or_create_default(&self, name: &'a [u8]) -> SymbolId {
         let slot_idx = self.compute_slot(name);
         let slot_entry = &self.slots[slot_idx];
         let index = {
             let mut slot = slot_entry.write().expect("SymbolMap poisoned");
             let entry = slot.entry(name);
             let index = entry.index();
-            entry.or_insert_with(|| RwLock::new(Symbol::default()));
+            entry.or_insert_with(|| {
+                let mut symbol = GlobalSymbol::default();
+                symbol.name = name;
+                RwLock::new(symbol)
+            });
             index
         };
 
         SymbolId::new(slot_idx, index)
     }
 
-    pub fn get_exclusive_or_default_new(&mut self, name: &'a [u8]) -> Option<SymbolId> {
-        let slot_idx = self.compute_slot(name);
-        let slot = self.slots[slot_idx].get_mut().expect("SymbolMap poisoned");
-        let index = match slot.entry(name) {
-            Entry::Occupied(_) => return None,
-            Entry::Vacant(entry) => {
-                let entry = entry.insert_entry(RwLock::new(Symbol::default()));
-                entry.index()
-            }
-        };
+    pub fn get_exclusive_symbol(&mut self, symbol: SymbolId) -> Option<&mut GlobalSymbol<'a>> {
+        let (slot_index, index) = symbol.location()?;
 
-        Some(SymbolId::new(slot_idx, index))
-    }
-
-    pub fn get_exclusive(&mut self, symbol: SymbolId) -> Option<&mut Symbol<'a>> {
-        if symbol.is_invalid() {
-            return None;
-        }
-
-        let slot = self.slots[symbol.slot()]
+        let slot = self.slots[slot_index]
             .get_mut()
             .expect("SymbolMap poisoned");
-        let entry = slot.get_index_mut(symbol.index())?.1;
+        let entry = slot.get_index_mut(index)?.1;
         Some(entry.get_mut().expect("SymbolMap entry poisoned"))
     }
 
-    pub fn inspect(&self, symbol: SymbolId, f: impl FnOnce(&RwLock<Symbol<'a>>)) {
-        if symbol.is_invalid() {
-            return;
+    pub fn get_exclusive_entry(&mut self, name: &'a [u8]) -> ExclusiveEntry<'_, 'a> {
+        let slot_idx = self.compute_slot(name);
+        let slot = self.slots[slot_idx].get_mut().expect("SymbolMap poisoned");
+        match slot.entry(name) {
+            indexmap::map::Entry::Occupied(entry) => ExclusiveEntry::Occupied(OccupiedEntry {
+                slot: slot_idx,
+                entry,
+            }),
+            indexmap::map::Entry::Vacant(entry) => ExclusiveEntry::Vacant(VacantEntry {
+                slot: slot_idx,
+                entry,
+            }),
         }
+    }
 
-        let slot = self.slots[symbol.slot()]
-            .read()
-            .expect("SymbolMap poisoned");
-        if let Some(entry) = slot.get_index(symbol.index()).map(|entry| entry.1) {
+    pub fn inspect(&self, symbol: SymbolId, f: impl FnOnce(&RwLock<GlobalSymbol<'a>>)) {
+        let Some((slot_index, index)) = symbol.location() else {
+            return;
+        };
+
+        let slot = self.slots[slot_index].read().expect("SymbolMap poisoned");
+        if let Some((_, entry)) = slot.get_index(index) {
             f(entry);
         }
     }
 
-    pub fn par_for_each(&self, f: impl Fn(&RwLock<Symbol<'a>>) + Send + Sync) {
+    pub fn par_for_each(&self, f: impl Fn(&RwLock<GlobalSymbol<'a>>) + Send + Sync) {
         self.slots.par_iter().for_each(|slot| {
             let slot = slot.read().expect("SymbolMap poisoned");
             slot.par_values().for_each(|symbol| f(symbol));
         });
     }
 
-    pub fn par_for_each_exclusive(&mut self, f: impl Fn(&mut Symbol<'a>) + Send + Sync) {
+    pub fn par_for_each_exclusive(&mut self, f: impl Fn(&mut GlobalSymbol<'a>) + Send + Sync) {
         self.slots.par_iter_mut().for_each(|slot| {
             let slot = slot.get_mut().expect("SymbolMap poisoned");
             slot.par_values_mut()
@@ -397,4 +367,147 @@ impl<'a> SymbolMap<'a> {
         h.write(name);
         (h.finish() as usize % self.slots.len()) as usize
     }
+}
+
+pub enum ExclusiveEntry<'b, 'a> {
+    Occupied(OccupiedEntry<'b, 'a>),
+    Vacant(VacantEntry<'b, 'a>),
+}
+
+impl<'b, 'a> ExclusiveEntry<'b, 'a> {
+    pub fn id(&self) -> SymbolId {
+        match self {
+            Self::Occupied(entry) => entry.id(),
+            Self::Vacant(entry) => entry.id(),
+        }
+    }
+
+    pub fn or_default(self) -> &'b mut GlobalSymbol<'a> {
+        match self {
+            Self::Occupied(entry) => entry.into_mut_symbol(),
+            Self::Vacant(entry) => entry.insert_default().into_mut_symbol(),
+        }
+    }
+}
+
+pub struct OccupiedEntry<'b, 'a> {
+    slot: usize,
+    entry: indexmap::map::OccupiedEntry<'b, &'a [u8], RwLock<GlobalSymbol<'a>>>,
+}
+
+impl<'b, 'a> OccupiedEntry<'b, 'a> {
+    pub fn id(&self) -> SymbolId {
+        SymbolId::new(self.slot, self.entry.index())
+    }
+
+    pub fn into_mut_symbol(self) -> &'b mut GlobalSymbol<'a> {
+        self.entry.into_mut().get_mut().unwrap()
+    }
+}
+
+pub struct VacantEntry<'b, 'a> {
+    slot: usize,
+    entry: indexmap::map::VacantEntry<'b, &'a [u8], RwLock<GlobalSymbol<'a>>>,
+}
+
+impl<'b, 'a> VacantEntry<'b, 'a> {
+    pub fn id(&self) -> SymbolId {
+        SymbolId::new(self.slot, self.entry.index())
+    }
+
+    pub fn insert_default(self) -> OccupiedEntry<'b, 'a> {
+        let mut symbol = GlobalSymbol::default();
+        symbol.name = *self.entry.key();
+        let entry = self.entry.insert_entry(RwLock::new(symbol));
+        OccupiedEntry {
+            slot: self.slot,
+            entry,
+        }
+    }
+}
+
+pub fn demangle_symbol<'a>(
+    ctx: &LinkContext<'a>,
+    symbol: &GlobalSymbol<'a>,
+    architecture: ImageFileMachine,
+) -> SymbolDemangler<'a> {
+    SymbolDemangler {
+        name: symbol.name,
+        i386: architecture == ImageFileMachine::I386,
+        demangle: ctx.options.demangle,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SymbolDemangler<'a> {
+    name: &'a [u8],
+    i386: bool,
+    demangle: bool,
+}
+
+impl std::fmt::Display for SymbolDemangler<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name_string = String::from_utf8_lossy(self.name);
+        if !self.demangle {
+            f.write_str(&name_string)?;
+            return Ok(());
+        }
+
+        let mut name = name_string.as_ref();
+        if let Some(trimmed) = name.strip_prefix("__imp_") {
+            name = trimmed;
+            write!(f, "__declspec(dllimport) ")?;
+        }
+
+        let try_demangle = |f: &mut std::fmt::Formatter<'_>| -> Option<()> {
+            demangle_msvc(f, name, self.i386)
+                .or_else(|| demangle_cpp(f, name, self.i386))
+                .or_else(|| demangle_rustc(f, name, self.i386))
+        };
+
+        if try_demangle(f).is_none() {
+            f.write_str(name)?;
+        }
+
+        Ok(())
+    }
+}
+
+fn demangle_cpp(f: &mut std::fmt::Formatter<'_>, symbol: &str, i386: bool) -> Option<()> {
+    let is_cpp_mangled =
+        |symbol: &str| (i386 && symbol.starts_with("__Z")) || symbol.starts_with("_Z");
+
+    if is_cpp_mangled(symbol) {
+        let demangler = cpp_demangle::Symbol::new(symbol).ok()?;
+        demangler.structured_demangle(f, &Default::default()).ok()
+    } else {
+        None
+    }
+}
+
+fn demangle_rustc(f: &mut std::fmt::Formatter<'_>, mut symbol: &str, i386: bool) -> Option<()> {
+    if i386 {
+        symbol = symbol.trim_start_matches('_');
+    }
+
+    let demangler = rustc_demangle::try_demangle(symbol).ok()?;
+    write!(f, "{demangler}").ok()
+}
+
+#[cfg(not(windows))]
+fn demangle_msvc(_f: &mut std::fmt::Formatter<'_>, _symbol: &str, _i386: bool) -> Option<()> {
+    None
+}
+
+#[cfg(windows)]
+fn demangle_msvc(f: &mut std::fmt::Formatter<'_>, symbol: &str, i386: bool) -> Option<()> {
+    use crate::undname::{UndnameFlags, undname_demangle};
+
+    let mut flags = UndnameFlags::NoPtr64Expansion;
+    if i386 {
+        flags |= UndnameFlags::ThirtyTwoBitDecode;
+    }
+
+    let demangler = undname_demangle(symbol, flags).ok()?;
+    write!(f, "{demangler}").ok()
 }
