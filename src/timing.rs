@@ -124,7 +124,7 @@ pub struct DurationDisplay<'a> {
 
 impl std::fmt::Display for DurationDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.inner < &Duration::from_nanos_u128(1_000) {
+        if self.inner < &Duration::from_nanos(1_000) {
             write!(f, "{}ns", self.inner.as_nanos())?;
             return Ok(());
         }

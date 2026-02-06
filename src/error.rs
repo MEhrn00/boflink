@@ -44,6 +44,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// ```txt
 /// boflink: error: file.o: symbol at index 123: symbol name is not valid
 /// ```
+#[allow(clippy::box_collection, reason = "reduces size of Result enums")]
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct Error(Box<Vec<String>>);
@@ -87,10 +88,10 @@ impl std::fmt::Display for Error {
             return Ok(());
         };
 
-        f.write_str(&e)?;
+        f.write_str(e)?;
         it.try_for_each(|e| {
             f.write_str(": ")?;
-            f.write_str(&e)
+            f.write_str(e)
         })
     }
 }

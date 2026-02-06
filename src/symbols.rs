@@ -61,7 +61,7 @@ use crate::{
 
 const SLOT_BITS: u32 = 8;
 const SLOT_SHIFT: u32 = u32::BITS - SLOT_BITS;
-const MAX_SLOTS: usize = 2usize.pow(SLOT_BITS as u32) - 1;
+const MAX_SLOTS: usize = 2usize.pow(SLOT_BITS) - 1;
 const MAX_INDEX: usize = !((MAX_SLOTS << SLOT_SHIFT) as u32) as usize;
 const INDEX_MASK: u32 = MAX_INDEX as u32;
 
@@ -301,9 +301,10 @@ impl<'a> SymbolMap<'a> {
             let entry = slot.entry(name);
             let index = entry.index();
             entry.or_insert_with(|| {
-                let mut symbol = GlobalSymbol::default();
-                symbol.name = name;
-                RwLock::new(symbol)
+                RwLock::new(GlobalSymbol {
+                    name,
+                    ..Default::default()
+                })
             });
             index
         };
@@ -350,7 +351,7 @@ impl<'a> SymbolMap<'a> {
     pub fn par_for_each(&self, f: impl Fn(&RwLock<GlobalSymbol<'a>>) + Send + Sync) {
         self.slots.par_iter().for_each(|slot| {
             let slot = slot.read().expect("SymbolMap poisoned");
-            slot.par_values().for_each(|symbol| f(symbol));
+            slot.par_values().for_each(&f);
         });
     }
 
@@ -365,7 +366,7 @@ impl<'a> SymbolMap<'a> {
     fn compute_slot(&self, name: &[u8]) -> usize {
         let mut h = DefaultHasher::default();
         h.write(name);
-        (h.finish() as usize % self.slots.len()) as usize
+        h.finish() as usize % self.slots.len()
     }
 }
 
@@ -416,12 +417,13 @@ impl<'b, 'a> VacantEntry<'b, 'a> {
     }
 
     pub fn insert_default(self) -> OccupiedEntry<'b, 'a> {
-        let mut symbol = GlobalSymbol::default();
-        symbol.name = *self.entry.key();
-        let entry = self.entry.insert_entry(RwLock::new(symbol));
+        let name = *self.entry.key();
         OccupiedEntry {
             slot: self.slot,
-            entry,
+            entry: self.entry.insert_entry(RwLock::new(GlobalSymbol {
+                name,
+                ..Default::default()
+            })),
         }
     }
 }

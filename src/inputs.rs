@@ -233,7 +233,7 @@ impl std::error::Error for UnknownFileError {}
 
 /// Id for an object file. This is a tagged index using a `u32`.
 /// - Index 0 is reserved for the internal file used for adding linker-synthesized
-/// sections/symbols.
+///   sections/symbols.
 /// - [`u32::MAX`] is for an invalid index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectFileId(u32);
@@ -604,7 +604,7 @@ impl<'a> ObjectFile<'a> {
             );
 
             if self.machine == ImageFileMachine::I386 {
-                public_symbol = public_symbol.strip_prefix(&[b'_']).unwrap_or(public_symbol);
+                public_symbol = public_symbol.strip_prefix(b"_").unwrap_or(public_symbol);
             }
             public_symbol
         };

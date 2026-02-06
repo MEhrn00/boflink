@@ -54,7 +54,7 @@ impl TypedArena<u8> {
     }
 
     pub fn alloc_bytes(&self, b: &[u8]) -> &mut [u8] {
-        self.alloc_extend(b.into_iter().copied())
+        self.alloc_extend(b.iter().copied())
     }
 
     pub fn alloc_os_str(&self, s: &OsStr) -> InvariantRef<'_, OsStr> {
@@ -165,13 +165,13 @@ impl<'a> ArenaHandle<'a, u8> {
     }
 
     pub fn alloc_bytes(&self, b: &[u8]) -> &'a mut [u8] {
-        self.alloc_extend(b.into_iter().copied())
+        self.alloc_extend(b.iter().copied())
     }
 
     pub fn alloc_os_str(&self, s: &OsStr) -> InvariantRef<'a, OsStr> {
         let b = self.alloc_bytes(s.as_encoded_bytes()) as *mut _;
         InvariantRef {
-            inner: unsafe { OsStr::from_encoded_bytes_unchecked(&mut *b) },
+            inner: unsafe { OsStr::from_encoded_bytes_unchecked(&*b) },
             invariant: PhantomData,
         }
     }

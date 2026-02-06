@@ -663,9 +663,7 @@ impl CliOptions {
                 v.to_str()
                     .and_then(|s| s.parse().ok())
                     .and_then(NonZeroUsize::new)
-                    .with_context(|| {
-                        format!("--threads value must be a non-zero positive number")
-                    })?,
+                    .context("--threads value must be a non-zero positive number")?,
             );
         } else if let Some(v) = anyval("y", "trace-symbol") {
             self.trace_symbol

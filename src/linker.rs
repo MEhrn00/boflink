@@ -130,7 +130,7 @@ impl<'a> Linker<'a> {
                     *obj.live.get_mut() = true;
                 }
 
-                (*obj.live.get_mut() == true).then_some(obj.id)
+                (*obj.live.get_mut()).then_some(obj.id)
             })
             .collect::<Vec<_>>();
 
@@ -286,7 +286,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
                 scope,
                 input_ctx,
                 InputFile {
-                    data: &mapping,
+                    data: mapping,
                     path,
                     parent: None,
                 },
