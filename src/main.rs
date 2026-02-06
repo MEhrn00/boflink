@@ -16,10 +16,10 @@ mod cli;
 mod coff;
 mod context;
 mod error;
-mod fsutils;
 mod inputs;
 mod linker;
 mod logging;
+mod stdext;
 mod symbols;
 mod timing;
 

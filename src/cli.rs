@@ -8,7 +8,9 @@ use std::{
 
 use os_str_bytes::OsStrBytesExt;
 
-use crate::{ErrorContext, bail, coff::ImageFileMachine, fsutils, logging::ColorOption};
+use crate::{
+    ErrorContext, bail, coff::ImageFileMachine, logging::ColorOption, stdext::path::PathExt,
+};
 
 const CARGO_PKG_NAME: &str = env!("CARGO_PKG_NAME");
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -596,11 +598,11 @@ impl CliOptions {
             && !dir.is_empty()
         {
             self.library_path
-                .push(fsutils::lexically_normalize_path(Path::new(dir)));
+                .push(Path::new(dir).normalize_lexically_cpp());
         } else if let Some(dir) = anyval("L", "library-path") {
             let v = dir?;
             self.library_path
-                .push(fsutils::lexically_normalize_path(Path::new(&v)));
+                .push(Path::new(&v).normalize_lexically_cpp());
         } else if let Some(v) = anyval("m", "") {
             let v = v?;
             self.machine = Some(Emulation::parse(&v).with_context(|| {

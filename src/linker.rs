@@ -20,9 +20,9 @@ use crate::{
     cli::{InputArg, InputArgContext, InputArgVariant},
     coff::ImageFileMachine,
     context::LinkContext,
-    fsutils::{UniqueFileExt, UniqueFileId},
     inputs::{FileKind, InputFile, ObjectFile, ObjectFileId},
     make_error,
+    stdext::fs::{FileExt, UniqueFileId},
     symbols::{ExclusiveEntry, GlobalSymbol, SymbolId},
     timing::ScopedTimer,
 };
