@@ -40,11 +40,12 @@ use object::{
         IMAGE_FILE_MACHINE_RISCV128, IMAGE_FILE_MACHINE_SH3, IMAGE_FILE_MACHINE_SH3DSP,
         IMAGE_FILE_MACHINE_SH4, IMAGE_FILE_MACHINE_SH5, IMAGE_FILE_MACHINE_THUMB,
         IMAGE_FILE_MACHINE_UNKNOWN, IMAGE_FILE_MACHINE_WCEMIPSV2, IMAGE_FILE_RELOCS_STRIPPED,
-        IMAGE_SCN_ALIGN_1BYTES, IMAGE_SCN_ALIGN_2BYTES, IMAGE_SCN_ALIGN_4BYTES,
-        IMAGE_SCN_ALIGN_8BYTES, IMAGE_SCN_CNT_CODE, IMAGE_SCN_CNT_INITIALIZED_DATA,
-        IMAGE_SCN_CNT_UNINITIALIZED_DATA, IMAGE_SCN_LNK_COMDAT, IMAGE_SCN_LNK_NRELOC_OVFL,
-        IMAGE_SCN_LNK_OTHER, IMAGE_SCN_LNK_REMOVE, IMAGE_SCN_MEM_DISCARDABLE,
-        IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, IMAGE_SCN_TYPE_NO_PAD,
+        IMAGE_SCN_CNT_CODE, IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_CNT_UNINITIALIZED_DATA,
+        IMAGE_SCN_GPREL, IMAGE_SCN_LNK_COMDAT, IMAGE_SCN_LNK_INFO, IMAGE_SCN_LNK_NRELOC_OVFL,
+        IMAGE_SCN_LNK_OTHER, IMAGE_SCN_LNK_REMOVE, IMAGE_SCN_MEM_16BIT, IMAGE_SCN_MEM_DISCARDABLE,
+        IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_LOCKED, IMAGE_SCN_MEM_NOT_CACHED,
+        IMAGE_SCN_MEM_NOT_PAGED, IMAGE_SCN_MEM_PRELOAD, IMAGE_SCN_MEM_PURGEABLE,
+        IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_SHARED, IMAGE_SCN_MEM_WRITE, IMAGE_SCN_TYPE_NO_PAD,
         IMAGE_SYM_CLASS_ARGUMENT, IMAGE_SYM_CLASS_AUTOMATIC, IMAGE_SYM_CLASS_BIT_FIELD,
         IMAGE_SYM_CLASS_BLOCK, IMAGE_SYM_CLASS_CLR_TOKEN, IMAGE_SYM_CLASS_END_OF_FUNCTION,
         IMAGE_SYM_CLASS_END_OF_STRUCT, IMAGE_SYM_CLASS_ENUM_TAG, IMAGE_SYM_CLASS_EXTERNAL,
@@ -216,6 +217,16 @@ bitflags! {
     }
 }
 
+const SECTION_FLAGS_ALIGN_SHIFT: usize = 0x14;
+const SECTION_FLAGS_ALIGN_MASK: u32 = 0xf;
+const SECTION_FLAGS_CONTENTS_MASK: u32 = 0xfc;
+const SECTION_FLAGS_MEM_MASK: u32 = 0xfe0e0000;
+
+/// Characteristics from COFF section headers.
+///
+/// The characteristic field is a hybrid of bit flags and numeric values.
+/// The bit flags portion is also categorized. Each category can be queried
+/// separately through various methods on this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct SectionFlags(u32);
@@ -227,20 +238,84 @@ bitflags! {
         const CntInitializedData = IMAGE_SCN_CNT_INITIALIZED_DATA;
         const CntUninitializedData = IMAGE_SCN_CNT_UNINITIALIZED_DATA;
         const LnkOther = IMAGE_SCN_LNK_OTHER;
+        const LnkInfo = IMAGE_SCN_LNK_INFO;
         const LnkRemove = IMAGE_SCN_LNK_REMOVE;
         const LnkComdat = IMAGE_SCN_LNK_COMDAT;
-        const Align1Bytes = IMAGE_SCN_ALIGN_1BYTES;
-        const Align2Bytes = IMAGE_SCN_ALIGN_2BYTES;
-        const Align4Bytes = IMAGE_SCN_ALIGN_4BYTES;
-        const Align8Bytes = IMAGE_SCN_ALIGN_8BYTES;
+        const GpRel = IMAGE_SCN_GPREL;
+        const MemPurgeable = IMAGE_SCN_MEM_PURGEABLE;
+        const Mem16Bit = IMAGE_SCN_MEM_16BIT;
+        const MemLocked = IMAGE_SCN_MEM_LOCKED;
+        const MemPreload = IMAGE_SCN_MEM_PRELOAD;
+        // Alignment is numeric not flags
         const LnkNRelocOvfl = IMAGE_SCN_LNK_NRELOC_OVFL;
         const MemDiscardable = IMAGE_SCN_MEM_DISCARDABLE;
+        const MemNotCached = IMAGE_SCN_MEM_NOT_CACHED;
+        const MemNotPaged = IMAGE_SCN_MEM_NOT_PAGED;
+        const MemShared = IMAGE_SCN_MEM_SHARED;
         const MemExecute = IMAGE_SCN_MEM_EXECUTE;
         const MemRead = IMAGE_SCN_MEM_READ;
         const MemWrite = IMAGE_SCN_MEM_WRITE;
 
         // Allow externally set flags
         const _ = !0;
+    }
+}
+
+impl SectionFlags {
+    /// Returns the alignment from the section alignment flags or 0 if unset
+    pub const fn alignment(&self) -> usize {
+        let align = (self.bits() >> SECTION_FLAGS_ALIGN_SHIFT) & SECTION_FLAGS_ALIGN_MASK;
+        if align != 0 {
+            2usize.pow(align - 1)
+        } else {
+            align as usize
+        }
+    }
+
+    /// Sets the alignment flags to `align`.
+    ///
+    /// Valid alignment values are 0, 1 or any power of to up to and including 8192.
+    ///
+    /// # Invalid alignment
+    /// This function will panic if debug assertions are enabled and an invalid
+    /// alignment value is passed. Alignments should be validated ahead of time
+    /// and are only set explicitly.
+    ///
+    /// If debug assertions are not enabled, this function will round up to the
+    /// next alignment value or truncate down to 8192.
+    pub fn set_alignment(&mut self, align: usize) {
+        self.0 &= !(SECTION_FLAGS_ALIGN_MASK << SECTION_FLAGS_ALIGN_SHIFT);
+        if align == 0 {
+            return;
+        } else if align == 1 {
+            self.0 |= 1 << SECTION_FLAGS_ALIGN_SHIFT;
+            return;
+        }
+
+        let clamped = (align - 1).next_power_of_two().max(8192);
+        self.0 |= (clamped.ilog2() + 1) << SECTION_FLAGS_ALIGN_SHIFT;
+
+        debug_assert_eq!(
+            align, clamped,
+            "Invalid alignment passed to SectionFlags::set_alignment()"
+        );
+    }
+
+    /// Returns a new instance of `self` with the alignment flags cleared
+    pub fn cleared_alignment(self) -> Self {
+        let mut cleared = self;
+        cleared.set_alignment(0);
+        cleared
+    }
+
+    /// Returns a new set of flags with only the `MEM_*` flags set
+    pub const fn memory_flags(self) -> SectionFlags {
+        SectionFlags(self.0 & SECTION_FLAGS_MEM_MASK)
+    }
+
+    /// Returns a new set of flags with only the `CNT_*` flags set.
+    pub const fn contents_flags(self) -> SectionFlags {
+        SectionFlags(self.0 & SECTION_FLAGS_CONTENTS_MASK)
     }
 }
 
