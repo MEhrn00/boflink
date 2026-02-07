@@ -14,11 +14,13 @@ use crate::{
 mod arena;
 mod cli;
 mod coff;
+mod concurrent_indexmap;
 mod context;
 mod error;
 mod inputs;
 mod linker;
 mod logging;
+mod outputs;
 mod stdext;
 mod symbols;
 mod timing;
@@ -124,6 +126,7 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
     }
 
     linker.resolve_symbols(&mut ctx);
+    linker.create_output_sections(&mut ctx);
 
     let mut stats = std::mem::take(&mut ctx.stats);
     drop(linker);

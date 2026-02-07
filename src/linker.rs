@@ -10,7 +10,10 @@ use object::read::archive::ArchiveFile;
 use os_str_bytes::OsStrBytesExt;
 use rayon::{
     Scope,
-    iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator},
+    iter::{
+        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+        IntoParallelRefMutIterator, ParallelIterator,
+    },
 };
 
 use crate::{
@@ -22,11 +25,12 @@ use crate::{
     context::LinkContext,
     inputs::{FileKind, InputFile, InputFileSource, ObjectFile, ObjectFileId},
     make_error,
+    outputs::OutputSection,
     stdext::{
         fs::{FileExt, UniqueFileId},
         path::PathExt,
     },
-    symbols::{ExclusiveEntry, GlobalSymbol, SymbolId},
+    symbols::{GlobalSymbol, MapEntry, SymbolId},
     timing::ScopedTimer,
 };
 
@@ -34,6 +38,7 @@ pub struct Linker<'a> {
     pub architecture: ImageFileMachine,
     strings: ArenaHandle<'a, u8>,
     pub objs: Vec<ArenaRef<'a, ObjectFile<'a>>>,
+    pub output_sections: Vec<OutputSection<'a>>,
     pub root_symbols: Vec<SymbolId>,
 }
 
@@ -72,6 +77,7 @@ impl<'a> Linker<'a> {
             strings,
             objs: input_objs.into_vec(),
             root_symbols: Vec::new(),
+            output_sections: Vec::new(),
         })
     }
 
@@ -84,35 +90,32 @@ impl<'a> Linker<'a> {
     }
 
     pub fn add_root_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
-        if let ExclusiveEntry::Vacant(entry) = ctx.symbol_map.get_exclusive_entry(self.mangle(name))
-        {
+        if let MapEntry::Vacant(entry) = ctx.symbol_map.get_map_entry(self.mangle(name)) {
             let symbol = entry.insert_default();
             self.root_symbols.push(symbol.id());
         }
     }
 
     pub fn add_traced_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
-        let symbol = ctx
-            .symbol_map
-            .get_exclusive_entry(self.mangle(name))
-            .or_default();
+        let symbol = ctx.symbol_map.get_map_entry(self.mangle(name)).or_default();
         symbol.traced = true;
     }
 
     pub fn resolve_symbols(&mut self, ctx: &mut LinkContext<'a>) {
         let _timer = ScopedTimer::msg("symbol resolution");
 
-        // First symbol resolution round is used to populate the global symbol map
-        // with symbol information and figure out which object file should claim
-        // the symbol. All object files are in a lazy state which means that only
-        // the input order is used to figure out which object file should be
-        // the owner of a duplicate symbol
+        // First symbol resolution pass is used to populate the global symbol map
+        // with symbol information and figure out which object file should be
+        // the owner of the global symbol. All files are initially put in a lazy
+        // state so any duplicate symbols will use the first one defined in the
+        // from the command line order
         self.objs.par_iter().for_each(|obj| {
             obj.resolve_symbols(ctx, &self.objs);
         });
 
-        // Include object files if they have a definition for a needed symbol
-        // from command line args (--entry, --require-defined, --undefined).
+        // Figure out what object files should be included based on command line
+        // input processing and through which object files define needed symbols
+        // in command line options (--entry, --require-defined, --undefined).
         for root_symbol in self.root_symbols.iter().copied() {
             let symbol = ctx.symbol_map.get_exclusive_symbol(root_symbol).unwrap();
             if let Some(owner) = symbol.owner.index() {
@@ -120,10 +123,7 @@ impl<'a> Linker<'a> {
             }
         }
 
-        // Collect the list of "primary" object files. These are either object
-        // files that are included from command line input files or needed objects
-        // from root symbols
-        let primary_objs = self
+        let live_objs = self
             .objs
             .par_iter_mut()
             .filter_map(|obj| {
@@ -137,47 +137,52 @@ impl<'a> Linker<'a> {
             })
             .collect::<Vec<_>>();
 
-        // Go through the primary object files and do a DFS pass over all the
-        // undefined symbols to include additional object files that have definitions
-        // for these needed symbols
+        // Go through the list of live objects and transitively include all
+        // dependent object files that have a symbol definition for any needed
+        // undefined symbol.
         rayon::in_place_scope(|scope| {
-            primary_objs.par_iter().for_each(|id| {
+            live_objs.par_iter().for_each(|id| {
                 let obj = &self.objs[id.index().unwrap()];
                 obj.include_needed_objects(ctx, &self.objs, scope);
             });
         });
 
-        // Redo symbol resolution from a clean slate only with the selected
-        // object files. The first symbol resolution round only selected symbol
-        // definitions based on input ordering. Now that the list of needed object
-        // files is known, duplicate symbols may have been claimed by files
-        // specified earlier on the command line while the real definition
-        // being used is from a later file and needs to be set properly
-        ctx.symbol_map.par_for_each_exclusive(|symbol| {
-            let name = symbol.name;
-            let traced = symbol.traced;
-            *symbol = GlobalSymbol::default();
-            symbol.name = name;
-            symbol.traced = traced;
+        // Redo symbol resolution from a clean slate using only the included object
+        // files. This fixes the global symbol map in cases where an early object
+        // file was chosen during the first symbol resolution pass but a later
+        // object file has the definition being used
+        ctx.symbol_map.par_for_each_symbol(|symbol| {
+            *symbol = GlobalSymbol {
+                name: symbol.name,
+                traced: symbol.traced,
+                ..Default::default()
+            };
         });
+
+        // Remove unused objects to shrink the list before re-resolving symbols.
+        self.objs = std::mem::take(&mut self.objs)
+            .into_par_iter()
+            .filter(|obj| obj.id.is_internal() || obj.live.load(Ordering::Relaxed))
+            .collect::<Vec<_>>();
+
+        self.objs
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(new_id, obj)| {
+                obj.id = ObjectFileId::new(new_id);
+            });
 
         self.objs.par_iter().for_each(|obj| {
-            if obj.live.load(Ordering::Relaxed) {
-                obj.resolve_symbols(ctx, &self.objs);
-            }
+            obj.resolve_symbols(ctx, &self.objs);
         });
 
-        if log::log_enabled!(logger: &*ctx, log::Level::Trace) {
-            let live_count = self
-                .objs
-                .par_iter_mut()
-                .map(|obj| *obj.live.get_mut())
-                .filter(|live| *live)
-                .count();
-
-            log::trace!("found {live_count} live objects after symbol resolution");
-        }
+        log::trace!(
+            "found {} live objects after symbol resolution",
+            self.objs.len() - 1
+        );
     }
+
+    pub fn create_output_sections(&mut self, ctx: &mut LinkContext<'a>) {}
 }
 
 #[derive(Default)]
