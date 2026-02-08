@@ -7,7 +7,8 @@ use crate::{
     cli::{CliArgs, CliOptions},
     coff::ImageFileMachine,
     context::LinkContext,
-    linker::{InputsStore, Linker},
+    inputs::InputsStore,
+    linker::Linker,
     timing::DurationExt,
 };
 
@@ -21,6 +22,7 @@ mod inputs;
 mod linker;
 mod logging;
 mod outputs;
+mod reader;
 mod stdext;
 mod symbols;
 mod timing;
@@ -90,15 +92,13 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
     let timer = std::time::Instant::now();
 
     let string_pool = ArenaPool::new();
-    let store = InputsStore::default();
-
+    let section_pool = ArenaPool::new();
+    let instore = InputsStore::default();
     let inputs = std::mem::take(&mut args.inputs);
-
     setup_options(&mut args.options);
+    let mut ctx = LinkContext::new(&args.options, &string_pool, &section_pool);
 
-    let mut ctx = LinkContext::new(&args.options, &string_pool);
-
-    let mut linker = Linker::read_inputs(&ctx, &inputs, &store)?;
+    let mut linker = Linker::read_inputs(&ctx, &inputs, &instore)?;
     ctx.exclusive_check_errored();
 
     if linker.objs.is_empty() {
@@ -126,6 +126,7 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
     }
 
     linker.resolve_symbols(&mut ctx);
+
     linker.create_output_sections(&mut ctx);
 
     let mut stats = std::mem::take(&mut ctx.stats);

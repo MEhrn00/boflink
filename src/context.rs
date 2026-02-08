@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use crate::{arena::ArenaPool, cli::CliOptions, symbols::SymbolMap};
+use crate::{arena::ArenaPool, cli::CliOptions, outputs::OutputSection, symbols::SymbolMap};
 
 /// Context structure which holds miscellaneous the program context used
 /// throughout the entire program.
@@ -22,11 +22,16 @@ pub struct LinkContext<'a> {
     errored: AtomicBool,
 
     pub string_pool: &'a ArenaPool<u8>,
+    pub section_pool: &'a ArenaPool<OutputSection<'a>>,
     pub stats: LinkStats,
 }
 
 impl<'a> LinkContext<'a> {
-    pub fn new(options: &'a CliOptions, string_pool: &'a ArenaPool<u8>) -> Self {
+    pub fn new(
+        options: &'a CliOptions,
+        string_pool: &'a ArenaPool<u8>,
+        section_pool: &'a ArenaPool<OutputSection<'a>>,
+    ) -> Self {
         // This should already be set to reflect the active thread count but
         // fall back to 1 if it is not.
         let active_threads = options.threads.map(|num| num.get()).unwrap_or(1);
@@ -34,6 +39,7 @@ impl<'a> LinkContext<'a> {
         Self {
             options,
             string_pool,
+            section_pool,
             errored: AtomicBool::new(false),
             symbol_map: SymbolMap::with_slot_count(active_threads),
             stats: Default::default(),

@@ -1,11 +1,12 @@
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::HashMap,
     ffi::OsStr,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use memmap2::Mmap;
 use object::{
     Object as _, ObjectSection, ObjectSymbol as _, ReadRef, SectionIndex, SymbolIndex, U16Bytes,
     U32Bytes,
@@ -23,14 +24,22 @@ use rayon::Scope;
 
 use crate::{
     ErrorContext,
-    arena::ArenaRef,
+    arena::{ArenaRef, TypedArena},
     coff::{
         CoffFlags, ComdatSelection, ImageFileMachine, SectionFlags, SectionNumber, StorageClass,
     },
     context::LinkContext,
     make_error,
+    outputs::{OutputSectionId, SectionKey},
     symbols::{GlobalSymbol, SymbolId},
 };
+
+#[derive(Default)]
+pub struct InputsStore<'a> {
+    pub files: TypedArena<InputFile<'a>>,
+    pub mappings: TypedArena<Mmap>,
+    pub objs: TypedArena<ObjectFile<'a>>,
+}
 
 #[derive(Debug)]
 pub struct InputFile<'a> {
@@ -427,17 +436,20 @@ impl<'a> ObjectFile<'a> {
                 .coff_relocations()
                 .with_context(|| format!("section at index {i}"))?;
 
-            self.sections[i] = Some(InputSection {
+            self.sections[coff_section.index().0] = Some(InputSection {
                 name,
                 data: coff_section
                     .data()
                     .with_context(|| format!("section at index {i}"))?,
                 length: 0,
+                virtual_address: 0,
                 checksum: 0,
                 characteristics,
                 coff_relocs: relocs.into(),
                 associative: None,
+                index: coff_section.index(),
                 discarded: AtomicBool::new(false),
+                output: OutputSectionId::Null,
             });
         }
 
@@ -664,11 +676,14 @@ impl<'a> ObjectFile<'a> {
             name: section_name,
             data: section_data,
             checksum: 0,
+            virtual_address: 0,
             length: section_data.len().saturating_sub(2) as u32,
             characteristics,
             coff_relocs,
             associative: None,
+            index: SectionIndex(1),
             discarded: AtomicBool::new(false),
+            output: OutputSectionId::Null,
         }));
 
         // TODO: Finish
@@ -770,32 +785,38 @@ impl<'a> ObjectFile<'a> {
         }
     }
 
-    pub fn compute_dependencies(&self, ctx: &LinkContext<'a>) -> Vec<ObjectFileId> {
-        let mut dependencies = Vec::new();
-        let mut seen = HashSet::new();
-        for symbol in self.symbols.iter().flatten() {
-            if symbol.is_local() {
-                continue;
-            }
-
-            let external_ref = ctx.symbol_map.get(symbol.external_id.unwrap()).unwrap();
-            let global = external_ref.read().unwrap();
-            if global.owner == self.id || global.owner.is_invalid() {
-                continue;
-            }
-
-            if seen.insert(global.owner) {
-                dependencies.push(global.owner);
+    /// Assigns input sections to known output sections.
+    ///
+    /// Returns a map of unhandled section keys and the list of input sections
+    /// that need an output section created for the key
+    pub fn assign_known_output_sections(&mut self) -> HashMap<SectionKey<'a>, Vec<SectionIndex>> {
+        let mut unknown = HashMap::new();
+        for section in self.sections.iter_mut().flatten() {
+            let mut key = SectionKey::new(section);
+            if let Some(output_id) = key.known_output() {
+                section.output = output_id;
+            } else {
+                // Remove the subsection name so that these get binned
+                // by output name
+                key.subname = None;
+                let list: &mut Vec<_> = unknown.entry(key).or_default();
+                list.push(section.index);
             }
         }
 
-        dependencies
+        unknown
     }
 
     pub fn input_section(&self, index: SectionIndex) -> Option<&InputSection<'a>> {
         self.sections
             .get(index.0)
             .and_then(|section| section.as_ref())
+    }
+
+    pub fn input_section_mut(&mut self, index: SectionIndex) -> Option<&mut InputSection<'a>> {
+        self.sections
+            .get_mut(index.0)
+            .and_then(|section| section.as_mut())
     }
 
     pub fn input_symbol(&self, index: SymbolIndex) -> Option<&InputSymbol<'a>> {
@@ -807,12 +828,15 @@ impl<'a> ObjectFile<'a> {
 pub struct InputSection<'a> {
     pub name: &'a [u8],
     pub data: &'a [u8],
+    pub virtual_address: u32,
     pub checksum: u32,
     pub length: u32,
     pub characteristics: SectionFlags,
+    pub index: SectionIndex,
     pub coff_relocs: Cow<'a, [pe::ImageRelocation]>,
     pub associative: Option<SectionIndex>,
     pub discarded: AtomicBool,
+    pub output: OutputSectionId,
 }
 
 #[derive(Debug)]
