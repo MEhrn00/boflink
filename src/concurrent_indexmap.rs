@@ -7,7 +7,7 @@
 //!
 //! An indexmap is used internally but insertion order is not retained.
 use std::{
-    hash::{BuildHasher, Hash, Hasher, RandomState},
+    hash::{BuildHasher, Hash, RandomState},
     marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr::NonNull,
@@ -21,23 +21,25 @@ use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelI
 /// Index value returned for retrieving items later
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Index {
-    slot: usize,
-    index: usize,
+    slot: u32,
+    index: u32,
 }
 
 impl Index {
     pub const fn slot(&self) -> usize {
-        self.slot
+        self.slot as usize
     }
 
     pub const fn index(&self) -> usize {
-        self.index
+        self.index as usize
     }
 }
 
+type SlotEntry<K, V, S> = CachePadded<RwLock<IndexMap<K, V, S>>>;
+
 pub struct ConcurrentIndexMap<K, V, S = RandomState> {
     hash_builder: S,
-    slots: Box<[CachePadded<RwLock<IndexMap<K, V, S>>>]>,
+    slots: Box<[SlotEntry<K, V, S>]>,
 }
 
 impl<K, V> ConcurrentIndexMap<K, V, RandomState> {
@@ -94,7 +96,7 @@ impl<K, V, S: Clone> ConcurrentIndexMap<K, V, S> {
             capacity = capacity.next_multiple_of(slot_count);
         }
 
-        capacity = capacity / slot_count;
+        capacity /= slot_count;
 
         Self {
             hash_builder: hasher.clone(),
@@ -195,16 +197,16 @@ where
         match guard.entry(key) {
             indexmap::map::Entry::Vacant(entry) => Entry::Vacant(VacantEntry {
                 index: Index {
-                    slot: slot_idx,
-                    index: entry.index(),
+                    slot: slot_idx as u32,
+                    index: entry.index() as u32,
                 },
                 key: entry.into_key(),
                 map: guard,
             }),
             indexmap::map::Entry::Occupied(entry) => Entry::Occupied(OccupiedEntry {
                 index: Index {
-                    slot: slot_idx,
-                    index: entry.index(),
+                    slot: slot_idx as u32,
+                    index: entry.index() as u32,
                 },
                 map: guard,
             }),
@@ -220,12 +222,12 @@ where
         match slot.entry(key) {
             indexmap::map::Entry::Occupied(entry) => {
                 ExclusiveEntry::Occupied(ExclusiveOccupiedEntry {
-                    slot: slot_idx,
+                    slot: slot_idx as u32,
                     entry,
                 })
             }
             indexmap::map::Entry::Vacant(entry) => ExclusiveEntry::Vacant(ExclusiveVacantEntry {
-                slot: slot_idx,
+                slot: slot_idx as u32,
                 entry,
             }),
         }
@@ -243,9 +245,7 @@ where
     }
 
     fn compute_slot(&self, key: &K) -> usize {
-        let mut state = self.hash_builder.build_hasher();
-        key.hash(&mut state);
-        state.finish() as usize % self.slots.len()
+        self.hash_builder.hash_one(key) as usize % self.slots.len()
     }
 }
 
@@ -334,12 +334,12 @@ where
     S: BuildHasher,
 {
     pub fn insert(&mut self, value: V) -> V {
-        let mut entry = self.map.get_index_entry(self.index.index).unwrap();
+        let mut entry = self.map.get_index_entry(self.index.index()).unwrap();
         entry.insert(value)
     }
 
     pub fn into_mut(mut self) -> RefMut<'a, K, V, S> {
-        let entry = self.map.get_index_entry(self.index.index).unwrap();
+        let entry = self.map.get_index_entry(self.index.index()).unwrap();
         let key = NonNull::from(entry.key());
         let value = NonNull::from(entry.into_mut());
         RefMut {
@@ -438,7 +438,7 @@ impl<'a, K, V> ExclusiveEntry<'a, K, V> {
 }
 
 pub struct ExclusiveOccupiedEntry<'a, K, V> {
-    slot: usize,
+    slot: u32,
     entry: indexmap::map::OccupiedEntry<'a, K, V>,
 }
 
@@ -446,7 +446,7 @@ impl<'a, K, V> ExclusiveOccupiedEntry<'a, K, V> {
     pub fn index(&self) -> Index {
         Index {
             slot: self.slot,
-            index: self.entry.index(),
+            index: self.entry.index() as u32,
         }
     }
 
@@ -460,7 +460,7 @@ impl<'a, K, V> ExclusiveOccupiedEntry<'a, K, V> {
 }
 
 pub struct ExclusiveVacantEntry<'a, K, V> {
-    slot: usize,
+    slot: u32,
     entry: indexmap::map::VacantEntry<'a, K, V>,
 }
 
@@ -468,7 +468,7 @@ impl<'a, K, V> ExclusiveVacantEntry<'a, K, V> {
     pub fn index(&self) -> Index {
         Index {
             slot: self.slot,
-            index: self.entry.index(),
+            index: self.entry.index() as u32,
         }
     }
 
