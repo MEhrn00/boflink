@@ -126,7 +126,6 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
     }
 
     linker.resolve_symbols(&mut ctx);
-
     linker.create_output_sections(&mut ctx);
 
     let mut stats = std::mem::take(&mut ctx.stats);

@@ -147,9 +147,9 @@ pub fn create_reserved_sections<'a>(
 ) -> Vec<ArenaRef<'a, OutputSection<'a>>> {
     let mut sections = Vec::with_capacity(OutputSectionId::Edata.0 as usize + 1);
 
-    let mut add = |name, flags| {
+    let mut push = |name: &'a str, flags| {
         let id = OutputSectionId(sections.len() as u32);
-        sections.push(arena.alloc_ref(OutputSection::new(id, name, flags, false)));
+        sections.push(arena.alloc_ref(OutputSection::new(id, name.as_bytes(), flags, false)));
     };
 
     let r = SectionFlags::MemRead;
@@ -162,35 +162,35 @@ pub fn create_reserved_sections<'a>(
     let uninit = SectionFlags::CntUninitializedData;
     let link_info = SectionFlags::LnkInfo;
 
-    add(b"", SectionFlags::empty()); // Null section
-    add(b".text", code | r | x);
-    add(b".data", data | r | w);
-    add(b".bss", uninit | r | w);
-    add(b".rdata", data | r);
-    add(b".xdata", data | r);
-    add(b".pdata", data | r);
-    add(b".ctors", data | r | w);
-    add(b".dtors", data | r | w);
-    add(b".sxdata", link_info);
-    add(b".debug$S", r | discardable);
-    add(b".debug$T", r | discardable);
-    add(b".debug$P", r | discardable);
-    add(b".debug$F", r | discardable);
-    add(b".debug_info", r | discardable);
-    add(b".debug_abbrev", r | discardable);
-    add(b".debug_aranges", r | discardable);
-    add(b".debug_rnglists", r | discardable);
-    add(b".debug_line", r | discardable);
-    add(b".debug_str", r | discardable);
-    add(b".debug_line_str", r | discardable);
-    add(b".rdata$zzz", data | r);
-    add(b".debug_frame", r | discardable);
-    add(b".tls", data | r | w);
-    add(b".tls$", data | r | w);
-    add(b".rsrc", data | r);
-    add(b".cormeta", link_info);
-    add(b".idata", data | r | w);
-    add(b".edata", data | r);
+    push("", SectionFlags::empty()); // Null section
+    push(".text", code | r | x);
+    push(".data", data | r | w);
+    push(".bss", uninit | r | w);
+    push(".rdata", data | r);
+    push(".xdata", data | r);
+    push(".pdata", data | r);
+    push(".ctors", data | r | w);
+    push(".dtors", data | r | w);
+    push(".sxdata", link_info);
+    push(".debug$S", r | discardable);
+    push(".debug$T", r | discardable);
+    push(".debug$P", r | discardable);
+    push(".debug$F", r | discardable);
+    push(".debug_info", r | discardable);
+    push(".debug_abbrev", r | discardable);
+    push(".debug_aranges", r | discardable);
+    push(".debug_rnglists", r | discardable);
+    push(".debug_line", r | discardable);
+    push(".debug_str", r | discardable);
+    push(".debug_line_str", r | discardable);
+    push(".rdata$zzz", data | r);
+    push(".debug_frame", r | discardable);
+    push(".tls", data | r | w);
+    push(".tls$", data | r | w);
+    push(".rsrc", data | r);
+    push(".cormeta", link_info);
+    push(".idata", data | r | w);
+    push(".edata", data | r);
 
     sections
 }
@@ -204,15 +204,14 @@ pub struct SectionKey<'a> {
 
 impl<'a> SectionKey<'a> {
     pub fn new(input_section: &InputSection<'a>) -> SectionKey<'a> {
-        let split_at = input_section.name.iter().position(|&ch| ch == b'$');
-        let (name, subname) = if let Some(split_at) = split_at {
-            (
-                &input_section.name[..split_at],
-                Some(&input_section.name[split_at + 1..]),
-            )
-        } else {
-            (input_section.name, None)
-        };
+        let mut name = input_section.name;
+        let mut subname = None;
+
+        let dollar = input_section.name.iter().position(|&ch| ch == b'$');
+        if let Some(dollar) = dollar {
+            name = &input_section.name[..dollar];
+            subname = Some(&input_section.name[dollar + 1..]);
+        }
 
         SectionKey {
             name,
@@ -282,7 +281,7 @@ impl<'a> SectionKey<'a> {
             Some(OutputSectionId::DebugLineStr)
         } else if name == b".debug_frame" && flags(data | r | discardable) {
             Some(OutputSectionId::DebugFrame)
-        } else if name == b".tls" && subname == None && flags(data | r | w) {
+        } else if name == b".tls" && subname.is_none() && flags(data | r | w) {
             Some(OutputSectionId::Tls)
         } else if name == b".tls" && flags(data | r | w) {
             Some(OutputSectionId::TlsD)
@@ -290,9 +289,7 @@ impl<'a> SectionKey<'a> {
             Some(OutputSectionId::Rsrc)
         } else if name == b".cormeta" && flags(link_info) {
             Some(OutputSectionId::Cormeta)
-            // MinGW import libraries are inconsistent on setting the IMAGE_SCN_CNT_INITIALIZED
-            // flag for legacy COFF imports
-        } else if name == b".idata" && (flags(data | r | w) || flags(r | w)) {
+        } else if name == b".idata" && flags(data | r | w) {
             Some(OutputSectionId::Idata)
         } else if name == b".edata" && flags(data | r) {
             Some(OutputSectionId::Edata)

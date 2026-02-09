@@ -27,9 +27,6 @@ use crate::{
     inputs::ObjectFileId,
 };
 
-const SLOT_BITS: u32 = 8;
-const MAX_SLOTS: usize = 2usize.pow(SLOT_BITS - 1);
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct SymbolId(Index);
@@ -85,9 +82,8 @@ pub struct SymbolMap<'a> {
 
 impl<'a> SymbolMap<'a> {
     pub fn with_slot_count(count: usize) -> Self {
-        let count = count.next_power_of_two();
         Self {
-            map: ConcurrentIndexMap::with_slot_count(count.max(MAX_SLOTS)),
+            map: ConcurrentIndexMap::with_slot_count(count.next_power_of_two()),
         }
     }
 
