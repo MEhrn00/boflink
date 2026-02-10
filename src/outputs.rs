@@ -23,28 +23,25 @@
 /// 4. .rdata (read-only data)
 /// 5. .xdata (unwind)
 /// 6. .pdata (exception)
-/// 7. .ctors (global constructors)
-/// 8. .dtors (global destructors)
-/// 9. .sxdata (registered exception)
-/// 10. .debug$S (debug symbols)
-/// 11. .debug$T (debug types)
-/// 12. .debug$P (precompiled debug types)
-/// 13. .debug$F (FPO debug info)
-/// 14. .debug_info (DWARF info)
-/// 15. .debug_abbrev (DWARF debug)
-/// 16. .debug_aranges (DWARF debug)
-/// 17. .debug_rnglists (DWARF)
-/// 18. .debug_line (DWARF line info)
-/// 19. .debug_str (DWARF strings)
-/// 20. .debug_line_str (DWARF line strings)
-/// 21. .rdata$zzz (GCC ident)
-/// 22. .debug_frame (DWARF frame)
-/// 23. .tls (thread-local storage)
-/// 24. .tls$ (thread-local storage)
-/// 25. .rsrc (resources)
-/// 26. .cormeta (CLR metadata, should not be seen)
-/// 27. .idata (import information, discarded)
-/// 28. .edata (export information, discarded)
+/// 7. .eh_frame (exception)
+/// 8. .ctors (global constructors)
+/// 9. .dtors (global destructors)
+/// 10. .tls (thread-local storage)
+/// 11. .rsrc (resources)
+/// 12. .idata (import information)
+/// 13. .debug$S (debug symbols)
+/// 14. .debug$T (debug types)
+/// 15. .debug$P (precompiled debug types)
+/// 16. .debug$F (FPO debug info)
+/// 17. .debug_info (DWARF info)
+/// 18. .debug_abbrev (DWARF debug)
+/// 19. .debug_aranges (DWARF debug)
+/// 20. .debug_rnglists (DWARF)
+/// 21. .debug_line (DWARF line info)
+/// 22. .debug_str (DWARF strings)
+/// 23. .debug_line_str (DWARF line strings)
+/// 24. .debug_frame (DWARF frame)
+/// 25. .sxdata (registered exception)
 ///
 /// All other sections are ordered after the reserved sections on a "first-seen" basis.
 use object::SectionIndex;
@@ -52,6 +49,7 @@ use object::SectionIndex;
 use crate::{
     arena::{ArenaHandle, ArenaRef},
     coff::SectionFlags,
+    context::LinkContext,
     inputs::{InputSection, ObjectFileId},
 };
 
@@ -70,28 +68,25 @@ impl OutputSectionId {
     pub const Rdata: Self = Self(4);
     pub const Xdata: Self = Self(5);
     pub const Pdata: Self = Self(6);
-    pub const Ctors: Self = Self(7);
-    pub const Dtors: Self = Self(8);
-    pub const Sxdata: Self = Self(9);
-    pub const DebugS: Self = Self(10);
-    pub const DebugT: Self = Self(11);
-    pub const DebugP: Self = Self(12);
-    pub const DebugF: Self = Self(13);
-    pub const DebugInfo: Self = Self(14);
-    pub const DebugAbbrev: Self = Self(15);
-    pub const DebugAranges: Self = Self(16);
-    pub const DebugRnglists: Self = Self(17);
-    pub const DebugLine: Self = Self(18);
-    pub const DebugStr: Self = Self(19);
-    pub const DebugLineStr: Self = Self(20);
-    pub const GccIdent: Self = Self(21);
-    pub const DebugFrame: Self = Self(22);
-    pub const Tls: Self = Self(23);
-    pub const TlsD: Self = Self(24);
-    pub const Rsrc: Self = Self(25);
-    pub const Cormeta: Self = Self(26);
-    pub const Idata: Self = Self(27);
-    pub const Edata: Self = Self(28);
+    pub const EhFrame: Self = Self(7);
+    pub const Ctors: Self = Self(8);
+    pub const Dtors: Self = Self(9);
+    pub const Tls: Self = Self(10);
+    pub const Rsrc: Self = Self(11);
+    pub const Idata: Self = Self(12);
+    pub const DebugS: Self = Self(13);
+    pub const DebugT: Self = Self(14);
+    pub const DebugP: Self = Self(15);
+    pub const DebugF: Self = Self(16);
+    pub const DebugInfo: Self = Self(17);
+    pub const DebugAbbrev: Self = Self(18);
+    pub const DebugAranges: Self = Self(19);
+    pub const DebugRnglists: Self = Self(20);
+    pub const DebugLine: Self = Self(21);
+    pub const DebugStr: Self = Self(22);
+    pub const DebugLineStr: Self = Self(23);
+    pub const DebugFrame: Self = Self(24);
+    pub const Sxdata: Self = Self(25);
 }
 
 impl OutputSectionId {
@@ -110,7 +105,6 @@ pub struct OutputSection<'a> {
     pub name: &'a [u8],
     pub index: SectionIndex,
     pub characteristics: SectionFlags,
-    pub checksum: u32,
     pub length: u32,
     pub discard: bool,
     pub inputs: Vec<(ObjectFileId, SectionIndex)>,
@@ -135,7 +129,6 @@ impl<'a> OutputSection<'a> {
             characteristics,
             discard,
             index: SectionIndex(0),
-            checksum: 0,
             length: 0,
             inputs: Vec::new(),
         }
@@ -145,7 +138,7 @@ impl<'a> OutputSection<'a> {
 pub fn create_reserved_sections<'a>(
     arena: &ArenaHandle<'a, OutputSection<'a>>,
 ) -> Vec<ArenaRef<'a, OutputSection<'a>>> {
-    let mut sections = Vec::with_capacity(OutputSectionId::Edata.0 as usize + 1);
+    let mut sections = Vec::with_capacity(27);
 
     let mut push = |name: &'a str, flags| {
         let id = OutputSectionId(sections.len() as u32);
@@ -169,9 +162,12 @@ pub fn create_reserved_sections<'a>(
     push(".rdata", data | r);
     push(".xdata", data | r);
     push(".pdata", data | r);
+    push(".eh_frame", data | r);
     push(".ctors", data | r | w);
     push(".dtors", data | r | w);
-    push(".sxdata", link_info);
+    push(".tls", data | r | w);
+    push(".rsrc", data | r);
+    push(".idata", data | r | w);
     push(".debug$S", r | discardable);
     push(".debug$T", r | discardable);
     push(".debug$P", r | discardable);
@@ -183,42 +179,87 @@ pub fn create_reserved_sections<'a>(
     push(".debug_line", r | discardable);
     push(".debug_str", r | discardable);
     push(".debug_line_str", r | discardable);
-    push(".rdata$zzz", data | r);
     push(".debug_frame", r | discardable);
-    push(".tls", data | r | w);
-    push(".tls$", data | r | w);
-    push(".rsrc", data | r);
-    push(".cormeta", link_info);
-    push(".idata", data | r | w);
-    push(".edata", data | r);
+    push(".sxdata", link_info);
 
     sections
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SectionKey<'a> {
-    pub name: &'a [u8],
-    pub subname: Option<&'a [u8]>,
-    pub flags: SectionFlags,
+    name: &'a [u8],
+    flags: SectionFlags,
 }
 
 impl<'a> SectionKey<'a> {
-    pub fn new(input_section: &InputSection<'a>) -> SectionKey<'a> {
-        let mut name = input_section.name;
-        let mut subname = None;
+    pub fn new(ctx: &LinkContext, section: &InputSection<'a>) -> SectionKey<'a> {
+        let mut name = section.name;
+        let flags =
+            section.characteristics.memory_flags() | section.characteristics.contents_flags();
 
-        let dollar = input_section.name.iter().position(|&ch| ch == b'$');
-        if let Some(dollar) = dollar {
-            name = &input_section.name[..dollar];
-            subname = Some(&input_section.name[dollar + 1..]);
+        let r = SectionFlags::MemRead;
+        let w = SectionFlags::MemWrite;
+        let discardable = SectionFlags::MemDiscardable;
+        let data = SectionFlags::CntInitializedData;
+        let link_info = SectionFlags::LnkInfo;
+
+        let merge_name = |name: &'a [u8]| {
+            let dollar = name.iter().position(|&ch| ch == b'$');
+            if let Some(dollar) = dollar {
+                &name[..dollar]
+            } else {
+                name
+            }
+        };
+
+        let has_any = |checks: &[(&str, SectionFlags)], name: &[u8], flags| -> bool {
+            checks
+                .iter()
+                .any(|(s, f)| *f == flags && s.as_bytes() == name)
+        };
+
+        let has_any_prefix = |checks: &[(&str, SectionFlags)], name: &[u8], flags| -> bool {
+            checks
+                .iter()
+                .any(|(s, f)| *f == flags && name.starts_with(s.as_bytes()))
+        };
+
+        if ctx.options.force_group_allocation {
+            // Do not merge these sections
+            let ignore_merge = [
+                (".debug$S", r | discardable),
+                (".debug$T", r | discardable),
+                (".debug$P", r | discardable),
+                (".debug$F", r | discardable),
+                (".sxdata", link_info),
+            ];
+
+            let ignore_merge_prefixes = [(".sxdata$", link_info)];
+
+            if !(has_any(&ignore_merge, name, flags)
+                || has_any_prefix(&ignore_merge_prefixes, name, flags))
+            {
+                name = merge_name(name);
+            }
+        } else {
+            // Always merge these sections. This makes looking up import information
+            // easier
+            let should_merge_prefixes = [(".idata$", data | r | w)];
+
+            if has_any_prefix(&should_merge_prefixes, name, flags) {
+                name = merge_name(name);
+            }
         }
 
-        SectionKey {
-            name,
-            subname,
-            flags: input_section.characteristics.memory_flags()
-                | input_section.characteristics.contents_flags(),
-        }
+        SectionKey { name, flags }
+    }
+
+    pub fn name(&self) -> &'a [u8] {
+        self.name
+    }
+
+    pub fn flags(&self) -> SectionFlags {
+        self.flags
     }
 
     pub fn known_output(&self) -> Option<OutputSectionId> {
@@ -235,7 +276,6 @@ impl<'a> SectionKey<'a> {
         let flags = |v| self.flags == v;
 
         let name = self.name;
-        let subname = self.subname;
 
         if name == b".text" && flags(code | r | x) {
             Some(OutputSectionId::Text)
@@ -243,8 +283,6 @@ impl<'a> SectionKey<'a> {
             Some(OutputSectionId::Data)
         } else if name == b".bss" && flags(uninit | r | w) {
             Some(OutputSectionId::Bss)
-        } else if name == b".rdata" && subname == Some(b"zzz") && flags(data | r) {
-            Some(OutputSectionId::GccIdent)
         } else if name == b".rdata" && flags(data | r) {
             Some(OutputSectionId::Rdata)
         } else if name == b".xdata" && flags(data | r) {
@@ -257,13 +295,13 @@ impl<'a> SectionKey<'a> {
             Some(OutputSectionId::Dtors)
         } else if name == b".sxdata" && flags(link_info) {
             Some(OutputSectionId::Sxdata)
-        } else if name == b".debug" && subname == Some(b"S") && flags(data | r | discardable) {
+        } else if name == b".debug$S" && flags(data | r | discardable) {
             Some(OutputSectionId::DebugS)
-        } else if name == b".debug" && subname == Some(b"T") && flags(data | r | discardable) {
+        } else if name == b".debug$T" && flags(data | r | discardable) {
             Some(OutputSectionId::DebugT)
-        } else if name == b".debug" && subname == Some(b"P") && flags(data | r | discardable) {
+        } else if name == b".debug$P" && flags(data | r | discardable) {
             Some(OutputSectionId::DebugP)
-        } else if name == b".debug" && subname == Some(b"F") && flags(data | r | discardable) {
+        } else if name == b".debug$F" && flags(data | r | discardable) {
             Some(OutputSectionId::DebugF)
         } else if name == b".debug_info" && flags(data | r | discardable) {
             Some(OutputSectionId::DebugInfo)
@@ -281,18 +319,12 @@ impl<'a> SectionKey<'a> {
             Some(OutputSectionId::DebugLineStr)
         } else if name == b".debug_frame" && flags(data | r | discardable) {
             Some(OutputSectionId::DebugFrame)
-        } else if name == b".tls" && subname.is_none() && flags(data | r | w) {
-            Some(OutputSectionId::Tls)
         } else if name == b".tls" && flags(data | r | w) {
-            Some(OutputSectionId::TlsD)
+            Some(OutputSectionId::Tls)
         } else if name == b".rsrc" && flags(data | r) {
             Some(OutputSectionId::Rsrc)
-        } else if name == b".cormeta" && flags(link_info) {
-            Some(OutputSectionId::Cormeta)
         } else if name == b".idata" && flags(data | r | w) {
             Some(OutputSectionId::Idata)
-        } else if name == b".edata" && flags(data | r) {
-            Some(OutputSectionId::Edata)
         } else {
             None
         }

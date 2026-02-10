@@ -1,11 +1,17 @@
 use std::{
     collections::HashMap,
-    sync::{RwLock, atomic::Ordering},
+    sync::{
+        RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
-use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
+use rayon::{
+    iter::{
+        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+        IntoParallelRefMutIterator, ParallelExtend, ParallelIterator,
+    },
+    slice::ParallelSliceMut,
 };
 
 use crate::{
@@ -23,7 +29,7 @@ use crate::{
 pub struct Linker<'a> {
     pub architecture: ImageFileMachine,
     strings: ArenaHandle<'a, u8>,
-    sections: ArenaHandle<'a, OutputSection<'a>>,
+    sections_arena: ArenaHandle<'a, OutputSection<'a>>,
     pub objs: Vec<ArenaRef<'a, ObjectFile<'a>>>,
     pub output_sections: Vec<ArenaRef<'a, OutputSection<'a>>>,
     pub root_symbols: Vec<SymbolId>,
@@ -57,7 +63,7 @@ impl<'a> Linker<'a> {
         Ok(Self {
             architecture: reader.architecture,
             strings,
-            sections: ctx.section_pool.get(),
+            sections_arena: ctx.section_pool.get(),
             objs: input_objs.into_vec(),
             root_symbols: Vec::new(),
             output_sections: Vec::new(),
@@ -130,6 +136,27 @@ impl<'a> Linker<'a> {
             });
         });
 
+        // From this point, all object files needed are set as live
+
+        // Resolve COMDAT leaders for live objects. This needs to happen live
+        // objects to select the correct definition that should be used
+        self.objs.par_iter().for_each(|obj| {
+            if obj.live.load(Ordering::Relaxed) {
+                obj.resolve_comdat_leaders(ctx, &self.objs);
+            }
+        });
+
+        self.objs.par_iter_mut().for_each(|obj| {
+            let ctx = &*ctx;
+            if obj.live.load(Ordering::Relaxed) {
+                if let Err(e) = obj.discard_unused_comdats(ctx) {
+                    log::error!(logger: ctx, "{}: {e}", obj.source());
+                }
+            }
+        });
+
+        ctx.exclusive_check_errored();
+
         // Redo symbol resolution from a clean slate using only the included object
         // files. This fixes the global symbol map in cases where an early object
         // file was chosen during the first symbol resolution pass but a later
@@ -168,56 +195,179 @@ impl<'a> Linker<'a> {
     pub fn create_output_sections(&mut self, ctx: &mut LinkContext<'a>) {
         let _timer = ScopedTimer::msg("output section allocation");
         // Add reserved sections
-        self.output_sections = create_reserved_sections(&self.sections);
+        self.output_sections = create_reserved_sections(&self.sections_arena);
 
-        // Go through input sections and key them based on their names and
-        // characteristics. This optimistically maps them assuming that grouped
-        // sections will be merged. Any unknown sections that cannot be mapped
-        // to a reserved section need to be allocated
+        let mut section_map = HashMap::<SectionKey, OutputSectionId>::new();
+        let map_ref = RwLock::new((&mut section_map, &mut self.output_sections));
 
-        let mut global_map = HashMap::<SectionKey, OutputSectionId>::new();
-        let map_ref = RwLock::new((&mut global_map, &mut self.output_sections));
-
-        self.objs
+        let inputs_matricies = self
+            .objs
             .par_iter_mut()
             .map(|obj| {
-                // Assign input sections to known output sections while collecting
-                // a list of unhandled inputs
-                let unhandled = obj.assign_known_output_sections();
-                (obj, unhandled)
-            })
-            .filter(|(_, unhandled)| !unhandled.is_empty())
-            .for_each_init(
-                || (&map_ref, ctx.section_pool.get()),
-                |(map_ref, section_arena), (obj, local_map)| {
-                    // Go through non-empty lists of object-local unhandled sections and allocate
-                    // new output sections for them. Hopefully, there are not that many object files
-                    // which need new output sections allocated so this will not run as often
-                    let mut global_map = map_ref.write().unwrap();
-                    let mut map = std::mem::take(global_map.0);
-                    for (key, unhandled) in local_map {
-                        let entry = map.entry(key);
-                        let id = *entry.or_insert_with_key(|key| {
-                            let id = OutputSectionId::new(global_map.1.len());
-                            global_map.1.push(
-                                section_arena
-                                    .alloc_ref(OutputSection::new(id, key.name, key.flags, false)),
-                            );
-                            id
-                        });
-
-                        unhandled.into_iter().for_each(|index| {
-                            log::debug!(
-                                "{}: handling assignment for input section {index}",
-                                obj.source()
-                            );
-                            let section = obj.input_section_mut(index).unwrap();
-                            section.output = id;
-                        });
+                // Create a matrix where X is the index of the output section
+                // and Y is the list of input sections for that output section
+                let mut outputs_matrix = Vec::new();
+                outputs_matrix.resize(26, Vec::new());
+                let mut needed_sections = HashMap::<SectionKey, Vec<_>>::new();
+                for section in obj.sections.iter_mut().flatten() {
+                    if *section.discarded.get_mut() {
+                        continue;
                     }
 
-                    let _ = std::mem::replace(global_map.0, map);
-                },
-            );
+                    let key = SectionKey::new(ctx, section);
+                    if let Some(id) = key.known_output() {
+                        section.output = id;
+                        outputs_matrix[id.index()].push(section.index);
+                    } else {
+                        needed_sections.entry(key).or_default().push(section.index);
+                    }
+                }
+
+                (obj, outputs_matrix, needed_sections)
+            })
+            .map(|(obj, mut outputs_matrix, needed_sections)| {
+                // If the object file contained input sections that could not be
+                // speculatively placed into a known section, allocate needed
+                // output sections.
+                if !needed_sections.is_empty() {
+                    let mut global_map = map_ref.write().unwrap();
+                    let mut map = std::mem::take(global_map.0);
+                    let section_arena = ctx.section_pool.get();
+                    for (key, indicies) in needed_sections {
+                        let name = key.name();
+                        let flags = key.flags();
+                        let output_id = *map.entry(key).or_insert_with(|| {
+                            let id = OutputSectionId::new(global_map.1.len());
+                            section_arena.alloc_ref(OutputSection::new(id, name, flags, false));
+                            id
+                        });
+                        outputs_matrix.resize(output_id.index() + 1, Vec::new());
+                        outputs_matrix[output_id.index()] = indicies
+                            .into_iter()
+                            .map(|index| {
+                                let section = obj.input_section_mut(index).unwrap();
+                                section.output = output_id;
+                                index
+                            })
+                            .collect();
+                    }
+                }
+
+                // Return the object file id and matrix of output section mappings
+                (obj.id, outputs_matrix)
+            })
+            .collect::<Vec<_>>();
+
+        // Join input sections to each output section
+        self.output_sections
+            .par_iter_mut()
+            .for_each(|output_section| {
+                let output_id = output_section.id;
+                let mut alignment = AtomicUsize::new(0);
+
+                output_section
+                    .inputs
+                    .par_extend(inputs_matricies.par_iter().flat_map(|(objid, matrix)| {
+                        let alignment = &alignment;
+                        let objid = *objid;
+                        let obj = &self.objs[objid.index().unwrap()];
+                        // Get the associated list of input sections from the object
+                        // file that are mapped to this output section
+                        let inputs = &matrix[output_id.index()];
+                        inputs.par_iter().copied().map(move |index| {
+                            let input_section = obj.input_section(index).unwrap();
+                            let section_align = input_section.characteristics.alignment();
+                            // Compute alignment needed
+                            if section_align > 0 {
+                                alignment.fetch_max(section_align, Ordering::SeqCst);
+                            }
+                            (objid, index)
+                        })
+                    }));
+
+                // Set the needed alignment for the output section
+                output_section
+                    .characteristics
+                    .set_alignment((*alignment.get_mut()).min(8192));
+
+                // Sort sections
+                if output_section.id == OutputSectionId::Idata {
+                    let output_name = output_section.name;
+
+                    // MinGW specific import handling. These need to be sorted
+                    // to match the GCC i386pe[p] linker script:
+                    //     KEEP (SORT(*)(.idata$2))
+                    //     KEEP (SORT(*)(.idata$3))
+                    //     KEEP (SORT(*)(.idata$4))
+                    //     SORT(*)(.idata$5)
+                    //     KEEP (SORT(*)(.idata$6))
+                    //     KEEP (SORT(*)(.idata$7))
+                    //
+                    // Sort pattern
+                    // (<parent path>, <section subname>, <member path>)
+                    output_section
+                        .inputs
+                        .par_sort_unstable_by_key(|(objid, index)| {
+                            let objid = *objid;
+                            let index = *index;
+                            let obj = &self.objs[objid.index().unwrap()];
+                            let parent_path = obj.file.parent.map(|parent| parent.path);
+                            let member_path = obj.file.path;
+                            let mut section_name = obj.input_section(index).unwrap().name;
+                            section_name = &section_name[output_name.len()..];
+                            (parent_path, section_name, member_path)
+                        });
+                } else if ctx.options.force_group_allocation {
+                    let output_name = output_section.name;
+                    output_section.inputs.par_sort_unstable_by_key(
+                        |(objid, index)| -> (&'a [u8], ObjectFileId, usize) {
+                            let objid = *objid;
+                            let index = *index;
+                            let mut name = self.objs[objid.index().unwrap()]
+                                .input_section(index)
+                                .unwrap()
+                                .name;
+                            name = &name[output_name.len()..];
+                            // Sort by "$<subname>" then object order then section index
+                            (name, objid, index.0)
+                        },
+                    );
+                } else {
+                    // Sort by object order and section index if not merging grouped sections
+                    output_section
+                        .inputs
+                        .par_sort_unstable_by_key(|(objid, index)| (*objid, index.0));
+                }
+            });
+
+        // Mark empty output sections as discarded unless they are explicitly
+        // kept reserved sections
+        self.output_sections.par_iter_mut().for_each(|section| {
+            if !(section.id > OutputSectionId::Null && section.id <= OutputSectionId::Bss) {
+                section.discard = section.inputs.is_empty();
+            }
+        });
+
+        // Debug print ordering. Sections have not been assigned virtual addresses
+        // at this point
+        if log::log_enabled!(log::Level::Debug) {
+            for section in self.output_sections.iter() {
+                if section.discard {
+                    continue;
+                }
+
+                let output_name = String::from_utf8_lossy(section.name);
+                for (id, index) in section.inputs.iter() {
+                    let obj = &self.objs[id.index().unwrap()];
+                    let index = *index;
+                    let input_name =
+                        String::from_utf8_lossy(obj.input_section(index).unwrap().name);
+                    log::debug!(
+                        "{}: section {input_name}({index}) mapped to {output_name}",
+                        obj.source()
+                    );
+                }
+            }
+        }
     }
 }

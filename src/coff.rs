@@ -308,7 +308,7 @@ impl SectionFlags {
             return;
         }
 
-        let clamped = (align - 1).next_power_of_two().max(8192);
+        let clamped = (align - 1).next_power_of_two().min(8192);
         self.0 |= (clamped.ilog2() + 1) << SECTION_FLAGS_ALIGN_SHIFT;
 
         debug_assert_eq!(
