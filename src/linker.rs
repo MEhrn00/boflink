@@ -20,19 +20,30 @@ use crate::{
     coff::ImageFileMachine,
     context::LinkContext,
     inputs::{InputsStore, ObjectFile, ObjectFileId},
-    outputs::{OutputSection, OutputSectionId, SectionKey, create_reserved_sections},
+    outputs::{
+        OutputSection, OutputSectionId, RebaseEntry, RebaseGroup, SectionKey,
+        create_reserved_sections,
+    },
     reader::InputsReader,
     symbols::{GlobalSymbol, MapEntry, SymbolId},
     timing::ScopedTimer,
 };
 
 pub struct Linker<'a> {
+    /// Architecture
     pub architecture: ImageFileMachine,
-    strings: ArenaHandle<'a, u8>,
-    sections_arena: ArenaHandle<'a, OutputSection<'a>>,
+
+    /// Input object files
     pub objs: Vec<ArenaRef<'a, ObjectFile<'a>>>,
-    pub output_sections: Vec<ArenaRef<'a, OutputSection<'a>>>,
+
+    /// Command line specified symbols
     pub root_symbols: Vec<SymbolId>,
+
+    /// Output sections
+    pub sections: Vec<ArenaRef<'a, OutputSection<'a>>>,
+
+    /// Local arena
+    arena: LinkerArena<'a>,
 }
 
 impl<'a> Linker<'a> {
@@ -62,11 +73,13 @@ impl<'a> Linker<'a> {
 
         Ok(Self {
             architecture: reader.architecture,
-            strings,
-            sections_arena: ctx.section_pool.get(),
             objs: input_objs.into_vec(),
             root_symbols: Vec::new(),
-            output_sections: Vec::new(),
+            sections: Vec::new(),
+            arena: LinkerArena {
+                strings,
+                sections: ctx.section_pool.get(),
+            },
         })
     }
 
@@ -75,7 +88,9 @@ impl<'a> Linker<'a> {
             return name;
         }
 
-        self.strings.alloc_bytes([b"_", name].concat().as_slice())
+        self.arena
+            .strings
+            .alloc_bytes([b"_", name].concat().as_slice())
     }
 
     pub fn add_root_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
@@ -175,6 +190,7 @@ impl<'a> Linker<'a> {
             .filter(|obj| obj.id.is_internal() || obj.live.load(Ordering::Relaxed))
             .collect::<Vec<_>>();
 
+        // Need to recompute ids since indicies have most likely changed
         self.objs
             .par_iter_mut()
             .enumerate()
@@ -195,10 +211,10 @@ impl<'a> Linker<'a> {
     pub fn create_output_sections(&mut self, ctx: &mut LinkContext<'a>) {
         let _timer = ScopedTimer::msg("output section allocation");
         // Add reserved sections
-        self.output_sections = create_reserved_sections(&self.sections_arena);
+        self.sections = create_reserved_sections(&self.arena.sections);
 
         let mut section_map = HashMap::<SectionKey, OutputSectionId>::new();
-        let map_ref = RwLock::new((&mut section_map, &mut self.output_sections));
+        let global_sections = RwLock::new((&mut section_map, &mut self.sections));
 
         let inputs_matricies = self
             .objs
@@ -210,6 +226,11 @@ impl<'a> Linker<'a> {
                 outputs_matrix.resize(26, Vec::new());
                 let mut needed_sections = HashMap::<SectionKey, Vec<_>>::new();
                 for section in obj.sections.iter_mut().flatten() {
+                    // Discard empty sections
+                    if section.length == 0 {
+                        *section.discarded.get_mut() = true;
+                    }
+
                     if *section.discarded.get_mut() {
                         continue;
                     }
@@ -230,15 +251,18 @@ impl<'a> Linker<'a> {
                 // speculatively placed into a known section, allocate needed
                 // output sections.
                 if !needed_sections.is_empty() {
-                    let mut global_map = map_ref.write().unwrap();
-                    let mut map = std::mem::take(global_map.0);
+                    let mut guard = global_sections.write().unwrap();
+                    let (mut section_map, mut section_list) =
+                        (std::mem::take(guard.0), std::mem::take(guard.1));
                     let section_arena = ctx.section_pool.get();
                     for (key, indicies) in needed_sections {
                         let name = key.name();
                         let flags = key.flags();
-                        let output_id = *map.entry(key).or_insert_with(|| {
-                            let id = OutputSectionId::new(global_map.1.len());
-                            section_arena.alloc_ref(OutputSection::new(id, name, flags, false));
+                        let output_id = *section_map.entry(key).or_insert_with(|| {
+                            let id = OutputSectionId::new(section_list.len());
+                            section_list.push(
+                                section_arena.alloc_ref(OutputSection::new(id, name, flags, false)),
+                            );
                             id
                         });
                         outputs_matrix.resize(output_id.index() + 1, Vec::new());
@@ -250,6 +274,9 @@ impl<'a> Linker<'a> {
                             })
                             .collect();
                     }
+
+                    let _ = std::mem::replace(guard.0, section_map);
+                    let _ = std::mem::replace(guard.1, section_list);
                 }
 
                 // Return the object file id and matrix of output section mappings
@@ -258,97 +285,128 @@ impl<'a> Linker<'a> {
             .collect::<Vec<_>>();
 
         // Join input sections to each output section
-        self.output_sections
-            .par_iter_mut()
-            .for_each(|output_section| {
-                let output_id = output_section.id;
-                let mut alignment = AtomicUsize::new(0);
+        self.sections.par_iter_mut().for_each(|output_section| {
+            let output_id = output_section.id;
+            let alignment = AtomicUsize::new(0);
 
+            output_section
+                .inputs
+                .par_extend(inputs_matricies.par_iter().flat_map(|(objid, matrix)| {
+                    let alignment = &alignment;
+                    let objid = *objid;
+                    let obj = &self.objs[objid.index().unwrap()];
+                    // Get the associated list of input sections from the object
+                    // file that are mapped to this output section
+                    let inputs = &matrix[output_id.index()];
+                    inputs.par_iter().copied().map(move |index| {
+                        let input_section = obj.input_section(index).unwrap();
+                        let section_align = input_section.characteristics.alignment();
+                        // Compute alignment needed
+                        if section_align > 0 {
+                            alignment.fetch_max(section_align, Ordering::SeqCst);
+                        }
+                        (objid, index)
+                    })
+                }));
+
+            // Check if this section is empty and mark it as discarded
+            if output_section.inputs.is_empty() {
+                output_section.discard = true;
+                return;
+            }
+
+            // Set alignment
+            output_section
+                .characteristics
+                .set_alignment(alignment.into_inner());
+
+            // Sort sections
+            if ctx.options.merge_groups {
+                let output_name = output_section.name;
+                output_section.inputs.par_sort_unstable_by_key(
+                    |(objid, index)| -> (&'a [u8], ObjectFileId, usize) {
+                        let objid = *objid;
+                        let index = *index;
+                        let mut name = self.objs[objid.index().unwrap()]
+                            .input_section(index)
+                            .unwrap()
+                            .name;
+                        name = &name[output_name.len()..];
+                        // Sort by "$<subname>" then object order then section index
+                        (name, objid, index.0)
+                    },
+                );
+            } else {
+                // Sort by object order and section index if not merging grouped sections
                 output_section
                     .inputs
-                    .par_extend(inputs_matricies.par_iter().flat_map(|(objid, matrix)| {
-                        let alignment = &alignment;
-                        let objid = *objid;
-                        let obj = &self.objs[objid.index().unwrap()];
-                        // Get the associated list of input sections from the object
-                        // file that are mapped to this output section
-                        let inputs = &matrix[output_id.index()];
-                        inputs.par_iter().copied().map(move |index| {
-                            let input_section = obj.input_section(index).unwrap();
-                            let section_align = input_section.characteristics.alignment();
-                            // Compute alignment needed
-                            if section_align > 0 {
-                                alignment.fetch_max(section_align, Ordering::SeqCst);
-                            }
-                            (objid, index)
-                        })
-                    }));
+                    .par_sort_unstable_by_key(|(objid, index)| (*objid, index.0));
+            }
+        });
 
-                // Set the needed alignment for the output section
-                output_section
-                    .characteristics
-                    .set_alignment((*alignment.get_mut()).min(8192));
-
-                // Sort sections
-                if output_section.id == OutputSectionId::Idata {
-                    let output_name = output_section.name;
-
-                    // MinGW specific import handling. These need to be sorted
-                    // to match the GCC i386pe[p] linker script:
-                    //     KEEP (SORT(*)(.idata$2))
-                    //     KEEP (SORT(*)(.idata$3))
-                    //     KEEP (SORT(*)(.idata$4))
-                    //     SORT(*)(.idata$5)
-                    //     KEEP (SORT(*)(.idata$6))
-                    //     KEEP (SORT(*)(.idata$7))
-                    //
-                    // Sort pattern
-                    // (<parent path>, <section subname>, <member path>)
-                    output_section
-                        .inputs
-                        .par_sort_unstable_by_key(|(objid, index)| {
-                            let objid = *objid;
-                            let index = *index;
-                            let obj = &self.objs[objid.index().unwrap()];
-                            let parent_path = obj.file.parent.map(|parent| parent.path);
-                            let member_path = obj.file.path;
-                            let mut section_name = obj.input_section(index).unwrap().name;
-                            section_name = &section_name[output_name.len()..];
-                            (parent_path, section_name, member_path)
-                        });
-                } else if ctx.options.merge_groups {
-                    let output_name = output_section.name;
-                    output_section.inputs.par_sort_unstable_by_key(
-                        |(objid, index)| -> (&'a [u8], ObjectFileId, usize) {
-                            let objid = *objid;
-                            let index = *index;
-                            let mut name = self.objs[objid.index().unwrap()]
-                                .input_section(index)
-                                .unwrap()
-                                .name;
-                            name = &name[output_name.len()..];
-                            // Sort by "$<subname>" then object order then section index
-                            (name, objid, index.0)
-                        },
-                    );
-                } else {
-                    // Sort by object order and section index if not merging grouped sections
-                    output_section
-                        .inputs
-                        .par_sort_unstable_by_key(|(objid, index)| (*objid, index.0));
-                }
+        // These sections may be empty and marked as discarded but they should
+        // always be kept
+        self.sections[OutputSectionId::Text.index()..=OutputSectionId::Bss.index()]
+            .iter_mut()
+            .for_each(|section| {
+                section.discard = false;
             });
+    }
 
-        // Mark empty output sections as discarded unless they are explicitly
-        // kept reserved sections
-        self.output_sections.par_iter_mut().for_each(|section| {
-            if !(section.id > OutputSectionId::Null && section.id <= OutputSectionId::Bss) {
-                section.discard = section.inputs.is_empty();
+    pub fn rebase_sections(&mut self) {
+        let _timer = ScopedTimer::msg("rebase sections");
+
+        let rebase_groups = self
+            .sections
+            .par_iter_mut()
+            .filter_map(|section| {
+                if section.discard {
+                    return None;
+                }
+
+                let mut rebases = Vec::with_capacity(self.objs.len());
+                rebases.resize(self.objs.len(), Vec::new());
+
+                let mut length = 0u32;
+                let mut virtual_address = 0u32;
+                for (objid, index) in section.inputs.iter().copied() {
+                    let obj = &self.objs[objid.index().unwrap()];
+                    let input_section = obj.input_section(index).unwrap();
+                    let align = input_section.characteristics.alignment();
+                    if align > 0 {
+                        virtual_address = virtual_address.next_multiple_of(align as u32);
+                    }
+                    length = virtual_address;
+                    rebases[objid.index().unwrap()].push(RebaseEntry {
+                        index,
+                        address: virtual_address,
+                    });
+
+                    virtual_address += input_section.length;
+                }
+
+                section.length = length;
+                Some(RebaseGroup {
+                    output: section.id,
+                    rebases,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        self.objs.par_iter_mut().for_each(|obj| {
+            for group in &rebase_groups {
+                let rebase_list = &group.rebases[obj.id.index().unwrap()];
+                for entry in rebase_list {
+                    let section = obj.input_section_mut(entry.index).unwrap();
+                    section.virtual_address = entry.address;
+                }
             }
         });
     }
+}
 
-    pub fn rebase_sections(&mut self, ctx: &mut LinkContext<'a>) {
-        let _timer = ScopedTimer::msg("rebase sections");
-    }
+/// Arena instances that are exclusive for the linker
+struct LinkerArena<'a> {
+    strings: ArenaHandle<'a, u8>,
+    sections: ArenaHandle<'a, OutputSection<'a>>,
 }
