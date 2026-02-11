@@ -24,7 +24,8 @@ use crate::{
     ErrorContext,
     arena::{ArenaRef, TypedArena},
     coff::{
-        CoffFlags, ComdatSelection, ImageFileMachine, SectionFlags, SectionNumber, StorageClass,
+        CoffFlags, ComdatSelection, Feat00Flags, ImageFileMachine, SectionFlags, SectionNumber,
+        StorageClass,
     },
     context::LinkContext,
     make_error,
@@ -349,11 +350,17 @@ pub struct ObjectFile<'a> {
     /// This vec retains the same symbol indicies as the original symbol table.
     pub symbols: Vec<Option<InputSymbol<'a>>>,
 
+    /// True if this COFF contains import information
+    pub has_import_data: bool,
+
     /// Indicies of COMDAT symbols.
     ///
     /// These are either COMDAT leader symbols or section symbols depending on
     /// the selection type.
-    comdat_symbols: Vec<SymbolIndex>,
+    pub comdat_indicies: Vec<SymbolIndex>,
+
+    /// @feat.00 flags
+    pub feat_flags: Feat00Flags,
 }
 
 impl<'a> ObjectFile<'a> {
@@ -373,9 +380,11 @@ impl<'a> ObjectFile<'a> {
             coff_symbols: Default::default(),
             sections: Vec::new(),
             symbols: Vec::new(),
-            comdat_symbols: Vec::new(),
+            comdat_indicies: Vec::new(),
             directives_index: SectionIndex(0),
+            has_import_data: false,
             addrsig_index: SectionIndex(0),
+            feat_flags: Feat00Flags::empty(),
         }
     }
 
@@ -437,10 +446,10 @@ impl<'a> ObjectFile<'a> {
                     .get(object::LittleEndian),
             );
 
-            // Linker metadata for us
+            // Linker metadata
             let has_link_info = || characteristics.contains(SectionFlags::LnkInfo);
 
-            // Store linker directives section index.
+            // Store the index of the section with linker directives
             if name == b".drectve" && has_link_info() {
                 // Verify data is present
                 let data = coff_section
@@ -464,8 +473,8 @@ impl<'a> ObjectFile<'a> {
             }
 
             // Skip other metadata sections marked for removal during linking.
-            // We keep other `IMAGE_SCN_MEM_DISCARDABLE` sections in and let the
-            // loader handle them or the user strip them out manually
+            // We keep `IMAGE_SCN_MEM_DISCARDABLE` sections in for the user to
+            // strip out manually or for the loader to handle
             if characteristics.contains(SectionFlags::LnkRemove) {
                 continue;
             }
@@ -512,13 +521,24 @@ impl<'a> ObjectFile<'a> {
                 && !data.is_empty()
                 && characteristics.contains(SectionFlags::MemRead | SectionFlags::MemWrite)
             {
+                self.has_import_data = true;
                 characteristics |= SectionFlags::CntInitializedData;
+            }
+
+            let mut length = data.len() as u32;
+            // If the section contains uninitialized data, use the size_of_raw_data field
+            // for the length
+            if characteristics.contains(SectionFlags::CntUninitializedData) {
+                length = coff_section
+                    .coff_section()
+                    .size_of_raw_data
+                    .get(object::LittleEndian);
             }
 
             self.sections[coff_section.index().0] = Some(InputSection {
                 name,
                 data,
-                length: 0,
+                length,
                 virtual_address: 0,
                 checksum: 0,
                 characteristics,
@@ -631,6 +651,11 @@ impl<'a> ObjectFile<'a> {
                     .coff_symbols
                     .aux_section(coff_symbol.index())
                     .with_context(|| format!("symbol at index {}", coff_symbol.index()))?;
+
+                // Overwrite length to match the aux symbol length. This value
+                // is more accurate for computing section length since GCC inserts
+                // padding into the raw data. The padding may get trimmed if
+                // proprly aligned
                 section.length = aux_section.length.get(object::LittleEndian);
                 section.checksum = aux_section.check_sum.get(object::LittleEndian);
 
@@ -640,7 +665,7 @@ impl<'a> ObjectFile<'a> {
                     let number = aux_section.number.get(object::LittleEndian);
                     section.associative = Some(SectionIndex(number as usize));
                     symbol.selection = Some(ComdatSelection::Associative);
-                    self.comdat_symbols.push(symbol.index);
+                    self.comdat_indicies.push(symbol.index);
                 } else if section.characteristics.contains(SectionFlags::LnkComdat) {
                     // For COMDAT sections that are not associative, record the
                     // auxiliary symbol for the leader to handle
@@ -657,7 +682,7 @@ impl<'a> ObjectFile<'a> {
                 let selection = ComdatSelection::try_from(aux_section.selection)
                     .with_context(|| format!("COMDAT leader for section {}", section.index))?;
                 symbol.selection = Some(selection);
-                self.comdat_symbols.push(symbol.index);
+                self.comdat_indicies.push(symbol.index);
             }
         }
 
@@ -821,7 +846,7 @@ impl<'a> ObjectFile<'a> {
         objs: &[ArenaRef<'a, ObjectFile<'a>>],
     ) {
         assert!(self.live.load(Ordering::Relaxed));
-        for symbol_index in self.comdat_symbols.iter().copied() {
+        for symbol_index in self.comdat_indicies.iter().copied() {
             let symbol = self.symbols[symbol_index.0].as_ref().unwrap();
 
             // The stored COMDAT indicies are partitioned with leaders in the
@@ -945,6 +970,33 @@ impl<'a> ObjectFile<'a> {
     pub fn input_symbol(&self, index: SymbolIndex) -> Option<&InputSymbol<'a>> {
         self.symbols.get(index.0).and_then(|symbol| symbol.as_ref())
     }
+
+    /// Returns the DLL name if this COFF contains the DLL name entry for a short
+    /// import
+    pub fn dllname(&self) -> Option<&'a [u8]> {
+        if !self.has_import_data {
+            return None;
+        }
+
+        let idata_flags =
+            SectionFlags::CntInitializedData | SectionFlags::MemRead | SectionFlags::MemWrite;
+
+        for section in self.sections.iter().flatten() {
+            if section.data.is_empty() {
+                continue;
+            }
+
+            if section.name == b".idata$7" && section.characteristics.contains(idata_flags) {
+                if let Some(nullbyte) = section.data.iter().position(|ch| *ch == 0) {
+                    return Some(&section.data[..nullbyte]);
+                } else {
+                    return Some(section.data);
+                }
+            }
+        }
+
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -963,6 +1015,7 @@ pub struct InputSection<'a> {
 }
 
 impl<'a> InputSection<'a> {
+    /// Returns `true` if this is a COMDAT section
     pub fn is_comdat(&self) -> bool {
         self.characteristics.contains(SectionFlags::LnkComdat)
     }

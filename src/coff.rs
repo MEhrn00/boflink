@@ -325,13 +325,21 @@ impl SectionFlags {
     }
 
     /// Returns a new set of flags with only the `MEM_*` flags set
-    pub const fn memory_flags(self) -> SectionFlags {
+    pub const fn memory_flags(self) -> Self {
         SectionFlags(self.0 & SECTION_FLAGS_MEM_MASK)
     }
 
     /// Returns a new set of flags with only the `CNT_*` flags set.
-    pub const fn contents_flags(self) -> SectionFlags {
+    pub const fn contents_flags(self) -> Self {
         SectionFlags(self.0 & SECTION_FLAGS_CONTENTS_MASK)
+    }
+
+    /// Returns only the flags used for determining the section kind and output
+    /// section contributions.
+    ///
+    /// These are only `IMAGE_SCN_MEM_*` and `IMAGE_SCN_CNT_*` flags
+    pub fn kind_flags(self) -> Self {
+        self.memory_flags() | self.contents_flags()
     }
 }
 
