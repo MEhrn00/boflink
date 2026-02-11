@@ -148,11 +148,11 @@ impl<'a> Linker<'a> {
 
         self.objs.par_iter_mut().for_each(|obj| {
             let ctx = &*ctx;
-            if obj.live.load(Ordering::Relaxed) {
-                if let Err(e) = obj.discard_unused_comdats(ctx) {
+            if obj.live.load(Ordering::Relaxed)
+                && let Err(e) = obj.discard_unused_comdats(ctx)
+            {
                     log::error!(logger: ctx, "{}: {e}", obj.source());
                 }
-            }
         });
 
         ctx.exclusive_check_errored();
@@ -244,10 +244,9 @@ impl<'a> Linker<'a> {
                         outputs_matrix.resize(output_id.index() + 1, Vec::new());
                         outputs_matrix[output_id.index()] = indicies
                             .into_iter()
-                            .map(|index| {
+                            .inspect(|&index| {
                                 let section = obj.input_section_mut(index).unwrap();
                                 section.output = output_id;
-                                index
                             })
                             .collect();
                     }
