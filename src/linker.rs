@@ -151,8 +151,8 @@ impl<'a> Linker<'a> {
             if obj.live.load(Ordering::Relaxed)
                 && let Err(e) = obj.discard_unused_comdats(ctx)
             {
-                    log::error!(logger: ctx, "{}: {e}", obj.source());
-                }
+                log::error!(logger: ctx, "{}: {e}", obj.source());
+            }
         });
 
         ctx.exclusive_check_errored();
@@ -346,27 +346,9 @@ impl<'a> Linker<'a> {
                 section.discard = section.inputs.is_empty();
             }
         });
+    }
 
-        // Debug print ordering. Sections have not been assigned virtual addresses
-        // at this point
-        if log::log_enabled!(log::Level::Debug) {
-            for section in self.output_sections.iter() {
-                if section.discard {
-                    continue;
-                }
-
-                let output_name = String::from_utf8_lossy(section.name);
-                for (id, index) in section.inputs.iter() {
-                    let obj = &self.objs[id.index().unwrap()];
-                    let index = *index;
-                    let input_name =
-                        String::from_utf8_lossy(obj.input_section(index).unwrap().name);
-                    log::debug!(
-                        "{}: section {input_name}({index}) mapped to {output_name}",
-                        obj.source()
-                    );
-                }
-            }
-        }
+    pub fn rebase_sections(&mut self, ctx: &mut LinkContext<'a>) {
+        let _timer = ScopedTimer::msg("rebase sections");
     }
 }
