@@ -224,7 +224,7 @@ impl<'a> SectionKey<'a> {
                 .any(|(s, f)| *f == flags && name.starts_with(s.as_bytes()))
         };
 
-        if ctx.options.force_group_allocation {
+        if ctx.options.merge_groups {
             // Do not merge these sections
             let ignore_merge = [
                 (".debug$S", r | discardable),

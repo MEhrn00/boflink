@@ -40,8 +40,6 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
   -e <symbol>, --entry=<symbol>
                              Name of the entrypoint symbol [default: go]
   --error-limit=<number>     Number of errors to print before exiting [default: 20]
-  --force-group-allocation   Combine grouped sections (default)
-    --no-force-group-allocation
   --gc-sections              Garbage collect unused sections
     --no-gc-sections
   --ignore-unresolved-symbol=<symbol>
@@ -53,7 +51,7 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
                              Add <dir> to the list of library search paths
   --merge-bss                Initialize the .bss section and merge it with the .data section
     --no-merge-bss
-  --merge-groups             Alias for --force-group-allocation
+  --merge-groups             Combine grouped sections (default)
     --no-merge-groups
   -m <emulation>             Set the target emulation [possible values: i386pep, i386pe]
   -o <file>, --output=<file>
@@ -61,7 +59,7 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
   --pop-state                Restore the previous state of positional significant arguments
   --print-gcc-specs          Print out a GCC spec file for using boflink with MinGW GCC
   --print-gc-sections        Print sections discarded during '--gc-sections'
-  --print-stats              Print input statistics
+  --stats                    Print resource statistics
   --print-timing             Print timing information
   --push-state               Save the current state of positional significant arguments
   --require-defined=<symbol>
@@ -403,7 +401,7 @@ pub struct CliOptions {
     pub dynamicbase: bool,
     pub entry: String,
     pub error_limit: usize,
-    pub force_group_allocation: bool,
+    pub merge_groups: bool,
     pub flto: bool,
     pub gc_sections: bool,
     pub high_entropy_va: bool,
@@ -421,7 +419,7 @@ pub struct CliOptions {
     pub print_gcc_specs: bool,
     pub print_gc_sections: bool,
     pub print_timing: bool,
-    pub print_stats: bool,
+    pub stats: bool,
     pub require_defined: Vec<String>,
     pub strip_debug: bool,
     pub sysroot: Option<PathBuf>,
@@ -448,7 +446,7 @@ impl std::default::Default for CliOptions {
             dynamicbase: false,
             entry: "go".into(),
             error_limit: 20,
-            force_group_allocation: true,
+            merge_groups: true,
             flto: false,
             gc_sections: false,
             high_entropy_va: false,
@@ -466,7 +464,7 @@ impl std::default::Default for CliOptions {
             print_gcc_specs: false,
             print_gc_sections: false,
             print_timing: false,
-            print_stats: false,
+            stats: false,
             require_defined: Vec::new(),
             strip_debug: true,
             sysroot: None,
@@ -528,8 +526,6 @@ impl CliOptions {
                 .parse()
                 .ok()
                 .context("--error-limit value must be a number")?;
-        } else if let Some(v) = long_bool("force-group-allocation") {
-            self.force_group_allocation = v;
         } else if arg == "-flto" {
             self.flto = true;
         } else if arg == "-fno-lto" {
@@ -581,7 +577,7 @@ impl CliOptions {
         } else if let Some(v) = long_bool("merge-bss") {
             self.merge_bss = v;
         } else if let Some(v) = long_bool("merge-groups") {
-            self.force_group_allocation = v;
+            self.merge_groups = v;
         } else if long_opt("nxcompat") {
             self.nxcompat = true;
         } else if let Some(v) = anyval("o", "output") {
@@ -596,8 +592,8 @@ impl CliOptions {
             self.print_gcc_specs = true;
         } else if long_opt("print-gc-sections") {
             self.print_gc_sections = true;
-        } else if long_opt("print-stats") {
-            self.print_stats = true;
+        } else if long_opt("stats") {
+            self.stats = true;
         } else if long_opt("print-timing") {
             self.print_timing = true;
         } else if let Some(v) = anyval("require-defined", "keep-symbol") {

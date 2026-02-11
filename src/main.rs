@@ -132,7 +132,7 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
     drop(linker);
     drop(ctx);
 
-    if args.options.print_stats {
+    if args.options.stats {
         stats.print_yaml();
     }
 

@@ -317,7 +317,7 @@ impl<'a> Linker<'a> {
                             section_name = &section_name[output_name.len()..];
                             (parent_path, section_name, member_path)
                         });
-                } else if ctx.options.force_group_allocation {
+                } else if ctx.options.merge_groups {
                     let output_name = output_section.name;
                     output_section.inputs.par_sort_unstable_by_key(
                         |(objid, index)| -> (&'a [u8], ObjectFileId, usize) {
