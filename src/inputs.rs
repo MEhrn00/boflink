@@ -890,7 +890,11 @@ impl<'a> ObjectFile<'a> {
                 continue;
             }
 
-            let external_ref = ctx.symbol_map.get(symbol.external_id.unwrap()).unwrap();
+            let Some(external_id) = symbol.external_id else {
+                continue;
+            };
+
+            let external_ref = ctx.symbol_map.get(external_id).unwrap();
             let global = external_ref.read().unwrap();
             if global.traced {
                 if symbol.is_defined() {
