@@ -1,54 +1,59 @@
 //! Linker output handling
 //!
 //! # Section ordering
-/// Reserved sections <https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#special-sections>
-/// get preallocated inside the output file. The specified ordering is meant to
-/// follow a hybrid of how GCC and Clang (GNU) order sections in object files.
-///
-/// Most open source BOFs and BOF loaders use MinGW GCC for compilation or testing.
-/// It is best to follow MinGW GCC's behavior as close as possible when building
-/// output files to make things predictable and accomodate brittle loaders.
-/// MinGW GCC only uses a subset of the reserved sections while Clang uses most of them
-/// so places where GCC has a gap, the behavior will try to match Clang. The
-/// only deviation from this is that sections that will automatically be discarded
-/// in the output file are ordered later.
-///
-/// Debug sections are never merged if included.
-/// Other GNU-specific sections are also included.
-///
-/// Reserved section ordering:
-/// 1. .text (code)
-/// 2. .data (data)
-/// 3. .bss (uninitialized data)
-/// 4. .rdata (read-only data)
-/// 5. .xdata (unwind)
-/// 6. .eh_frame (unwind)
-/// 7. .pdata (exception)
-/// 8. .ctors (global constructors)
-/// 9. .dtors (global destructors)
-/// 10. .tls (thread-local storage)
-/// 11. .rsrc (resources)
-/// 12. .debug$S (debug symbols)
-/// 13. .debug$T (debug types)
-/// 14. .debug$P (precompiled debug types)
-/// 15. .debug$F (FPO debug info)
-/// 16. .debug_info (DWARF info)
-/// 17. .debug_abbrev (DWARF debug)
-/// 18. .debug_aranges (DWARF debug)
-/// 19. .debug_rnglists (DWARF)
-/// 20. .debug_line (DWARF line info)
-/// 21. .debug_str (DWARF strings)
-/// 22. .debug_line_str (DWARF line strings)
-/// 23. .debug_frame (DWARF frame)
-///
-/// All other sections are ordered after the reserved sections on a "first-seen" basis.
+//! Reserved sections <https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#special-sections>
+//! get preallocated inside the output file. The specified ordering is meant to
+//! follow a hybrid of how GCC and Clang (GNU) order sections in object files.
+//!
+//! Most open source BOFs and BOF loaders use MinGW GCC for compilation or testing.
+//! It is best to follow MinGW GCC's behavior as close as possible when building
+//! output files to make things predictable and accomodate brittle loaders.
+//! MinGW GCC only uses a subset of the reserved sections while Clang uses most of them
+//! so places where GCC has a gap, the behavior will try to match Clang. The
+//! only deviation from this is that sections that will automatically be discarded
+//! in the output file are ordered later.
+//!
+//! Debug sections are never merged if included.
+//! Other GNU-specific sections are also included.
+//!
+//! Reserved section ordering:
+//! 1. .text (code)
+//! 2. .data (data)
+//! 3. .bss (uninitialized data)
+//! 4. .rdata (read-only data)
+//! 5. .xdata (unwind)
+//! 6. .eh_frame (unwind)
+//! 7. .pdata (exception)
+//! 8. .ctors (global constructors)
+//! 9. .dtors (global destructors)
+//! 10. .tls (thread-local storage)
+//! 11. .rsrc (resources)
+//! 12. .debug$S (debug symbols)
+//! 13. .debug$T (debug types)
+//! 14. .debug$P (precompiled debug types)
+//! 15. .debug$F (FPO debug info)
+//! 16. .debug_info (DWARF info)
+//! 17. .debug_abbrev (DWARF debug)
+//! 18. .debug_aranges (DWARF debug)
+//! 19. .debug_rnglists (DWARF)
+//! 20. .debug_line (DWARF line info)
+//! 21. .debug_str (DWARF strings)
+//! 22. .debug_line_str (DWARF line strings)
+//! 23. .debug_frame (DWARF frame)
+//!
+//! All other sections are ordered after the reserved sections on a "first-seen" basis.
 use object::SectionIndex;
+use rayon::{
+    iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
+    slice::ParallelSliceMut,
+};
 
 use crate::{
     arena::{ArenaHandle, ArenaRef},
     coff::SectionFlags,
     context::LinkContext,
-    inputs::{InputSection, ObjectFileId},
+    inputs::{InputSection, ObjectFile, ObjectFileId},
+    sparse::{FixedSparseMap, SparseKeyBuilder},
 };
 
 /// ID for an output section.
@@ -95,50 +100,110 @@ impl OutputSectionId {
     }
 }
 
+pub const RESERVED_OUTPUT_SECTIONS_COUNT: usize = 24;
+
 #[derive(Debug, Clone)]
 pub struct OutputSection<'a> {
-    pub id: OutputSectionId,
     pub name: &'a [u8],
-    pub index: SectionIndex,
     pub characteristics: SectionFlags,
     pub length: u32,
-    pub discard: bool,
     pub inputs: Vec<(ObjectFileId, SectionIndex)>,
 }
 
 impl<'a> std::default::Default for OutputSection<'a> {
     fn default() -> Self {
-        Self::new(OutputSectionId(0), b"", SectionFlags::empty(), false)
+        Self::new(b"", SectionFlags::empty())
     }
 }
 
 impl<'a> OutputSection<'a> {
-    pub fn new(
-        id: OutputSectionId,
-        name: &'a [u8],
-        characteristics: SectionFlags,
-        discard: bool,
-    ) -> Self {
+    pub fn new(name: &'a [u8], characteristics: SectionFlags) -> Self {
         Self {
-            id,
             name,
             characteristics,
-            discard,
-            index: SectionIndex(0),
             length: 0,
             inputs: Vec::new(),
         }
+    }
+
+    pub fn sort_inputs(&mut self, ctx: &LinkContext, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
+        if ctx.options.merge_groups {
+            let name = self.name;
+            self.inputs.par_sort_unstable_by_key(|(objid, index)| {
+                let index = *index;
+                let obj = &objs[objid.index()];
+                let input_name = obj.input_section(index).unwrap().name;
+                let ordering_name = input_name.strip_prefix(name).unwrap();
+                // $<name>, object order, section order
+                (ordering_name, objid.index(), index.0)
+            });
+        } else {
+            // Sort based on input file order
+            self.inputs
+                .par_sort_unstable_by_key(|(objid, index)| (objid.index(), index.0));
+        }
+    }
+
+    pub fn compute_alignment(&mut self, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
+        let align = self
+            .inputs
+            .par_iter()
+            .map(|(objid, index)| {
+                objs[objid.index()]
+                    .input_section(*index)
+                    .unwrap()
+                    .characteristics
+                    .alignment()
+            })
+            .max()
+            .unwrap_or_default();
+        if align > 0 {
+            self.characteristics.set_alignment(align.min(8192));
+        }
+    }
+
+    /// Computes the length for this output section.
+    ///
+    /// This is done sequentially
+    pub fn compute_length(&mut self, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
+        self.length = self.inputs.iter().fold(0, |length, (objid, index)| {
+            let section = objs[objid.index()].input_section(*index).unwrap();
+            let align = section.characteristics.alignment().min(1);
+            let address = length.next_multiple_of(align as u32);
+            address + section.length
+        });
+    }
+
+    /// Creates a matrix used for joining object file input sections to this
+    /// output section.
+    pub fn create_join_matrix(&self) -> InputJoinMatrix {
+        let mat = self
+            .inputs
+            .par_iter()
+            .by_uniform_blocks(1_000_000)
+            .fold(Vec::new, |mut mat, (objid, index)| {
+                if mat.len() <= objid.index() {
+                    mat.resize(objid.index() + 1, Vec::new());
+                }
+                mat[objid.index()].push(*index);
+                mat
+            })
+            .reduce(Vec::new, |mut v1, mut v2| {
+                v1.append(&mut v2);
+                v2
+            });
+
+        InputJoinMatrix { mat }
     }
 }
 
 pub fn create_reserved_sections<'a>(
     arena: &ArenaHandle<'a, OutputSection<'a>>,
 ) -> Vec<ArenaRef<'a, OutputSection<'a>>> {
-    let mut sections = Vec::with_capacity(27);
+    let mut sections = Vec::new();
 
     let mut push = |name: &'a str, flags| {
-        let id = OutputSectionId(sections.len() as u32);
-        sections.push(arena.alloc_ref(OutputSection::new(id, name.as_bytes(), flags, false)));
+        sections.push(arena.alloc_ref(OutputSection::new(name.as_bytes(), flags)));
     };
 
     let r = SectionFlags::MemRead;
@@ -150,7 +215,7 @@ pub fn create_reserved_sections<'a>(
     let data = SectionFlags::CntInitializedData;
     let uninit = SectionFlags::CntUninitializedData;
 
-    push("", SectionFlags::empty()); // SHT_NULL section
+    push("<null>", SectionFlags::empty()); // SHT_NULL section
     push(".text", code | r | x);
     push(".data", data | r | w);
     push(".bss", uninit | r | w);
@@ -174,6 +239,8 @@ pub fn create_reserved_sections<'a>(
     push(".debug_str", data | r | discardable);
     push(".debug_line_str", data | r | discardable);
     push(".debug_frame", data | r | discardable);
+
+    debug_assert!(sections.len() == RESERVED_OUTPUT_SECTIONS_COUNT);
 
     sections
 }
@@ -238,7 +305,8 @@ impl<'a> SectionKey<'a> {
         self.flags
     }
 
-    pub fn known_output(&self) -> Option<OutputSectionId> {
+    /// Id for preallocated sections if known
+    pub fn known_id(&self) -> Option<OutputSectionId> {
         let r = SectionFlags::MemRead;
         let w = SectionFlags::MemWrite;
         let x = SectionFlags::MemExecute;
@@ -299,6 +367,31 @@ impl<'a> SectionKey<'a> {
         } else {
             None
         }
+    }
+}
+
+pub struct OutputSectionKeyBuilder;
+
+impl SparseKeyBuilder for OutputSectionKeyBuilder {
+    type Key = OutputSectionId;
+
+    fn sparse_index(key: Self::Key) -> usize {
+        key.index()
+    }
+}
+
+pub type OutputSectionInputsMap =
+    FixedSparseMap<OutputSectionId, Vec<(ObjectFileId, SectionIndex)>, OutputSectionKeyBuilder>;
+
+/// Matrix for joining input sections to output sections
+pub struct InputJoinMatrix {
+    mat: Vec<Vec<SectionIndex>>,
+}
+
+impl InputJoinMatrix {
+    /// Gets the list of input sections for the specified object file.
+    pub fn get(&self, obj: ObjectFileId) -> Option<&[SectionIndex]> {
+        self.mat.get(obj.index()).map(|list| list.as_slice())
     }
 }
 
