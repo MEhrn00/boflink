@@ -23,6 +23,7 @@ mod linker;
 mod logging;
 mod outputs;
 mod reader;
+mod sparse;
 mod stdext;
 mod symbols;
 mod timing;
