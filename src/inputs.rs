@@ -238,46 +238,19 @@ impl std::error::Error for UnknownFileError {}
 /// Id for an object file. This is a tagged index using a `u32`.
 /// - Index 0 is reserved for the internal file used for adding linker-synthesized
 ///   sections/symbols.
-/// - [`u32::MAX`] is for an invalid index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectFileId(u32);
 
 impl ObjectFileId {
-    pub const fn internal() -> Self {
-        Self(0)
-    }
-
-    pub const fn is_internal(&self) -> bool {
-        self.0 == Self::internal().0
-    }
-
-    pub const fn invalid() -> Self {
-        Self(u32::MAX)
-    }
-
-    pub const fn is_invalid(&self) -> bool {
-        self.0 == Self::invalid().0
-    }
-
-    pub const fn is_valid(&self) -> bool {
-        !self.is_invalid()
-    }
-
     pub fn new(idx: usize) -> Self {
-        let idx = u32::try_from(idx).unwrap_or_else(|_| panic!("object file ID overflowed"));
-        if idx == u32::MAX {
-            panic!("object file ID overflowed");
-        }
-
-        Self(idx)
+        Self(
+            u32::try_from(idx)
+                .unwrap_or_else(|_| panic!("number of object files exceeded u32::MAX")),
+        )
     }
 
-    pub const fn index(self) -> Option<usize> {
-        if self.is_valid() {
-            Some(self.0 as usize)
-        } else {
-            None
-        }
+    pub const fn index(self) -> usize {
+        self.0 as usize
     }
 }
 
@@ -345,13 +318,13 @@ pub struct ObjectFile<'a> {
     /// if not present.
     pub addrsig_index: SectionIndex,
 
+    /// True if this COFF contains import information
+    pub has_import_data: bool,
+
     /// Symbols.
     ///
     /// This vec retains the same symbol indicies as the original symbol table.
     pub symbols: Vec<Option<InputSymbol<'a>>>,
-
-    /// True if this COFF contains import information
-    pub has_import_data: bool,
 
     /// Indicies of COMDAT symbols.
     ///
@@ -364,10 +337,6 @@ pub struct ObjectFile<'a> {
 }
 
 impl<'a> ObjectFile<'a> {
-    pub fn new_internal() -> ObjectFile<'a> {
-        Self::new(ObjectFileId::internal(), InputFile::internal(), true)
-    }
-
     pub fn new(id: ObjectFileId, file: InputFile<'a>, lazy: bool) -> ObjectFile<'a> {
         Self {
             id,
@@ -815,18 +784,18 @@ impl<'a> ObjectFile<'a> {
             // symbol used
             let should_claim = |global: &GlobalSymbol| {
                 // Always claim symbols if the global one does not have an owner
-                let Some(owner_index) = global.owner.index() else {
+                let Some(owner_id) = global.owner else {
                     return true;
                 };
 
-                let owner = &objs[owner_index];
+                let owner = &objs[owner_id.index()];
                 let owner_symbol = owner.input_symbol(global.index).unwrap();
                 let owner_live = owner.live.load(Ordering::Relaxed);
 
                 // Compare symbol kinds. A greater kind means more symbol resolution
                 // strength. Use the first symbol seen if they are equal
                 match symbol.kind(live).cmp(&owner_symbol.kind(owner_live)) {
-                    std::cmp::Ordering::Equal => self.id < global.owner,
+                    std::cmp::Ordering::Equal => self.id < owner_id,
                     o => o == std::cmp::Ordering::Greater,
                 }
             };
@@ -835,7 +804,7 @@ impl<'a> ObjectFile<'a> {
                 global.value = symbol.value;
                 global.section_number = symbol.section_number;
                 global.index = symbol.index;
-                global.owner = self.id;
+                global.owner = Some(self.id);
             }
         }
     }
@@ -866,11 +835,11 @@ impl<'a> ObjectFile<'a> {
             let mut global = external_ref.write().unwrap();
 
             let should_claim = |global: &GlobalSymbol| {
-                let Some(owner_index) = global.owner.index() else {
+                let Some(owner_id) = global.owner else {
                     return true;
                 };
 
-                let owner = &objs[owner_index];
+                let owner = &objs[owner_id.index()];
                 if !owner.live.load(Ordering::Relaxed) {
                     return true;
                 }
@@ -881,7 +850,7 @@ impl<'a> ObjectFile<'a> {
                     .comdat_priority(self)
                     .cmp(&owner_symbol.comdat_priority(owner))
                 {
-                    std::cmp::Ordering::Equal => self.id < global.owner,
+                    std::cmp::Ordering::Equal => self.id < owner_id,
                     o => o == std::cmp::Ordering::Greater,
                 }
             };
@@ -890,7 +859,7 @@ impl<'a> ObjectFile<'a> {
                 global.value = symbol.value;
                 global.section_number = symbol.section_number;
                 global.index = symbol.index;
-                global.owner = self.id;
+                global.owner = Some(self.id);
             }
         }
     }
@@ -931,7 +900,7 @@ impl<'a> ObjectFile<'a> {
                 }
             }
 
-            let Some(owner) = global.owner.index().map(|index| &objs[index]) else {
+            let Some(owner) = global.owner.map(|id| &objs[id.index()]) else {
                 return;
             };
 

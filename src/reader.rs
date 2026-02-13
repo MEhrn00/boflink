@@ -62,7 +62,10 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
             "InputsReader::create_internal_file() must be called before inputs are added"
         );
 
-        let obj = ArenaRef::new_in(ObjectFile::new_internal(), &self.store.objs);
+        let obj = ArenaRef::new_in(
+            ObjectFile::new(ObjectFileId::new(0), InputFile::internal(), false),
+            &self.store.objs,
+        );
         self.input_objs.alloc(obj);
     }
 

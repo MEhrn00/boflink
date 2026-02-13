@@ -44,7 +44,7 @@ pub struct GlobalSymbol<'a> {
     pub section_number: SectionNumber,
     pub index: SymbolIndex,
     pub imported: bool,
-    pub owner: ObjectFileId,
+    pub owner: Option<ObjectFileId>,
     pub traced: bool,
 }
 
@@ -54,7 +54,7 @@ impl<'a> std::default::Default for GlobalSymbol<'a> {
             name: &[],
             value: 0,
             section_number: SectionNumber::Undefined,
-            owner: ObjectFileId::invalid(),
+            owner: None,
             index: object::SymbolIndex(0),
             imported: false,
             traced: false,
