@@ -12,12 +12,12 @@ use crate::{
     cli::InputArg,
     coff::{ImageFileMachine, SectionNumber, StorageClass},
     context::LinkContext,
-    inputs::{InputSymbol, InputsStore, ObjectFile, ObjectFileId},
+    inputs::{InputsReader, InputsStore},
+    object::{ObjectFile, ObjectFileId, ObjectSymbol},
     outputs::{
         OutputSection, OutputSectionId, OutputSectionInputsMap, SectionKey,
         create_reserved_sections,
     },
-    reader::InputsReader,
     symbols::{GlobalSymbol, MapEntry},
     timing::ScopedTimer,
 };
@@ -32,8 +32,8 @@ pub struct Linker<'a> {
     /// Output sections
     pub sections: Vec<ArenaRef<'a, OutputSection<'a>>>,
 
-    /// Local arena
-    arena: LinkerArena<'a>,
+    /// String arena
+    strings: ArenaHandle<'a, u8>,
 }
 
 impl<'a> Linker<'a> {
@@ -65,10 +65,7 @@ impl<'a> Linker<'a> {
             architecture: reader.architecture,
             objs: input_objs.into_vec(),
             sections: Vec::new(),
-            arena: LinkerArena {
-                strings,
-                sections: ctx.section_pool.get(),
-            },
+            strings,
         })
     }
 
@@ -77,9 +74,7 @@ impl<'a> Linker<'a> {
             return name;
         }
 
-        self.arena
-            .strings
-            .alloc_bytes([b"_", name].concat().as_slice())
+        self.strings.alloc_bytes([b"_", name].concat().as_slice())
     }
 
     pub fn add_root_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
@@ -88,7 +83,7 @@ impl<'a> Linker<'a> {
             let symbol = entry.insert_default();
             let obj = &mut self.objs[0];
             let index = SymbolIndex(obj.symbols.len());
-            self.objs[0].symbols.push(Some(InputSymbol {
+            self.objs[0].symbols.push(Some(ObjectSymbol {
                 name,
                 index,
                 storage_class: StorageClass::External,
@@ -208,16 +203,13 @@ impl<'a> Linker<'a> {
             obj.resolve_symbols(ctx, &self.objs);
         });
 
-        log::trace!(
-            "found {} live objects after symbol resolution",
-            self.objs.len() - 1
-        );
+        *ctx.stats.globals.get_mut() = ctx.symbol_map.len();
     }
 
     pub fn create_output_sections(&mut self, ctx: &mut LinkContext<'a>) {
         let _timer = ScopedTimer::msg("output section allocation");
         // Add reserved sections
-        self.sections = create_reserved_sections(&self.arena.sections);
+        self.sections = create_reserved_sections(&ctx.section_pool.get());
         let reserved_len = self.sections.len();
 
         // Partition object file input sections.
@@ -373,30 +365,9 @@ impl<'a> Linker<'a> {
                 section.output = output_id;
             }
         });
-
-        if log::log_enabled!(log::Level::Debug) {
-            for output in self.sections.iter() {
-                let name = String::from_utf8_lossy(output.name);
-                for (obj_id, index) in output.inputs.iter().copied() {
-                    let obj = &self.objs[obj_id.index()];
-                    let section = obj.input_section(index).unwrap();
-                    let input_name = String::from_utf8_lossy(section.name);
-                    log::debug!(
-                        "{}: {input_name} input section mapped to {name} output section",
-                        obj.source()
-                    );
-                }
-            }
-        }
     }
 
     pub fn rebase_sections(&mut self) {
         let _timer = ScopedTimer::msg("rebase sections");
     }
-}
-
-/// Arena instances that are exclusive for the linker
-struct LinkerArena<'a> {
-    strings: ArenaHandle<'a, u8>,
-    sections: ArenaHandle<'a, OutputSection<'a>>,
 }

@@ -21,8 +21,8 @@ mod error;
 mod inputs;
 mod linker;
 mod logging;
+mod object;
 mod outputs;
-mod reader;
 mod sparse;
 mod stdext;
 mod symbols;
@@ -110,8 +110,6 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
         bail!("unable to detect target architecture from input files");
     }
 
-    *ctx.stats.global_symbols.get_mut() = ctx.symbol_map.len();
-
     // Add entrypoint, require defined and undefined GC roots
     for symbol in [&args.options.entry]
         .into_iter()
@@ -127,6 +125,11 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
     }
 
     linker.resolve_symbols(&mut ctx);
+    log::debug!(
+        "found {} live objects after symbol resolution",
+        linker.objs.len() - 1
+    );
+
     // TODO: Lots of other passes
     linker.create_output_sections(&mut ctx);
     linker.rebase_sections();

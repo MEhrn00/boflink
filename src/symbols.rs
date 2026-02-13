@@ -24,7 +24,7 @@ use crate::{
     coff::{ImageFileMachine, SectionNumber},
     concurrent_indexmap::{self, ConcurrentIndexMap, Index, Ref},
     context::LinkContext,
-    inputs::ObjectFileId,
+    object::ObjectFileId,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

@@ -61,6 +61,12 @@ impl<K, V> ConcurrentIndexMap<K, V, RandomState> {
     pub fn with_capacity_and_slot_count(capacity: usize, slot_count: usize) -> Self {
         Self::with_capacity_hasher_and_slot_count(capacity, RandomState::default(), slot_count)
     }
+
+    pub fn len(&self) -> usize {
+        self.slots
+            .iter()
+            .fold(0, |acc, slot| acc + slot.read().unwrap().len())
+    }
 }
 
 impl<K, V, S: Clone> ConcurrentIndexMap<K, V, S> {
@@ -109,12 +115,6 @@ impl<K, V, S: Clone> ConcurrentIndexMap<K, V, S> {
                 })
                 .collect(),
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.slots
-            .iter()
-            .fold(0, |acc, slot| acc + slot.read().unwrap().len())
     }
 }
 

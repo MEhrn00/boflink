@@ -82,11 +82,9 @@ impl<'a> log::Log for &LinkContext<'a> {
 
 #[derive(Debug, Default)]
 pub struct LinkStats {
-    pub input_files: AtomicU32,
-    pub input_coffs: AtomicU32,
-    pub input_archives: AtomicU32,
-    pub input_archive_members: AtomicU32,
-    pub global_symbols: AtomicUsize,
+    pub read: ReadStats,
+    pub parse: ParseStats,
+    pub globals: AtomicUsize,
 }
 
 impl LinkStats {
@@ -102,17 +100,43 @@ impl LinkStats {
         write!(
             w,
             r#"stats:
-  input_files: {input_files}
-  input_coffs: {input_coffs}
-  input_archives: {input_archives}
-  input_archive_members: {input_archive_members}
-  global_symbols: {global_symbols}
+  read:
+    files: {read_files}
+    coffs: {read_coffs}
+    archives: {read_archives}
+  parse:
+    coffs: {parse_coffs}
+    input_sections: {parse_input_sections}
+    input_symbols: {parse_input_symbols}
+    local_symbols: {parse_local_symbols}
+    comdats: {parse_comdats}
+  globals: {globals}
 "#,
-            input_files = self.input_files.load(Ordering::Relaxed),
-            input_coffs = self.input_coffs.load(Ordering::Relaxed),
-            input_archives = self.input_archives.load(Ordering::Relaxed),
-            input_archive_members = self.input_archive_members.load(Ordering::Relaxed),
-            global_symbols = self.global_symbols.load(Ordering::Relaxed),
+            read_files = *self.read.files.get_mut(),
+            read_coffs = *self.read.coffs.get_mut(),
+            read_archives = *self.read.archives.get_mut(),
+            parse_coffs = *self.parse.coffs.get_mut(),
+            parse_input_sections = *self.parse.input_sections.get_mut(),
+            parse_input_symbols = *self.parse.input_symbols.get_mut(),
+            parse_local_symbols = *self.parse.local_symbols.get_mut(),
+            parse_comdats = *self.parse.comdats.get_mut(),
+            globals = *self.globals.get_mut(),
         )
     }
+}
+
+#[derive(Debug, Default)]
+pub struct ReadStats {
+    pub files: AtomicU32,
+    pub coffs: AtomicU32,
+    pub archives: AtomicU32,
+}
+
+#[derive(Debug, Default)]
+pub struct ParseStats {
+    pub coffs: AtomicU32,
+    pub input_sections: AtomicUsize,
+    pub input_symbols: AtomicUsize,
+    pub local_symbols: AtomicU32,
+    pub comdats: AtomicUsize,
 }
