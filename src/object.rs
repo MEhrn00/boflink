@@ -53,14 +53,19 @@ impl ObjectFileId {
         )
     }
 
+    /// Creates a new [`ObjectFileId`] that should be used for the internal
+    /// object file
     pub const fn internal() -> Self {
         ObjectFileId(0)
     }
 
+    /// Returns true if this is [`ObjectFileId::internal()`]
     pub const fn is_internal(&self) -> bool {
         self.0 == Self::internal().0
     }
 
+    /// Returns the index used for getting the object file from the list of input
+    /// objects
     pub const fn index(self) -> usize {
         self.0 as usize
     }
@@ -72,80 +77,119 @@ pub struct ObjectFile<'a> {
     /// The id of this file.
     pub id: ObjectFileId,
 
+    /// The initialized input sections from this object file that may contribute
+    /// to output sections.
+    ///
+    /// The sections in this list are structured so that 1-based section numbers
+    /// from the original object file can be used to index into this table. It
+    /// allows for symbols and relocations from the original object file to retain
+    /// the same indicies instead of needing to go through and rewrite them.
+    ///
+    /// The table uses 1-based indicies with the first section always being `None`.
+    /// Using 1-based indicies is similar to the ELF `SHT_NULL` section but it
+    /// simplifies things here too. Symbols used 1-based indicies for the section
+    /// number of the definition and auxiliary section symbols use 1-based indicies
+    /// for associative sections.
+    pub sections: Vec<Option<ObjectSection<'a>>>,
+
+    /// The initialized input symbols that may contribute to the output file.
+    ///
+    /// Like with the sections, the symbols in this vec retain the same indicies
+    /// as the original object file. This allows relocations to index into this
+    /// vec without needing to keep an intermediate lookup table
+    pub symbols: Vec<Option<ObjectSymbol<'a>>>,
+
+    /// Indicies of COMDAT leader symbols used for handling COMDAT deduplication.
+    ///
+    /// The leader symbol contains the unique name used for the COMDAT section
+    /// definition. It is a symbol defined in the COMDAT section where the symbol
+    /// table record for it is the first one appearing after the COMDAT section
+    /// symbol.
+    ///
+    /// One thing ambiguous with COMDAT leader selection is on the storage class
+    /// requirements for the defined symbol. This is left unspecified; however,
+    /// it is possible for the COMDAT leader to be `IMAGE_SYM_CLASS_STATIC` or
+    /// a default definition for a weak symbol.
+    pub comdat_leaders: Vec<SymbolIndex>,
+
+    /// File should be included in the linked output.
+    ///
+    /// This is used as the main indicator for object file inclusion.
+    pub live: AtomicBool,
+
+    /// True if there is import information inside of this object file.
+    ///
+    /// This will be set if the object file was read from an import library that
+    /// either contains legacy import-style COFFs with `.idata$<number>` sections
+    /// or the object file was derived from a short import file.
+    ///
+    /// The import data is used for associating resolved DLL imported symbols to
+    /// their associated library names.
+    pub has_import_data: bool,
+
+    /// True if this object file has any common symbols. Common symbols may need
+    /// to have space allocated for them
+    pub has_common_symbols: bool,
+
     /// The file associated with this object file
     pub file: InputFile<'a>,
 
-    /// File should be lazily included.
+    /// Index of the .drectve section if present.
     ///
-    /// This reflects the command line option context used when parsing this file.
-    /// - Object files specified on the command line directly are not lazy
-    /// - Object files wrapped in `--start-lib ... --end-lib` are lazy
-    /// - Object files from archives are lazy
-    /// - Object files from archives wrapped in `--whole-archive ... --no-whole-archive` are not lazy
+    /// This will be set to 0 if the object file does not contain any linker
+    /// directives.
+    pub directives_index: SectionIndex,
+
+    /// Flag indicating if the file was read in a lazy context. This is not used
+    /// as a direct indicator for determining what object files should be included
+    /// in the link but non-lazy object files most likely will be included.
+    ///
+    /// An object file's lazy state is determined using these rules:
+    /// - Files read from disk that are object files default to non-lazy.
+    ///   - They will be considered lazy if surrounded by a set of `--start-lib ... --end-lib`
+    ///     arguments.
+    /// - Files that are members of archives read from disk are considered lazy.
+    ///   - They will be considered non-lazy if the archive this object file is from
+    ///     was surrounded by a set of `--whole-archive ... --no-whole-archive` arguments.
     pub lazy: bool,
 
-    /// File should be included in the linked output
-    pub live: AtomicBool,
-
-    /// Architecture
+    /// File architecture
     pub machine: ImageFileMachine,
 
-    /// File flags
+    /// The `IMAGE_FILE_*` flags of the object file.
+    ///
+    /// This is largely unused for object files.
     pub characteristics: CoffFlags,
 
     /// Raw COFF section headers.
     ///
-    /// May be empty in a few scenarios.
-    /// - This is the internal object file
-    /// - Object file has no sections
-    /// - Object file was initialized from an import file
+    /// May be empty in a few scenarios:
+    /// - This is the internal object file for inserting linker-synthesized sections
+    /// - There were no sections inside the read object file
+    /// - This object file was initialized from a short import file
     pub coff_sections: SectionTable<'a>,
 
     /// Raw COFF symbol table.
     ///
-    /// May be empty in a few scenarios.
-    /// - This is the internal object file
-    /// - Object file has no symbols
-    /// - Object file was initialized from an import file
+    /// May be empty in a few scenarios:
+    /// - This is the internal object file for inserting linker-synthesized symbols
+    /// - There were no symbols inside the read object file
+    /// - This object file was initialized from a short import file
     pub coff_symbols: SymbolTable<'a>,
 
-    /// Input sections.
+    /// Index of the .llvm_addrsig section.
     ///
-    /// Sections use 1-based indicies. This follows a structure as ELF's SHT_NULL section.
-    /// The first section in this array will always be `None`. The rest of the
-    /// sections retain the same 1-based indicies as the source file they
-    /// were initialized from. `None` entries are sections that were skipped
-    /// during initialization
-    pub sections: Vec<Option<ObjectSection<'a>>>,
-
-    /// Index of the .drectve section if present.
-    ///
-    /// This will be the index of the ghost `SHT_NULL` section `SectionIndex(0)`
-    /// if not present.
-    pub directives_index: SectionIndex,
-
-    /// Index of the .llvm_addrsig section if present.
-    ///
-    /// This will be the index of the ghost `SHT_NULL` section `SectionIndex(0)`
-    /// if not present.
+    /// This will be 0 if not present. The addrsig section is currently not used
+    /// but will be needed in the future
     pub addrsig_index: SectionIndex,
 
-    /// Symbols.
+    /// Flags from the @feat.00 symbol.
     ///
-    /// This vec retains the same symbol indicies as the original symbol table.
-    pub symbols: Vec<Option<ObjectSymbol<'a>>>,
-
-    /// Indicies of COMDAT leader symbols
-    pub comdat_leaders: Vec<SymbolIndex>,
-
-    /// @feat.00 flags
+    /// These flags contain additional information on different compiler features
+    /// that may require runtime support. Most of these runtime support features
+    /// are not implemented with COFF loaders so the flags here are used to
+    /// provide additional context if errors occur due to them.
     pub feat_flags: Feat00Flags,
-
-    /// True if this COFF contains import information
-    pub has_import_data: bool,
-
-    /// True if this object file has common symbols
-    pub has_common_symbols: bool,
 }
 
 impl<'a> ObjectFile<'a> {
@@ -265,8 +309,8 @@ impl<'a> ObjectFile<'a> {
             }
 
             // Skip other metadata sections marked for removal during linking.
-            // We keep `IMAGE_SCN_MEM_DISCARDABLE` sections in for the user to
-            // strip out manually or for the loader to handle
+            // We keep sections marked as `IMAGE_SCN_MEM_DISCARDABLE`. Stripping
+            // them is left for the COFF loader to do or the user to do manually
             if characteristics.contains(SectionFlags::LnkRemove) {
                 continue;
             }
@@ -406,7 +450,7 @@ impl<'a> ObjectFile<'a> {
                         selection: None,
                         typ: image_symbol.typ(),
                         external_id: None,
-                        weak_definition: None,
+                        definition: None,
                     })
                 };
 
@@ -817,7 +861,7 @@ pub struct ObjectSymbol<'a> {
     pub storage_class: StorageClass,
     pub typ: u16,
     pub selection: Option<ComdatSelection>,
-    pub weak_definition: Option<SymbolIndex>,
+    pub definition: Option<SymbolIndex>,
     pub external_id: Option<SymbolId>,
 }
 

@@ -1,3 +1,6 @@
+//! Main link driver.
+//!
+//! This module contains implemenrations for the linker passes.
 use std::{collections::HashMap, sync::atomic::Ordering};
 
 use indexmap::IndexMap;
@@ -22,8 +25,13 @@ use crate::{
     timing::ScopedTimer,
 };
 
+/// Structure with all of the link information.
+///
+/// This is designed to act as a container for holding different collections of
+/// artifacts. It is treated more as a plain data container with some methods
+/// rather than having a defined API
 pub struct Linker<'a> {
-    /// Architecture
+    /// Target architecture
     pub architecture: ImageFileMachine,
 
     /// Input object files
@@ -32,13 +40,15 @@ pub struct Linker<'a> {
     /// Output sections
     pub sections: Vec<ArenaRef<'a, OutputSection<'a>>>,
 
+    /// Symbols which require definitions at the end of the link
     required_symbol: Vec<SymbolId>,
 
-    /// String arena
+    /// Exclusive arena handle for allocating strings
     strings: ArenaHandle<'a, u8>,
 }
 
 impl<'a> Linker<'a> {
+    /// Reads a set of [`InputArg`]s and creates the initial linker structure
     pub fn read_inputs(
         ctx: &LinkContext<'a>,
         inputs: &'a [InputArg],
@@ -72,6 +82,8 @@ impl<'a> Linker<'a> {
         })
     }
 
+    /// Mangles the specified name using the mangling scheme from the linker
+    /// architecture.
     pub fn mangle(&self, name: &'a [u8]) -> &'a [u8] {
         if self.architecture != ImageFileMachine::I386 {
             return name;
@@ -80,6 +92,9 @@ impl<'a> Linker<'a> {
         self.strings.alloc_bytes([b"_", name].concat().as_slice())
     }
 
+    /// Adds the specified symbol as a GC root.
+    ///
+    /// The symbol name should not be mangled before calling this function.
     pub fn add_gc_root(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
         let name = self.mangle(name);
         if let MapEntry::Vacant(entry) = ctx.symbol_map.get_map_entry(name) {
@@ -95,12 +110,17 @@ impl<'a> Linker<'a> {
                 // by the internal object during symbol resolution
                 value: 0,
                 section_number: SectionNumber::Undefined,
+                definition: None,
                 typ: 0,
                 selection: None,
             }));
         }
     }
 
+    /// Adds a symbol that requires a definition at the end of linking.
+    ///
+    /// This only adds the symbol and stores an ID for. The check needs to be
+    /// done explicitly
     pub fn add_required_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
         let name = self.mangle(name);
         let symbol = ctx.symbol_map.get_map_entry(name);
@@ -110,11 +130,16 @@ impl<'a> Linker<'a> {
         }
     }
 
+    /// Marks the specified symbol for trace output
     pub fn add_traced_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
         let symbol = ctx.symbol_map.get_map_entry(self.mangle(name)).or_default();
         symbol.traced = true;
     }
 
+    /// Handles resolving symbols from the currently held object files.
+    ///
+    /// This will go through and mark object files as live which should be included
+    /// in the linked output
     pub fn resolve_symbols(&mut self, ctx: &mut LinkContext<'a>) {
         let _timer = ScopedTimer::msg("symbol resolution");
 
@@ -218,7 +243,11 @@ impl<'a> Linker<'a> {
         *ctx.stats.globals.get_mut() = ctx.symbol_map.len();
     }
 
+    /// Reports any duplicate symbols found in the list of object files
     pub fn report_duplicate_symbols(&mut self, ctx: &LinkContext<'a>) {
+        // Collect instead of immediately reporting them so that the output is
+        // deterministic and the order of duplicate symbols being reported follows
+        // the order of input objects
         let duplicate_errors = self
             .objs
             .par_iter()
@@ -227,7 +256,7 @@ impl<'a> Linker<'a> {
                     return None;
                 }
 
-                let mut errors: Vec<String> = Vec::new();
+                let mut errors = Vec::new();
                 for symbol in obj.symbols.iter().flatten() {
                     if !symbol.is_global() || symbol.is_weak() || symbol.is_common() {
                         continue;
@@ -265,6 +294,7 @@ impl<'a> Linker<'a> {
             })
             .collect::<Vec<_>>();
 
+        // Log errors and exit if any were seen
         for error in duplicate_errors.iter().flatten() {
             log::error!("{error}");
         }
@@ -274,10 +304,15 @@ impl<'a> Linker<'a> {
         }
     }
 
+    /// Creates the initial set of output sections and links them to the list of
+    /// input sections.
+    ///
+    /// This only does output section creation and linking. Other information,
+    /// such as alignment, size, etc. is not calculated. The main purpose is to
+    /// get the general layout of where symbols will end up in the output file
     pub fn create_output_sections(&mut self, ctx: &mut LinkContext<'a>) {
         let _timer = ScopedTimer::msg("output section allocation");
-        // Add reserved sections
-        self.sections = create_reserved_sections(&ctx.section_pool.get());
+        self.sections = create_reserved_sections(ctx);
         let reserved_sections_len = self.sections.len();
 
         // Partition object file input sections.
@@ -334,7 +369,7 @@ impl<'a> Linker<'a> {
                     let index = *section_map.entry(key).or_insert_with(|| {
                         let index = sections.len();
                         let id = OutputSectionId::new(reserved_sections_len + index);
-                        sections.push(arena.alloc_ref(OutputSection::new(id, name, flags)));
+                        sections.push(arena.alloc_ref(OutputSection::new(id, name, flags, false)));
                         index
                     });
                     sections[index].inputs.append(&mut input_sections);
@@ -392,7 +427,7 @@ impl<'a> Linker<'a> {
         self.objs
             .par_iter_mut()
             .filter(|obj| obj.has_import_data)
-            .for_each(|obj: &mut ArenaRef<'a, ObjectFile<'a>>| {
+            .for_each(|obj| {
                 let obj = obj.as_mut();
                 for symbol in obj.symbols.iter().flatten() {
                     let Some(external_id) = symbol.external_id else {

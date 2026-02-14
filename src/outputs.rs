@@ -1,29 +1,29 @@
 //! Linker output handling
 //!
-//! # Section ordering
-//! Reserved sections <https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#special-sections>
-//! get preallocated inside the output file. The specified ordering is meant to
-//! follow a hybrid of how GCC and Clang (GNU) order sections in object files.
+//! Reserved sections and other linker-synthesized sections get pre-allocated
+//! during creation. Some or most of these output sections will get discarded
+//! if they happen to contain no inputs or all of the inputs are empty and unused.
 //!
+//! # Section ordering
 //! Most open source BOFs and BOF loaders use MinGW GCC for compilation or testing.
 //! It is best to follow MinGW GCC's behavior as close as possible when building
 //! output files to make things predictable and accomodate brittle loaders.
-//! MinGW GCC only uses a subset of the reserved sections while Clang uses most of them
-//! so places where GCC has a gap, the behavior will try to match Clang. The
-//! only deviation from this is that sections that will automatically be discarded
-//! in the output file are ordered later.
+//! This ordering tries to follow as close as possible to match a mix of the
+//! MinGW GCC and Clang ordering with other linker-synthesizd sections interleaved.
 //!
-//! Debug sections are never merged if included.
-//! Other GNU-specific sections are also included.
+//! Sections that will always be discarded are placed at the end. These are used
+//! as containers for referencing various different types of input sections across
+//! all input files.
 //!
-//! Reserved section ordering:
+//! Ordering:
+//! 0. NULL section (empty section that is unused, discarded)
 //! 1. .text (code)
 //! 2. .data (data)
 //! 3. .bss (uninitialized data)
 //! 4. .rdata (read-only data)
-//! 5. .xdata (unwind)
-//! 6. .eh_frame (unwind)
-//! 7. .pdata (exception)
+//! 5. .xdata (unwind info)
+//! 6. .eh_frame (unwind info)
+//! 7. .pdata (exception info)
 //! 8. .ctors (global constructors)
 //! 9. .dtors (global destructors)
 //! 10. .tls (thread-local storage)
@@ -32,15 +32,16 @@
 //! 13. .debug$T (debug types)
 //! 14. .debug$P (precompiled debug types)
 //! 15. .debug$F (FPO debug info)
-//! 16. .debug_info (DWARF info)
-//! 17. .debug_abbrev (DWARF debug)
-//! 18. .debug_aranges (DWARF debug)
+//! 16. .debug_info (DWARF)
+//! 17. .debug_abbrev (DWARF)
+//! 18. .debug_aranges (DWARF)
 //! 19. .debug_rnglists (DWARF)
-//! 20. .debug_line (DWARF line info)
-//! 21. .debug_str (DWARF strings)
-//! 22. .debug_line_str (DWARF line strings)
-//! 23. .debug_frame (DWARF frame)
-//! 24. .idata (import data)
+//! 20. .debug_line (DWARF)
+//! 21. .debug_str (DWARF)
+//! 22. .debug_line_str (DWARF)
+//! 23. .debug_frame (DWARF)
+//! 24. .idata (import data, discarded)
+//! 25. .common (used for temporarily defining common symbols, discarded)
 //!
 //! All other sections are ordered after the reserved sections on a "first-seen" basis.
 use object::SectionIndex;
@@ -50,7 +51,7 @@ use rayon::{
 };
 
 use crate::{
-    arena::{ArenaHandle, ArenaRef},
+    arena::ArenaRef,
     coff::SectionFlags,
     context::LinkContext,
     object::{ObjectFile, ObjectFileId, ObjectSection},
@@ -59,7 +60,7 @@ use crate::{
 
 /// ID for an output section.
 ///
-/// Section 0 is treated as the `SHT_NULL` section
+/// Section 0 is treated as the `SHT_NULL` section and is unused
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OutputSectionId(u32);
 
@@ -90,7 +91,14 @@ impl OutputSectionId {
     pub const DebugLineStr: Self = Self(22);
     pub const DebugFrame: Self = Self(23);
     pub const Idata: Self = Self(24);
+    pub const Common: Self = Self(25);
 }
+
+/// The last ID from the reserved output section ids
+pub const LAST_RESERVED_SECTION_ID: OutputSectionId = OutputSectionId::Common;
+
+/// Length of the reserved sections list
+pub const RESERVED_SECTIONS_LEN: usize = LAST_RESERVED_SECTION_ID.0 as usize + 1;
 
 impl OutputSectionId {
     pub fn new(index: usize) -> Self {
@@ -102,28 +110,58 @@ impl OutputSectionId {
     }
 }
 
-pub const RESERVED_OUTPUT_SECTIONS_COUNT: usize = 25;
-
+/// Section for the output file.
+///
+/// This contains the section metadata and list of indicies for input sections.
 #[derive(Debug, Clone)]
 pub struct OutputSection<'a> {
+    /// Id of this output section.
+    ///
+    /// The output section list is designed to stay fixed so this id should be
+    /// stable.
     pub id: OutputSectionId,
+
+    /// Name that will end up in the section header
     pub name: &'a [u8],
+
+    /// Flags
     pub characteristics: SectionFlags,
+
+    /// The 1-based section index.
+    ///
+    /// This is different than the id. The id is used for referencing this section
+    /// in the output section list. The index is what is actually used for the
+    /// section table index in the output file.
     pub index: SectionIndex,
+
+    /// Total length of the output section.
     pub length: u32,
-    pub discarded: bool,
+
+    /// True if this section should be excluded from the output file.
+    ///
+    /// Output sections will be excluded if they are used as input section containers
+    /// or the list of input sections is empty and all of them can be safely
+    /// discarded.
+    pub exclude: bool,
+
+    /// Indicies of input sections.
     pub inputs: Vec<(ObjectFileId, SectionIndex)>,
 }
 
 impl<'a> OutputSection<'a> {
-    pub fn new(id: OutputSectionId, name: &'a [u8], characteristics: SectionFlags) -> Self {
+    pub fn new(
+        id: OutputSectionId,
+        name: &'a [u8],
+        characteristics: SectionFlags,
+        exclude: bool,
+    ) -> Self {
         Self {
             id,
             name,
             characteristics,
             index: SectionIndex(0),
             length: 0,
-            discarded: false,
+            exclude,
             inputs: Vec::new(),
         }
     }
@@ -202,14 +240,14 @@ impl<'a> OutputSection<'a> {
     }
 }
 
-pub fn create_reserved_sections<'a>(
-    arena: &ArenaHandle<'a, OutputSection<'a>>,
-) -> Vec<ArenaRef<'a, OutputSection<'a>>> {
+/// Creates the list of reserved output sections
+pub fn create_reserved_sections<'a>(ctx: &LinkContext<'a>) -> Vec<ArenaRef<'a, OutputSection<'a>>> {
+    let arena = ctx.section_pool.get();
     let mut sections = Vec::new();
 
-    let mut push = |name: &'a str, flags| {
+    let mut push = |name: &'a str, flags, exclude: bool| {
         let id = OutputSectionId(sections.len() as u32);
-        sections.push(arena.alloc_ref(OutputSection::new(id, name.as_bytes(), flags)));
+        sections.push(arena.alloc_ref(OutputSection::new(id, name.as_bytes(), flags, exclude)));
     };
 
     let r = SectionFlags::MemRead;
@@ -221,33 +259,34 @@ pub fn create_reserved_sections<'a>(
     let data = SectionFlags::CntInitializedData;
     let uninit = SectionFlags::CntUninitializedData;
 
-    push("<null>", SectionFlags::empty()); // SHT_NULL section
-    push(".text", code | r | x);
-    push(".data", data | r | w);
-    push(".bss", uninit | r | w);
-    push(".rdata", data | r);
-    push(".xdata", data | r);
-    push(".eh_frame", data | r);
-    push(".pdata", data | r);
-    push(".ctors", data | r | w);
-    push(".dtors", data | r | w);
-    push(".tls", data | r | w);
-    push(".rsrc", data | r);
-    push(".debug$S", data | r | discardable);
-    push(".debug$T", data | r | discardable);
-    push(".debug$P", data | r | discardable);
-    push(".debug$F", data | r | discardable);
-    push(".debug_info", data | r | discardable);
-    push(".debug_abbrev", data | r | discardable);
-    push(".debug_aranges", data | r | discardable);
-    push(".debug_rnglists", data | r | discardable);
-    push(".debug_line", data | r | discardable);
-    push(".debug_str", data | r | discardable);
-    push(".debug_line_str", data | r | discardable);
-    push(".debug_frame", data | r | discardable);
-    push(".idata", data | r | w);
+    push("<null>", SectionFlags::empty(), true); // SHT_NULL section
+    push(".text", code | r | x, false);
+    push(".data", data | r | w, false);
+    push(".bss", uninit | r | w, false);
+    push(".rdata", data | r, false);
+    push(".xdata", data | r, false);
+    push(".eh_frame", data | r, false);
+    push(".pdata", data | r, false);
+    push(".ctors", data | r | w, false);
+    push(".dtors", data | r | w, false);
+    push(".tls", data | r | w, false);
+    push(".rsrc", data | r, false);
+    push(".debug$S", data | r | discardable, false);
+    push(".debug$T", data | r | discardable, false);
+    push(".debug$P", data | r | discardable, false);
+    push(".debug$F", data | r | discardable, false);
+    push(".debug_info", data | r | discardable, false);
+    push(".debug_abbrev", data | r | discardable, false);
+    push(".debug_aranges", data | r | discardable, false);
+    push(".debug_rnglists", data | r | discardable, false);
+    push(".debug_line", data | r | discardable, false);
+    push(".debug_str", data | r | discardable, false);
+    push(".debug_line_str", data | r | discardable, false);
+    push(".debug_frame", data | r | discardable, false);
+    push(".idata", data | r | w, false);
+    push(".common", uninit | r | w, false);
 
-    debug_assert!(sections.len() == RESERVED_OUTPUT_SECTIONS_COUNT);
+    debug_assert!(sections.len() == RESERVED_SECTIONS_LEN);
 
     sections
 }

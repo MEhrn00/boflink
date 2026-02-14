@@ -47,18 +47,16 @@ use object::{
         IMAGE_FILE_UP_SYSTEM_ONLY, IMAGE_SCN_CNT_CODE, IMAGE_SCN_CNT_INITIALIZED_DATA,
         IMAGE_SCN_CNT_UNINITIALIZED_DATA, IMAGE_SCN_GPREL, IMAGE_SCN_LNK_COMDAT,
         IMAGE_SCN_LNK_INFO, IMAGE_SCN_LNK_NRELOC_OVFL, IMAGE_SCN_LNK_OTHER, IMAGE_SCN_LNK_REMOVE,
-        IMAGE_SCN_MEM_16BIT, IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SCN_MEM_EXECUTE,
-        IMAGE_SCN_MEM_LOCKED, IMAGE_SCN_MEM_NOT_CACHED, IMAGE_SCN_MEM_NOT_PAGED,
-        IMAGE_SCN_MEM_PRELOAD, IMAGE_SCN_MEM_PURGEABLE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_SHARED,
-        IMAGE_SCN_MEM_WRITE, IMAGE_SCN_TYPE_NO_PAD, IMAGE_SYM_CLASS_ARGUMENT,
-        IMAGE_SYM_CLASS_AUTOMATIC, IMAGE_SYM_CLASS_BIT_FIELD, IMAGE_SYM_CLASS_BLOCK,
-        IMAGE_SYM_CLASS_CLR_TOKEN, IMAGE_SYM_CLASS_END_OF_FUNCTION, IMAGE_SYM_CLASS_END_OF_STRUCT,
-        IMAGE_SYM_CLASS_ENUM_TAG, IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_EXTERNAL_DEF,
-        IMAGE_SYM_CLASS_FILE, IMAGE_SYM_CLASS_FUNCTION, IMAGE_SYM_CLASS_LABEL,
-        IMAGE_SYM_CLASS_MEMBER_OF_ENUM, IMAGE_SYM_CLASS_MEMBER_OF_STRUCT,
-        IMAGE_SYM_CLASS_MEMBER_OF_UNION, IMAGE_SYM_CLASS_NULL, IMAGE_SYM_CLASS_REGISTER,
-        IMAGE_SYM_CLASS_REGISTER_PARAM, IMAGE_SYM_CLASS_SECTION, IMAGE_SYM_CLASS_STATIC,
-        IMAGE_SYM_CLASS_STRUCT_TAG, IMAGE_SYM_CLASS_TYPE_DEFINITION,
+        IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_NOT_CACHED,
+        IMAGE_SCN_MEM_NOT_PAGED, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_SHARED, IMAGE_SCN_MEM_WRITE,
+        IMAGE_SCN_TYPE_NO_PAD, IMAGE_SYM_CLASS_ARGUMENT, IMAGE_SYM_CLASS_AUTOMATIC,
+        IMAGE_SYM_CLASS_BIT_FIELD, IMAGE_SYM_CLASS_BLOCK, IMAGE_SYM_CLASS_CLR_TOKEN,
+        IMAGE_SYM_CLASS_END_OF_FUNCTION, IMAGE_SYM_CLASS_END_OF_STRUCT, IMAGE_SYM_CLASS_ENUM_TAG,
+        IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_EXTERNAL_DEF, IMAGE_SYM_CLASS_FILE,
+        IMAGE_SYM_CLASS_FUNCTION, IMAGE_SYM_CLASS_LABEL, IMAGE_SYM_CLASS_MEMBER_OF_ENUM,
+        IMAGE_SYM_CLASS_MEMBER_OF_STRUCT, IMAGE_SYM_CLASS_MEMBER_OF_UNION, IMAGE_SYM_CLASS_NULL,
+        IMAGE_SYM_CLASS_REGISTER, IMAGE_SYM_CLASS_REGISTER_PARAM, IMAGE_SYM_CLASS_SECTION,
+        IMAGE_SYM_CLASS_STATIC, IMAGE_SYM_CLASS_STRUCT_TAG, IMAGE_SYM_CLASS_TYPE_DEFINITION,
         IMAGE_SYM_CLASS_UNDEFINED_LABEL, IMAGE_SYM_CLASS_UNDEFINED_STATIC,
         IMAGE_SYM_CLASS_UNION_TAG, IMAGE_SYM_CLASS_WEAK_EXTERNAL,
     },
@@ -233,11 +231,6 @@ bitflags! {
     }
 }
 
-const SECTION_FLAGS_ALIGN_SHIFT: usize = 0x14;
-const SECTION_FLAGS_ALIGN_MASK: u32 = 0xf;
-const SECTION_FLAGS_CONTENTS_MASK: u32 = 0xfc;
-const SECTION_FLAGS_MEM_MASK: u32 = 0xfe0e0000;
-
 /// Characteristics from COFF section headers.
 ///
 /// The characteristic field is a hybrid of bit flags and numeric values.
@@ -258,10 +251,6 @@ bitflags! {
         const LnkRemove = IMAGE_SCN_LNK_REMOVE;
         const LnkComdat = IMAGE_SCN_LNK_COMDAT;
         const GpRel = IMAGE_SCN_GPREL;
-        const MemPurgeable = IMAGE_SCN_MEM_PURGEABLE;
-        const Mem16Bit = IMAGE_SCN_MEM_16BIT;
-        const MemLocked = IMAGE_SCN_MEM_LOCKED;
-        const MemPreload = IMAGE_SCN_MEM_PRELOAD;
         // Alignment is numeric not flags
         const LnkNRelocOvfl = IMAGE_SCN_LNK_NRELOC_OVFL;
         const MemDiscardable = IMAGE_SCN_MEM_DISCARDABLE;
@@ -277,6 +266,9 @@ bitflags! {
     }
 }
 
+const SECTION_FLAGS_ALIGN_SHIFT: usize = 0x14;
+const SECTION_FLAGS_ALIGN_MASK: u32 = 0xf;
+
 impl SectionFlags {
     /// Returns the alignment from the section alignment flags or 0 if unset
     pub const fn alignment(&self) -> usize {
@@ -288,114 +280,86 @@ impl SectionFlags {
         }
     }
 
-    /// Sets the alignment flags to `align`.
+    /// Sets the alignment flag to match `align`.
     ///
-    /// Valid alignment values are 0, 1 or any power of to up to and including 8192.
+    /// Valid alignment values are 0, 1 or any power of two <= 8192.
+    /// Setting the align value to 0 will clear all alignment flags.
     ///
-    /// # Invalid alignment
-    /// This function will panic if debug assertions are enabled and an invalid
-    /// alignment value is passed. Alignments should be validated ahead of time
-    /// and are only set explicitly.
-    ///
-    /// If debug assertions are not enabled, this function will round up to the
-    /// next alignment value or truncate down to 8192.
-    pub fn set_alignment(&mut self, align: usize) {
+    /// # Panics
+    /// Function will panic if an invalid alignment value is passed in.
+    pub const fn set_alignment(&mut self, align: usize) {
+        // Clear previous flags
         self.0 &= !(SECTION_FLAGS_ALIGN_MASK << SECTION_FLAGS_ALIGN_SHIFT);
+
         if align == 0 {
-            return;
-        } else if align == 1 {
-            self.0 |= 1 << SECTION_FLAGS_ALIGN_SHIFT;
             return;
         }
 
-        let clamped = (align - 1).next_power_of_two().min(8192);
-        self.0 |= (clamped.ilog2() + 1) << SECTION_FLAGS_ALIGN_SHIFT;
-
-        debug_assert_eq!(
-            align, clamped,
-            "Invalid alignment passed to SectionFlags::set_alignment()"
+        assert!(
+            align.is_power_of_two(),
+            "align value for SectionFlags::set_alignment() must be a power of two"
         );
+        assert!(
+            align <= 8192,
+            "align value for SectionFlags::set_alignment() must be within range 0 <= align <= 8192"
+        );
+        self.0 |= (align.ilog2() + 1) << SECTION_FLAGS_ALIGN_SHIFT;
     }
 
-    /// Returns a new instance of `self` with the alignment flags cleared
-    pub fn cleared_alignment(self) -> Self {
-        let mut cleared = self;
-        cleared.set_alignment(0);
-        cleared
-    }
-
-    /// Returns a new set of flags with only the `MEM_*` flags set
+    /// Returns a new set of flags with only the `IMAGE_SCN_MEM_*` flags set
     pub const fn memory_flags(self) -> Self {
-        SectionFlags(self.0 & SECTION_FLAGS_MEM_MASK)
+        SectionFlags(self.0 & (0xe << 24))
     }
 
-    /// Returns a new set of flags with only the `CNT_*` flags set.
+    /// Returns a new set of flags with only the `IMAGE_SCN_CNT_*` flags set.
     pub const fn contents_flags(self) -> Self {
-        SectionFlags(self.0 & SECTION_FLAGS_CONTENTS_MASK)
+        SectionFlags(self.0 & (0xe << 4))
     }
 
-    /// Returns only the flags used for determining the section kind and output
-    /// section contributions.
+    /// Returns the union of `self.memory_flags() | self.contents_flags()`.
     ///
-    /// These are only `IMAGE_SCN_MEM_*` and `IMAGE_SCN_CNT_*` flags
-    pub fn kind_flags(self) -> Self {
-        self.memory_flags() | self.contents_flags()
+    /// This is used for determining output section flags from an input section.
+    pub const fn kind_flags(self) -> Self {
+        Self(self.memory_flags().0 | self.contents_flags().0)
     }
 }
 
 /// A section **number** for a symbol.
 ///
-/// Section numbers a little confusing because certain values are not used as
-/// section indicies but for denoting the type of symbol definition. Section
-/// numbers also refer to 1-based indicies if the symbol is defined.
-///
-/// Section handling follows similarly to how ELF handles sections.
-/// Section initialization will create an empty section at index 0 that acts
-/// as an `SHT_NULL` section. Indexing into the section table can be done directly
-/// using the number value after checking if it is negative since the NULL section
-/// will just be empty.
+/// The section number is 1-based and stored internally as a `u32`.
+/// The associated [`SectionNumber::index()`] method can be used for getting
+/// the section index value if the section number refers to a section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
-pub struct SectionNumber(i32);
+pub struct SectionNumber(u32);
 
 #[allow(non_upper_case_globals)]
 impl SectionNumber {
     pub const Undefined: Self = Self(0);
-    pub const Absolute: Self = Self(-1);
-    pub const Debug: Self = Self(-2);
+    pub const Absolute: Self = Self(u32::MAX);
+    pub const Debug: Self = Self(u32::MAX - 1);
 }
 
 impl From<i32> for SectionNumber {
     fn from(value: i32) -> Self {
-        Self(value)
+        Self(value.cast_unsigned())
     }
 }
 
 impl SectionNumber {
-    pub const fn as_i32(self) -> i32 {
+    pub const fn as_u32(&self) -> u32 {
         self.0
     }
 
     /// Returns the 1-based section index if the section number refers to a section
     pub const fn index(self) -> Option<SectionIndex> {
-        if self.0 > 0 {
+        if 0 < self.0 && self.0 < SectionNumber::Absolute.0 {
             Some(SectionIndex(self.0 as usize))
         } else {
             None
         }
     }
 }
-
-#[derive(Debug)]
-pub struct TryFromStorageClassError(u8);
-
-impl std::fmt::Display for TryFromStorageClassError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown 'IMAGE_SYM_CLASS_*' value '{}'", self.0)
-    }
-}
-
-impl std::error::Error for TryFromStorageClassError {}
 
 /// Symbol storage class values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -468,17 +432,17 @@ impl TryFrom<u8> for StorageClass {
 }
 
 #[derive(Debug)]
-pub struct TryFromComdatSelectionError(u8);
+pub struct TryFromStorageClassError(u8);
 
-impl std::fmt::Display for TryFromComdatSelectionError {
+impl std::fmt::Display for TryFromStorageClassError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown 'IMAGE_COMDAT_SELECT_*' value '{}'", self.0)
+        write!(f, "unknown 'IMAGE_SYM_CLASS_*' value '{}'", self.0)
     }
 }
 
-impl std::error::Error for TryFromComdatSelectionError {}
+impl std::error::Error for TryFromStorageClassError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum ComdatSelection {
     NoDuplicates = IMAGE_COMDAT_SELECT_NODUPLICATES,
@@ -487,6 +451,19 @@ pub enum ComdatSelection {
     ExactMatch = IMAGE_COMDAT_SELECT_EXACT_MATCH,
     Associative = IMAGE_COMDAT_SELECT_ASSOCIATIVE,
     Largest = IMAGE_COMDAT_SELECT_LARGEST,
+}
+
+impl From<ComdatSelection> for u8 {
+    fn from(value: ComdatSelection) -> Self {
+        match value {
+            ComdatSelection::NoDuplicates => IMAGE_COMDAT_SELECT_NODUPLICATES,
+            ComdatSelection::Any => IMAGE_COMDAT_SELECT_ANY,
+            ComdatSelection::SameSize => IMAGE_COMDAT_SELECT_SAME_SIZE,
+            ComdatSelection::ExactMatch => IMAGE_COMDAT_SELECT_EXACT_MATCH,
+            ComdatSelection::Associative => IMAGE_COMDAT_SELECT_ASSOCIATIVE,
+            ComdatSelection::Largest => IMAGE_COMDAT_SELECT_LARGEST,
+        }
+    }
 }
 
 impl TryFrom<u8> for ComdatSelection {
@@ -505,18 +482,16 @@ impl TryFrom<u8> for ComdatSelection {
     }
 }
 
-impl From<ComdatSelection> for u8 {
-    fn from(value: ComdatSelection) -> Self {
-        match value {
-            ComdatSelection::NoDuplicates => IMAGE_COMDAT_SELECT_NODUPLICATES,
-            ComdatSelection::Any => IMAGE_COMDAT_SELECT_ANY,
-            ComdatSelection::SameSize => IMAGE_COMDAT_SELECT_SAME_SIZE,
-            ComdatSelection::ExactMatch => IMAGE_COMDAT_SELECT_EXACT_MATCH,
-            ComdatSelection::Associative => IMAGE_COMDAT_SELECT_ASSOCIATIVE,
-            ComdatSelection::Largest => IMAGE_COMDAT_SELECT_LARGEST,
-        }
+#[derive(Debug)]
+pub struct TryFromComdatSelectionError(u8);
+
+impl std::fmt::Display for TryFromComdatSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown 'IMAGE_COMDAT_SELECT_*' value '{}'", self.0)
     }
 }
+
+impl std::error::Error for TryFromComdatSelectionError {}
 
 /// @feat.00 symbol flags.
 ///
