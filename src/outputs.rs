@@ -40,6 +40,7 @@
 //! 21. .debug_str (DWARF strings)
 //! 22. .debug_line_str (DWARF line strings)
 //! 23. .debug_frame (DWARF frame)
+//! 24. .idata (import data)
 //!
 //! All other sections are ordered after the reserved sections on a "first-seen" basis.
 use object::SectionIndex;
@@ -88,6 +89,7 @@ impl OutputSectionId {
     pub const DebugStr: Self = Self(21);
     pub const DebugLineStr: Self = Self(22);
     pub const DebugFrame: Self = Self(23);
+    pub const Idata: Self = Self(24);
 }
 
 impl OutputSectionId {
@@ -100,28 +102,28 @@ impl OutputSectionId {
     }
 }
 
-pub const RESERVED_OUTPUT_SECTIONS_COUNT: usize = 24;
+pub const RESERVED_OUTPUT_SECTIONS_COUNT: usize = 25;
 
 #[derive(Debug, Clone)]
 pub struct OutputSection<'a> {
+    pub id: OutputSectionId,
     pub name: &'a [u8],
     pub characteristics: SectionFlags,
+    pub index: SectionIndex,
     pub length: u32,
+    pub discarded: bool,
     pub inputs: Vec<(ObjectFileId, SectionIndex)>,
 }
 
-impl<'a> std::default::Default for OutputSection<'a> {
-    fn default() -> Self {
-        Self::new(b"", SectionFlags::empty())
-    }
-}
-
 impl<'a> OutputSection<'a> {
-    pub fn new(name: &'a [u8], characteristics: SectionFlags) -> Self {
+    pub fn new(id: OutputSectionId, name: &'a [u8], characteristics: SectionFlags) -> Self {
         Self {
+            id,
             name,
             characteristics,
+            index: SectionIndex(0),
             length: 0,
+            discarded: false,
             inputs: Vec::new(),
         }
     }
@@ -132,7 +134,7 @@ impl<'a> OutputSection<'a> {
             self.inputs.par_sort_unstable_by_key(|(objid, index)| {
                 let index = *index;
                 let obj = &objs[objid.index()];
-                let input_name = obj.input_section(index).unwrap().name;
+                let input_name = obj.section(index).unwrap().name;
                 let ordering_name = input_name.strip_prefix(name).unwrap();
                 // $<name>, object order, section order
                 (ordering_name, objid.index(), index.0)
@@ -150,7 +152,7 @@ impl<'a> OutputSection<'a> {
             .par_iter()
             .map(|(objid, index)| {
                 objs[objid.index()]
-                    .input_section(*index)
+                    .section(*index)
                     .unwrap()
                     .characteristics
                     .alignment()
@@ -167,7 +169,7 @@ impl<'a> OutputSection<'a> {
     /// This is done sequentially
     pub fn compute_length(&mut self, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
         self.length = self.inputs.iter().fold(0, |length, (objid, index)| {
-            let section = objs[objid.index()].input_section(*index).unwrap();
+            let section = objs[objid.index()].section(*index).unwrap();
             let align = section.characteristics.alignment().min(1);
             let address = length.next_multiple_of(align as u32);
             address + section.length
@@ -193,7 +195,10 @@ impl<'a> OutputSection<'a> {
                 v2
             });
 
-        InputJoinMatrix { mat }
+        InputJoinMatrix {
+            output_id: self.id,
+            mat,
+        }
     }
 }
 
@@ -203,7 +208,8 @@ pub fn create_reserved_sections<'a>(
     let mut sections = Vec::new();
 
     let mut push = |name: &'a str, flags| {
-        sections.push(arena.alloc_ref(OutputSection::new(name.as_bytes(), flags)));
+        let id = OutputSectionId(sections.len() as u32);
+        sections.push(arena.alloc_ref(OutputSection::new(id, name.as_bytes(), flags)));
     };
 
     let r = SectionFlags::MemRead;
@@ -239,6 +245,7 @@ pub fn create_reserved_sections<'a>(
     push(".debug_str", data | r | discardable);
     push(".debug_line_str", data | r | discardable);
     push(".debug_frame", data | r | discardable);
+    push(".idata", data | r | w);
 
     debug_assert!(sections.len() == RESERVED_OUTPUT_SECTIONS_COUNT);
 
@@ -274,6 +281,7 @@ impl<'a> SectionKey<'a> {
         };
 
         let r = SectionFlags::MemRead;
+        let w = SectionFlags::MemWrite;
         let discardable = SectionFlags::MemDiscardable;
         let data = SectionFlags::CntInitializedData;
 
@@ -290,7 +298,8 @@ impl<'a> SectionKey<'a> {
             if !ignore_merge.contains(&(key.name, key.flags)) {
                 key.name = strip_dollar(key.name);
             }
-        } else {
+        } else if key.name.starts_with(b".idata$") && key.flags == data | r | w {
+            // Always merge import data sections
             key.name = strip_dollar(key.name);
         }
 
@@ -385,6 +394,7 @@ pub type OutputSectionInputsMap =
 
 /// Matrix for joining input sections to output sections
 pub struct InputJoinMatrix {
+    pub output_id: OutputSectionId,
     mat: Vec<Vec<SectionIndex>>,
 }
 
@@ -393,18 +403,4 @@ impl InputJoinMatrix {
     pub fn get(&self, obj: ObjectFileId) -> Option<&[SectionIndex]> {
         self.mat.get(obj.index()).map(|list| list.as_slice())
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RebaseGroup {
-    /// Output section for this rebase group
-    pub output: OutputSectionId,
-    /// Matrix with input object / list of rebased addresses.
-    pub rebases: Vec<Vec<RebaseEntry>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RebaseEntry {
-    pub index: SectionIndex,
-    pub address: u32,
 }
