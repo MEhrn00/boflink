@@ -15,14 +15,11 @@ use std::{
 
 use object::{
     Object as _, ObjectSection as _, ObjectSymbol as _, ReadRef, SectionIndex, SymbolIndex,
-    SymbolScope, U16Bytes, U32Bytes,
-    coff::{
-        CoffFile, CoffHeader, ImageSymbol as _, ImportFile, ImportName, ImportType, SectionTable,
-        SymbolTable,
-    },
+    U16Bytes,
+    coff::{CoffFile, CoffHeader, ImageSymbol, SectionTable, SymbolTable},
     pe::{
-        IMAGE_COMDAT_SELECT_ASSOCIATIVE, IMAGE_REL_AMD64_REL32, IMAGE_REL_I386_DIR32,
-        IMAGE_SYM_CLASS_FILE, IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY,
+        IMAGE_COMDAT_SELECT_ASSOCIATIVE, IMAGE_SYM_ABSOLUTE, IMAGE_SYM_CLASS_EXTERNAL,
+        IMAGE_SYM_DEBUG, IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY,
     },
 };
 use rayon::Scope;
@@ -30,6 +27,7 @@ use rayon::Scope;
 use crate::{
     ErrorContext,
     arena::ArenaRef,
+    bail,
     coff::{
         CoffFlags, ComdatSelection, Feat00Flags, ImageFileMachine, SectionFlags, SectionNumber,
         StorageClass,
@@ -38,7 +36,7 @@ use crate::{
     inputs::{InputFile, InputFileSource},
     make_error,
     outputs::OutputSectionId,
-    symbols::{GlobalSymbol, SymbolId},
+    symbols::{GlobalSymbol, SymbolDemangler, SymbolId},
 };
 
 /// Id for an object file. This is a tagged index using a `u32`.
@@ -53,6 +51,14 @@ impl ObjectFileId {
             u32::try_from(idx)
                 .unwrap_or_else(|_| panic!("number of object files exceeded u32::MAX")),
         )
+    }
+
+    pub const fn internal() -> Self {
+        ObjectFileId(0)
+    }
+
+    pub const fn is_internal(&self) -> bool {
+        self.0 == Self::internal().0
     }
 
     pub const fn index(self) -> usize {
@@ -124,22 +130,22 @@ pub struct ObjectFile<'a> {
     /// if not present.
     pub addrsig_index: SectionIndex,
 
-    /// True if this COFF contains import information
-    pub has_import_data: bool,
-
     /// Symbols.
     ///
     /// This vec retains the same symbol indicies as the original symbol table.
     pub symbols: Vec<Option<ObjectSymbol<'a>>>,
 
-    /// Indicies of COMDAT symbols.
-    ///
-    /// These are either COMDAT leader symbols or section symbols depending on
-    /// the selection type.
-    pub comdat_indicies: Vec<SymbolIndex>,
+    /// Indicies of COMDAT leader symbols
+    pub comdat_leaders: Vec<SymbolIndex>,
 
     /// @feat.00 flags
     pub feat_flags: Feat00Flags,
+
+    /// True if this COFF contains import information
+    pub has_import_data: bool,
+
+    /// True if this object file has common symbols
+    pub has_common_symbols: bool,
 }
 
 impl<'a> ObjectFile<'a> {
@@ -155,12 +161,21 @@ impl<'a> ObjectFile<'a> {
             coff_symbols: Default::default(),
             sections: Vec::new(),
             symbols: Vec::new(),
-            comdat_indicies: Vec::new(),
+            comdat_leaders: Vec::new(),
             directives_index: SectionIndex(0),
-            has_import_data: false,
             addrsig_index: SectionIndex(0),
             feat_flags: Feat00Flags::empty(),
+            has_common_symbols: false,
+            has_import_data: false,
         }
+    }
+
+    pub fn internal_obj() -> Self {
+        Self::new(ObjectFileId::internal(), InputFile::internal(), false)
+    }
+
+    pub fn is_internal_obj(&self) -> bool {
+        self.id.is_internal()
     }
 
     pub fn source(&self) -> InputFileSource<'a> {
@@ -324,12 +339,16 @@ impl<'a> ObjectFile<'a> {
                 checksum: 0,
                 characteristics,
                 coff_relocs: relocs.into(),
-                associative: None,
+                associative_edges: Vec::new(),
                 index: coff_section.index(),
                 discarded: AtomicBool::new(false),
+                visited: AtomicBool::new(false),
                 output: OutputSectionId::Null,
             });
         }
+
+        // Every COMDAT should have at least one symbol associated with it
+        self.comdat_leaders.reserve(comdats);
 
         ctx.stats
             .parse
@@ -351,53 +370,85 @@ impl<'a> ObjectFile<'a> {
     ) -> crate::Result<()> {
         self.symbols.resize_with(self.coff_symbols.len(), || None);
 
-        let mut comdat_aux = Vec::new();
-        comdat_aux.resize_with(self.coff_sections.len() + 1, || None);
+        // Map of COMDAT selections indexable by section number. Used for setting
+        // up COMDAT leaders
+        let mut comdat_sels = Vec::new();
+        comdat_sels.resize_with(self.coff_sections.len() + 1, || None);
 
         let mut locals = 0;
 
         for coff_symbol in coff.symbols() {
-            if coff_symbol.coff_symbol().storage_class() == IMAGE_SYM_CLASS_FILE {
+            let image_symbol = coff_symbol.coff_symbol();
+
+            // Helper closures for getting values from the COFF symbol. These
+            // are closures so that these values are lazily acquired. Some symbol
+            // types, such as IMAGE_SYM_DEBUG, do not require reading the symbol
+            // name so do not attempt to read it unless necessary.
+            let symbol_name = || {
+                coff_symbol
+                    .name_bytes()
+                    .with_context(|| format!("reading name for symbol {}", coff_symbol.index()))
+            };
+
+            // Makes a local copy of the symbol and adds it to the local symbol
+            // table
+            let make_symbol =
+                |name: &'a [u8], index: SymbolIndex| -> crate::Result<ObjectSymbol<'a>> {
+                    Ok(ObjectSymbol {
+                        name,
+                        index,
+                        value: image_symbol.value(),
+                        section_number: image_symbol.section_number().into(),
+                        storage_class: image_symbol
+                            .storage_class()
+                            .try_into()
+                            .with_context(|| format!("symbol at index {index}"))?,
+                        selection: None,
+                        typ: image_symbol.typ(),
+                        external_id: None,
+                        weak_definition: None,
+                    })
+                };
+
+            if image_symbol.section_number() == IMAGE_SYM_ABSOLUTE {
+                let name = symbol_name()?;
+                if name == b"@feat.00" {
+                    self.feat_flags = Feat00Flags::from_bits_retain(image_symbol.value());
+                    continue;
+                } else if name == b"@comp.id" {
+                    continue;
+                }
+
+                let index = coff_symbol.index();
+                let symbol = self.symbols[index.0].insert(make_symbol(name, index)?);
+                if image_symbol.storage_class() == IMAGE_SYM_CLASS_EXTERNAL {
+                    symbol.external_id = Some(ctx.symbol_map.get_or_create_default(name));
+                }
+                continue;
+            } else if image_symbol.section_number() == IMAGE_SYM_DEBUG {
                 continue;
             }
 
-            let name = coff_symbol
-                .name_bytes()
-                .with_context(|| format!("reading name for symbol {}", coff_symbol.index()))?;
+            let index = coff_symbol.index();
+            let symbol = self.symbols[index.0].insert(make_symbol(symbol_name()?, index)?);
+            if symbol.is_weak() {
+                // Handle IMAGE_SYM_CLASS_WEAK_EXTERNAL without an aux record
+                if image_symbol.number_of_aux_symbols() == 0 {
+                    bail!(
+                        "{}: missing weak extern auxiliary record",
+                        symbol.demangle(ctx, self.machine)
+                    );
+                }
 
-            let symbol = {
-                let index = coff_symbol.index();
-                let coff_symbol = coff_symbol.coff_symbol();
-                let local_symbol = ObjectSymbol {
-                    name,
-                    index,
-                    value: coff_symbol.value(),
-                    section_number: coff_symbol.section_number().into(),
-                    storage_class: coff_symbol
-                        .storage_class()
-                        .try_into()
-                        .with_context(|| format!("symbol at index {index}"))?,
-                    selection: None,
-                    typ: coff_symbol.typ(),
-                    external_id: None,
-                };
-                self.symbols[index.0] = Some(local_symbol);
-                self.symbols[index.0].as_mut().unwrap()
-            };
-
-            if coff_symbol.is_weak() {
                 let weak_aux = self
                     .coff_symbols
-                    .aux_weak_external(coff_symbol.index())
-                    .with_context(|| {
-                        format!("reading weak aux for symbol {}", coff_symbol.index())
-                    })?;
+                    .aux_weak_external(symbol.index)
+                    .with_context(|| format!("reading weak aux for symbol {}", symbol.index))?;
 
                 let weak_search = weak_aux.weak_search_type.get(object::LittleEndian);
 
                 // Check if the weak external symbol should be externally visible
-                // for symbol resolution and unlink it from the global symbol map
-                // if it should not.
+                // for symbol resolution.
                 // It is confusing why a weak "external" would be treated as a
                 // local symbol but it happens to be a thing.
                 // These can be confusing since GCC tries to "simulate" weak definitions
@@ -408,17 +459,19 @@ impl<'a> ObjectFile<'a> {
                 // - https://sourceware.org/legacy-ml/binutils/2005-08/msg00205.html
                 // - https://maskray.me/blog/2021-04-25-weak-symbol
                 // - https://sourceware.org/bugzilla/show_bug.cgi?id=9687
-
-                if weak_search != IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY {
-                    symbol.external_id = Some(ctx.symbol_map.get_or_create_default(name));
+                if weak_search == IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY {
+                    continue;
                 }
-            } else if coff_symbol.scope() == SymbolScope::Linkage {
-                symbol.external_id = Some(ctx.symbol_map.get_or_create_default(name));
-            } else if coff_symbol.is_local() {
+            } else if symbol.is_global() {
+                symbol.external_id = Some(ctx.symbol_map.get_or_create_default(symbol.name));
+            } else {
                 locals += 1;
             }
 
-            let Some(section_index) = coff_symbol.section_index() else {
+            let Some(section_index) = symbol.section_number.index() else {
+                if symbol.is_common() {
+                    self.has_common_symbols = true;
+                }
                 continue;
             };
 
@@ -437,43 +490,51 @@ impl<'a> ObjectFile<'a> {
             };
 
             // Handle section symbols
-            if coff_symbol.coff_symbol().has_aux_section() {
+            if image_symbol.has_aux_section() {
                 let aux_section = self
                     .coff_symbols
-                    .aux_section(coff_symbol.index())
-                    .with_context(|| format!("symbol at index {}", coff_symbol.index()))?;
+                    .aux_section(symbol.index)
+                    .with_context(|| format!("symbol at index {}", symbol.index))?;
 
-                // Overwrite length to match the aux symbol length. This value
-                // is more accurate for computing section length since GCC inserts
-                // padding into the raw data. The padding may get trimmed if
-                // proprly aligned
-                section.length = aux_section.length.get(object::LittleEndian);
+                // Overwrite section length using the auxiliary symbol length
+                // if non-zero. GCC will insert padding at the end of sections
+                // that contain initialized data. The length field here reflects
+                // the actual section size and not the padded size
+                let length = aux_section.length.get(object::LittleEndian);
+                if length > 0 {
+                    section.length = length;
+                }
                 section.checksum = aux_section.check_sum.get(object::LittleEndian);
 
                 if aux_section.selection == IMAGE_COMDAT_SELECT_ASSOCIATIVE {
-                    // Record associative COMDATs and setup the aux section
-                    // for the leader to handle
+                    // Add associative COMDATs to the parent associative adjacency
+                    // list
                     let number = aux_section.number.get(object::LittleEndian);
-                    section.associative = Some(SectionIndex(number as usize));
-                    symbol.selection = Some(ComdatSelection::Associative);
-                    self.comdat_indicies.push(symbol.index);
+                    let parent_index = SectionIndex(number as usize);
+                    let parent = self.sections
+                        .get_mut(parent_index.0)
+                        .and_then(|section| section.as_mut())
+                        .with_context(|| format!("auxiliary section symbol at index {} associative section is invalid", symbol.index))?;
+                    parent.associative_edges.push(section_index);
                 } else if section.characteristics.contains(SectionFlags::LnkComdat) {
                     // For COMDAT sections that are not associative, record the
-                    // auxiliary symbol for the leader to handle
-                    comdat_aux[section_index.0] = Some(aux_section);
+                    // selection type for the leader to handle
+                    let selection =
+                        ComdatSelection::try_from(aux_section.selection).with_context(|| {
+                            format!("auxiliary section symbol at index {}", symbol.index)
+                        })?;
+                    comdat_sels[section_index.0] = Some(selection);
                 }
 
                 continue;
             }
 
-            // Handle COMDAT sections that are pending a leader symbol
+            // Associate COMDAT selections to leader symbols
             if section.is_comdat()
-                && let Some(aux_section) = comdat_aux[section_index.0].take()
+                && let Some(selection) = comdat_sels[section_index.0].take()
             {
-                let selection = ComdatSelection::try_from(aux_section.selection)
-                    .with_context(|| format!("COMDAT leader for section {}", section.index))?;
                 symbol.selection = Some(selection);
-                self.comdat_indicies.push(symbol.index);
+                self.comdat_leaders.push(symbol.index);
             }
         }
 
@@ -486,106 +547,6 @@ impl<'a> ObjectFile<'a> {
             .parse
             .input_symbols
             .fetch_add(self.symbols.len(), Ordering::Relaxed);
-
-        Ok(())
-    }
-
-    pub fn parse_importfile(&mut self, ctx: &LinkContext<'a>) -> crate::Result<()> {
-        let file = ImportFile::parse(self.file.data)?;
-        self.machine = Self::identify_importfile_machine(self.file.data)?;
-        self.characteristics = CoffFlags::LineNumsStripped;
-
-        let strings = ctx.string_pool.get();
-
-        let import_name = if let ImportName::Name(name) = file.import() {
-            name
-        } else {
-            let mut public_symbol = file.symbol();
-            log::warn!(
-                "{}: using public symbol name '{}' for resolving NONAME ordinal import",
-                self.source(),
-                String::from_utf8_lossy(public_symbol)
-            );
-
-            if self.machine == ImageFileMachine::I386 {
-                public_symbol = public_symbol.strip_prefix(b"_").unwrap_or(public_symbol);
-            }
-            public_symbol
-        };
-
-        let thunk_section_name = match file.import_type() {
-            ImportType::Const => ".rdata",
-            ImportType::Code => ".text",
-            ImportType::Data => ".data",
-        };
-
-        let section_name = strings.alloc_bytes(
-            [thunk_section_name.as_bytes(), b"$", import_name]
-                .concat()
-                .as_slice(),
-        );
-        let code = file.import_type() == ImportType::Code;
-
-        let mut coff_relocs: Cow<[object::pe::ImageRelocation]> = Cow::Borrowed(&[]);
-        if code {
-            if self.machine == ImageFileMachine::Amd64 {
-                static THUNK_RELOC: [object::pe::ImageRelocation; 1] =
-                    [object::pe::ImageRelocation {
-                        virtual_address: U32Bytes::from_bytes(2u32.to_le_bytes()),
-                        symbol_table_index: U32Bytes::from_bytes(0u32.to_le_bytes()),
-                        typ: U16Bytes::from_bytes(IMAGE_REL_AMD64_REL32.to_le_bytes()),
-                    }];
-                coff_relocs = Cow::Borrowed(&THUNK_RELOC);
-            } else if self.machine == ImageFileMachine::I386 {
-                static THUNK_RELOC: [object::pe::ImageRelocation; 1] =
-                    [object::pe::ImageRelocation {
-                        virtual_address: U32Bytes::from_bytes(2u32.to_le_bytes()),
-                        symbol_table_index: U32Bytes::from_bytes(0u32.to_le_bytes()),
-                        typ: U16Bytes::from_bytes(IMAGE_REL_I386_DIR32.to_le_bytes()),
-                    }];
-                coff_relocs = Cow::Borrowed(&THUNK_RELOC);
-            }
-        }
-
-        let mut characteristics = SectionFlags::empty();
-        characteristics.set_alignment(4);
-        match file.import_type() {
-            ImportType::Code => {
-                characteristics |=
-                    SectionFlags::CntCode | SectionFlags::MemExecute | SectionFlags::MemRead;
-            }
-            ImportType::Data => {
-                characteristics |= SectionFlags::CntInitializedData
-                    | SectionFlags::MemRead
-                    | SectionFlags::MemWrite;
-            }
-            ImportType::Const => {
-                characteristics |= SectionFlags::CntInitializedData | SectionFlags::MemRead;
-            }
-        }
-
-        let section_data = if code {
-            // jmp [rip + $<symbol>]
-            [0xff, 0x25, 0x00, 0x00, 0x00, 0x00, 0x90, 0x90].as_slice()
-        } else {
-            &[]
-        };
-
-        self.sections.push(Some(ObjectSection {
-            name: section_name,
-            data: section_data,
-            checksum: 0,
-            virtual_address: 0,
-            length: section_data.len().saturating_sub(2) as u32,
-            characteristics,
-            coff_relocs,
-            associative: None,
-            index: SectionIndex(1),
-            discarded: AtomicBool::new(false),
-            output: OutputSectionId::Null,
-        }));
-
-        // TODO: Finish
 
         Ok(())
     }
@@ -607,38 +568,43 @@ impl<'a> ObjectFile<'a> {
             }
 
             // Skip resolving local weak symbols
-            if symbol.is_weak() && symbol.external_id.is_none() {
+            if symbol.is_weak() {
                 continue;
             }
 
-            let external_ref = ctx.symbol_map.get(symbol.external_id.unwrap()).unwrap();
+            let Some(external_id) = symbol.external_id else {
+                continue;
+            };
+
+            let external_ref = ctx.symbol_map.get(external_id).unwrap();
             let mut global = external_ref.write().unwrap();
 
             // Check if our copy of the symbol should be become the new global
             // symbol used
             let should_claim = |global: &GlobalSymbol| {
-                // Always claim symbols if the global one does not have an owner
-                let Some(owner_id) = global.owner else {
+                // Always claim symbols if the global one is undefined and owned
+                // by the internal object file
+                if global.owner.is_internal() && global.is_undefined() {
                     return true;
-                };
+                }
 
-                let owner = &objs[owner_id.index()];
-                let owner_symbol = owner.input_symbol(global.index).unwrap();
+                let owner = &objs[global.owner.index()];
+                let owner_symbol = owner.symbol(global.index).unwrap();
                 let owner_live = owner.live.load(Ordering::Relaxed);
 
                 // Compare symbol kinds. A greater kind means more symbol resolution
                 // strength. Use the first symbol seen if they are equal
-                match symbol.kind(live).cmp(&owner_symbol.kind(owner_live)) {
-                    std::cmp::Ordering::Equal => self.id < owner_id,
+                match symbol
+                    .priority(live)
+                    .cmp(&owner_symbol.priority(owner_live))
+                {
+                    std::cmp::Ordering::Equal => self.id < owner.id,
                     o => o == std::cmp::Ordering::Greater,
                 }
             };
 
             if should_claim(&global) {
-                global.value = symbol.value;
-                global.section_number = symbol.section_number;
-                global.index = symbol.index;
-                global.owner = Some(self.id);
+                symbol.claim(self.id, &mut global);
             }
         }
     }
@@ -649,18 +615,9 @@ impl<'a> ObjectFile<'a> {
         objs: &[ArenaRef<'a, ObjectFile<'a>>],
     ) {
         assert!(self.live.load(Ordering::Relaxed));
-        for symbol_index in self.comdat_indicies.iter().copied() {
+        for symbol_index in self.comdat_leaders.iter().copied() {
             let symbol = self.symbols[symbol_index.0].as_ref().unwrap();
-
-            // The stored COMDAT indicies are partitioned with leaders in the
-            // front and associative COMDATs after. Once an associative COMDAT
-            // is seen, there should not be any more leaders
-            if !symbol.is_comdat_leader() {
-                break;
-            }
-
-            // Section symbols for `IMAGE_COMDAT_SELECT_ASSOCIATIVE` and local
-            // COMDATs will get added to this list. Only resolve globally scoped symbols
+            // Check for local COMDAT leaders
             if symbol.is_local() {
                 continue;
             }
@@ -669,39 +626,79 @@ impl<'a> ObjectFile<'a> {
             let mut global = external_ref.write().unwrap();
 
             let should_claim = |global: &GlobalSymbol| {
-                let Some(owner_id) = global.owner else {
+                if global.owner.is_internal() && global.is_undefined() {
                     return true;
-                };
+                }
 
-                let owner = &objs[owner_id.index()];
+                let owner = &objs[global.owner.index()];
                 if !owner.live.load(Ordering::Relaxed) {
                     return true;
                 }
 
-                let owner_symbol = owner.input_symbol(global.index).unwrap();
+                let owner_symbol = owner.symbol(global.index).unwrap();
 
                 match symbol
                     .comdat_priority(self)
                     .cmp(&owner_symbol.comdat_priority(owner))
                 {
-                    std::cmp::Ordering::Equal => self.id < owner_id,
+                    std::cmp::Ordering::Equal => self.id < owner.id,
                     o => o == std::cmp::Ordering::Greater,
                 }
             };
 
             if should_claim(&global) {
-                global.value = symbol.value;
-                global.section_number = symbol.section_number;
-                global.index = symbol.index;
-                global.owner = Some(self.id);
+                symbol.claim(self.id, &mut global);
             }
         }
     }
 
-    pub fn discard_unused_comdats(&mut self, ctx: &LinkContext<'a>) -> crate::Result<()> {
+    pub fn discard_unclaimed_comdats(&mut self, ctx: &LinkContext<'a>) {
         assert!(*self.live.get_mut());
-        // TODO: Sort COMDATs and handle discards
-        Ok(())
+
+        // Flag for marking visited COMDATs. Gets set as the virtual address which
+        // will be overwritten during rebasing
+        let visited = 1;
+
+        // Visit sections which have not been visited before. If a section has
+        // been visited, check its discard status that was set by the last COMDAT leader
+        // - If the visited COMDAT is discarded but this leader is kept, continue visiting followers and mark them live
+        // - If the visited COMDAT was kept and this leader is kept, stop traversing the follower chain
+        // - If the visited COMDAT was kept but this leader was discarded, be conservative and stop
+        // traversing the chain to keep the followers live for the other leader
+        let should_visit = |section: &mut ObjectSection, discard: bool| -> bool {
+            section.virtual_address != visited || (*section.discarded.get_mut() && !discard)
+        };
+
+        let mark = |section: &mut ObjectSection| {
+            section.virtual_address = visited;
+        };
+
+        for &symbol_index in self.comdat_leaders.iter() {
+            let symbol = self.symbols[symbol_index.0].as_ref().unwrap();
+
+            // Set the discard status
+            let mut discard = false;
+            if symbol.is_global() {
+                let external_ref = ctx.symbol_map.get(symbol.external_id.unwrap()).unwrap();
+                let global = external_ref.read().unwrap();
+                if global.owner != self.id {
+                    discard = true;
+                }
+            }
+
+            let section_index = symbol.section_number.index().unwrap();
+
+            // Do a DFS traversal over associative edges to update discard status
+            let mut stack = vec![section_index];
+            while let Some(section_index) = stack.pop() {
+                let section = self.sections[section_index.0].as_mut().unwrap();
+                if should_visit(section, discard) {
+                    mark(section);
+                    *section.discarded.get_mut() = discard;
+                    stack.extend(&section.associative_edges);
+                }
+            }
+        }
     }
 
     pub fn include_needed_objects<'scope>(
@@ -734,9 +731,11 @@ impl<'a> ObjectFile<'a> {
                 }
             }
 
-            let Some(owner) = global.owner.map(|id| &objs[id.index()]) else {
-                return;
-            };
+            if global.owner.is_internal() {
+                continue;
+            }
+
+            let owner = &objs[global.owner.index()];
 
             let symbol_is_needed = symbol.is_undefined() || symbol.is_common();
             let should_visit = |obj: &ArenaRef<'a, ObjectFile>| {
@@ -758,47 +757,31 @@ impl<'a> ObjectFile<'a> {
         }
     }
 
-    pub fn input_section(&self, index: SectionIndex) -> Option<&ObjectSection<'a>> {
+    pub fn section(&self, index: SectionIndex) -> Option<&ObjectSection<'a>> {
         self.sections
             .get(index.0)
             .and_then(|section| section.as_ref())
     }
 
-    pub fn input_section_mut(&mut self, index: SectionIndex) -> Option<&mut ObjectSection<'a>> {
+    pub fn section_mut(&mut self, index: SectionIndex) -> Option<&mut ObjectSection<'a>> {
         self.sections
             .get_mut(index.0)
             .and_then(|section| section.as_mut())
     }
 
-    pub fn input_symbol(&self, index: SymbolIndex) -> Option<&ObjectSymbol<'a>> {
+    pub fn symbol(&self, index: SymbolIndex) -> Option<&ObjectSymbol<'a>> {
         self.symbols.get(index.0).and_then(|symbol| symbol.as_ref())
     }
 
-    /// Returns the DLL name if this COFF contains the DLL name entry for a short
-    /// import
-    pub fn dllname(&self) -> Option<&'a [u8]> {
-        if !self.has_import_data {
-            return None;
-        }
-
-        let idata_flags =
-            SectionFlags::CntInitializedData | SectionFlags::MemRead | SectionFlags::MemWrite;
-
-        for section in self.sections.iter().flatten() {
-            if section.data.is_empty() {
-                continue;
-            }
-
-            if section.name == b".idata$7" && section.characteristics.contains(idata_flags) {
-                if let Some(nullbyte) = section.data.iter().position(|ch| *ch == 0) {
-                    return Some(&section.data[..nullbyte]);
-                } else {
-                    return Some(section.data);
-                }
-            }
-        }
-
-        None
+    pub fn demangle_symbol(
+        &self,
+        ctx: &LinkContext,
+        index: SymbolIndex,
+    ) -> Option<SymbolDemangler<'a>> {
+        self.symbols
+            .get(index.0)
+            .and_then(|symbol| symbol.as_ref())
+            .map(|symbol| symbol.demangle(ctx, self.machine))
     }
 }
 
@@ -812,8 +795,9 @@ pub struct ObjectSection<'a> {
     pub characteristics: SectionFlags,
     pub index: SectionIndex,
     pub coff_relocs: Cow<'a, [object::pe::ImageRelocation]>,
-    pub associative: Option<SectionIndex>,
+    pub associative_edges: Vec<SectionIndex>,
     pub discarded: AtomicBool,
+    pub visited: AtomicBool,
     pub output: OutputSectionId,
 }
 
@@ -833,6 +817,7 @@ pub struct ObjectSymbol<'a> {
     pub storage_class: StorageClass,
     pub typ: u16,
     pub selection: Option<ComdatSelection>,
+    pub weak_definition: Option<SymbolIndex>,
     pub external_id: Option<SymbolId>,
 }
 
@@ -882,27 +867,35 @@ impl<'a> ObjectSymbol<'a> {
             .is_some_and(|selection| selection != ComdatSelection::Associative)
     }
 
-    pub fn kind(&self, live: bool) -> SymbolKind {
+    pub fn claim(&self, id: ObjectFileId, global: &mut GlobalSymbol<'a>) {
+        global.value = self.value;
+        global.section_number = self.section_number;
+        global.index = self.index;
+        global.weak = self.is_weak();
+        global.owner = id;
+    }
+
+    pub fn priority(&self, live: bool) -> SymbolPriority {
         if self.is_defined() {
             if live {
-                SymbolKind::Defined
+                SymbolPriority::Defined
             } else {
-                SymbolKind::LazyDefined
+                SymbolPriority::LazyDefined
             }
         } else if self.is_weak() {
             if live {
-                SymbolKind::Weak
+                SymbolPriority::Weak
             } else {
-                SymbolKind::LazyWeak
+                SymbolPriority::LazyWeak
             }
         } else if self.is_common() {
             if live {
-                SymbolKind::Common
+                SymbolPriority::Common
             } else {
-                SymbolKind::LazyCommon
+                SymbolPriority::LazyCommon
             }
         } else {
-            SymbolKind::Unknown
+            SymbolPriority::Unknown
         }
     }
 
@@ -928,21 +921,29 @@ impl<'a> ObjectSymbol<'a> {
         {
             self.section_number
                 .index()
-                .and_then(|index| obj.input_section(index))
+                .and_then(|index| obj.section(index))
                 .map(|section| section.length as usize + 1usize)
                 .unwrap_or(0)
         } else {
             0
         }
     }
+
+    pub fn demangle(
+        &self,
+        ctx: &LinkContext,
+        architecture: ImageFileMachine,
+    ) -> SymbolDemangler<'a> {
+        crate::symbols::demangle(ctx, self.name, architecture)
+    }
 }
 
-/// Symbol kinds.
+/// Symbol priorities.
 ///
 /// These are ordered and can be compared to see if one kind has a higher resolution
 /// strength over the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SymbolKind {
+pub enum SymbolPriority {
     Unknown,
     LazyCommon,
     Common,
