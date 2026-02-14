@@ -18,6 +18,7 @@ mod coff;
 mod concurrent_indexmap;
 mod context;
 mod error;
+mod gc_sections;
 mod inputs;
 mod linker;
 mod logging;
@@ -110,13 +111,18 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
         bail!("unable to detect target architecture from input files");
     }
 
-    // Add entrypoint, require defined and undefined GC roots
+    // Add command line symbols as GC roots
     for symbol in [&args.options.entry]
         .into_iter()
         .chain(args.options.require_defined.iter())
         .chain(args.options.undefined.iter())
     {
-        linker.add_root_symbol(&mut ctx, symbol.as_bytes());
+        linker.add_gc_root(&mut ctx, symbol.as_bytes());
+    }
+
+    // Add require defined symbols
+    for symbol in args.options.require_defined.iter() {
+        linker.add_required_symbol(&mut ctx, symbol.as_bytes());
     }
 
     // Add traced symbols
@@ -130,9 +136,13 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
         linker.objs.len() - 1
     );
 
-    // TODO: Lots of other passes
+    if ctx.options.gc_sections {
+        linker.do_gc(&ctx);
+    }
+
+    linker.report_duplicate_symbols(&ctx);
     linker.create_output_sections(&mut ctx);
-    linker.rebase_sections();
+    linker.claim_undefined_symbols(&ctx);
 
     let mut stats = std::mem::take(&mut ctx.stats);
     drop(linker);
