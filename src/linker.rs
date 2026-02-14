@@ -18,7 +18,7 @@ use crate::{
         OutputSection, OutputSectionId, OutputSectionInputsMap, SectionKey,
         create_reserved_sections,
     },
-    symbols::{GlobalSymbol, MapEntry},
+    symbols::{GlobalSymbol, MapEntry, SymbolId},
     timing::ScopedTimer,
 };
 
@@ -31,6 +31,8 @@ pub struct Linker<'a> {
 
     /// Output sections
     pub sections: Vec<ArenaRef<'a, OutputSection<'a>>>,
+
+    required_symbol: Vec<SymbolId>,
 
     /// String arena
     strings: ArenaHandle<'a, u8>,
@@ -65,6 +67,7 @@ impl<'a> Linker<'a> {
             architecture: reader.architecture,
             objs: input_objs.into_vec(),
             sections: Vec::new(),
+            required_symbol: Vec::new(),
             strings,
         })
     }
@@ -77,9 +80,9 @@ impl<'a> Linker<'a> {
         self.strings.alloc_bytes([b"_", name].concat().as_slice())
     }
 
-    pub fn add_root_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
+    pub fn add_gc_root(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
         let name = self.mangle(name);
-        if let MapEntry::Vacant(entry) = ctx.symbol_map.get_map_entry(self.mangle(name)) {
+        if let MapEntry::Vacant(entry) = ctx.symbol_map.get_map_entry(name) {
             let symbol = entry.insert_default();
             let obj = &mut self.objs[0];
             let index = SymbolIndex(obj.symbols.len());
@@ -88,11 +91,22 @@ impl<'a> Linker<'a> {
                 index,
                 storage_class: StorageClass::External,
                 external_id: Some(symbol.id()),
+                // Make this symbol undefined so that it does not get claimed
+                // by the internal object during symbol resolution
                 value: 0,
                 section_number: SectionNumber::Undefined,
                 typ: 0,
                 selection: None,
             }));
+        }
+    }
+
+    pub fn add_required_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
+        let name = self.mangle(name);
+        let symbol = ctx.symbol_map.get_map_entry(name);
+        let id = symbol.id();
+        if !self.required_symbol.contains(&id) {
+            self.required_symbol.push(id);
         }
     }
 
@@ -117,11 +131,11 @@ impl<'a> Linker<'a> {
         // input processing and through which object files define needed symbols
         // in command line options (--entry, --require-defined, --undefined).
         let live_symbols = std::mem::take(&mut self.objs[0].symbols);
-        for root_symbol in live_symbols.iter().flatten() {
-            if let Some(external_id) = root_symbol.external_id {
-                let symbol = ctx.symbol_map.get_exclusive_symbol(external_id).unwrap();
-                if let Some(owner) = symbol.owner {
-                    *self.objs[owner.index()].live.get_mut() = true;
+        for symbol in live_symbols.iter().flatten() {
+            if let Some(external_id) = symbol.external_id {
+                let global = ctx.symbol_map.get_exclusive_symbol(external_id).unwrap();
+                if !global.owner.is_internal() {
+                    *self.objs[global.owner.index()].live.get_mut() = true;
                 }
             }
         }
@@ -164,10 +178,8 @@ impl<'a> Linker<'a> {
 
         self.objs.par_iter_mut().for_each(|obj| {
             let ctx = &*ctx;
-            if obj.live.load(Ordering::Relaxed)
-                && let Err(e) = obj.discard_unused_comdats(ctx)
-            {
-                log::error!(logger: ctx, "{}: {e}", obj.source());
+            if obj.live.load(Ordering::Relaxed) {
+                obj.discard_unclaimed_comdats(ctx);
             }
         });
 
@@ -206,11 +218,67 @@ impl<'a> Linker<'a> {
         *ctx.stats.globals.get_mut() = ctx.symbol_map.len();
     }
 
+    pub fn report_duplicate_symbols(&mut self, ctx: &LinkContext<'a>) {
+        let duplicate_errors = self
+            .objs
+            .par_iter()
+            .filter_map(|obj| {
+                if !obj.live.load(Ordering::Relaxed) {
+                    return None;
+                }
+
+                let mut errors: Vec<String> = Vec::new();
+                for symbol in obj.symbols.iter().flatten() {
+                    if !symbol.is_global() || symbol.is_weak() || symbol.is_common() {
+                        continue;
+                    }
+
+                    if let Some(section) = symbol
+                        .section_number
+                        .index()
+                        .map(|index| obj.section(index).unwrap())
+                        && section.discarded.load(Ordering::Relaxed)
+                    {
+                        continue;
+                    }
+
+                    let external_ref = ctx.symbol_map.get(symbol.external_id.unwrap()).unwrap();
+                    let global = external_ref.read().unwrap();
+                    if global.owner != obj.id && !global.owner.is_internal() {
+                        let owner = &self.objs[global.owner.index()];
+                        errors.push(format!(
+                            "duplicate symbol: {name}\n\
+                                    defined at {owner}\n\
+                                    defined at {this}",
+                            name = symbol.demangle(ctx, obj.machine),
+                            owner = owner.source(),
+                            this = obj.source(),
+                        ));
+                    }
+                }
+
+                if !errors.is_empty() {
+                    Some(errors)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for error in duplicate_errors.iter().flatten() {
+            log::error!("{error}");
+        }
+
+        if !duplicate_errors.is_empty() {
+            std::process::exit(1);
+        }
+    }
+
     pub fn create_output_sections(&mut self, ctx: &mut LinkContext<'a>) {
         let _timer = ScopedTimer::msg("output section allocation");
         // Add reserved sections
         self.sections = create_reserved_sections(&ctx.section_pool.get());
-        let reserved_len = self.sections.len();
+        let reserved_sections_len = self.sections.len();
 
         // Partition object file input sections.
         //
@@ -228,11 +296,6 @@ impl<'a> Linker<'a> {
                     .iter_mut()
                     .flatten()
                     .filter_map(|section| {
-                        // Discard empty sections
-                        if section.length == 0 {
-                            *section.discarded.get_mut() = true;
-                        }
-
                         if *section.discarded.get_mut() {
                             None
                         } else {
@@ -240,10 +303,14 @@ impl<'a> Linker<'a> {
                         }
                     })
                     .fold(
-                        (OutputSectionInputsMap::new(reserved_len), IndexMap::new()),
+                        (
+                            OutputSectionInputsMap::new(reserved_sections_len),
+                            IndexMap::new(),
+                        ),
                         |(mut known, mut needed), section| {
                             let key = SectionKey::new(ctx, section);
                             if let Some(id) = key.known_id() {
+                                section.output = id;
                                 let entry = known.get_or_default(id);
                                 entry.push((objid, section.index));
                             } else {
@@ -256,102 +323,56 @@ impl<'a> Linker<'a> {
             })
             .unzip_into_vecs(&mut known_outputs, &mut needed_outputs);
 
-        // Spin off two jobs. The first join will go through the lists of known
-        // output sections for each object file. The second will allocate the
-        // new output sections for the lists of needed sections.
-
-        let (mut join_mats, mut new_outputs) = rayon::join(
+        let ((mut new_outputs, join_mats), _) = rayon::join(
             || {
-                // Join known outputs
-                self.sections
-                    .par_iter_mut()
-                    .enumerate()
-                    .map(|(index, section)| (OutputSectionId::new(index), section))
-                    .for_each(|(id, section)| {
-                        section.inputs.par_extend(
-                            known_outputs
-                                .par_iter()
-                                .filter_map(|input_map| input_map.get(id))
-                                .flat_map_iter(|inputs| inputs.iter().copied()),
-                        );
-                    });
-
-                // Remove empty sections except for .text, .data, .bss.
-                // Do this sequentially since there are not that many pre-allocated
-                // output sections. This also gives time for rayon to schedule execution
-                // of the second closure if it has not already done so
-                self.sections.retain(|section| {
-                    section.name == b".text"
-                        || section.name == b".data"
-                        || section.name == b".bss"
-                        || !section.inputs.is_empty()
-                });
-
-                // Fix output section metadata
-                self.sections.par_iter_mut().for_each(|section| {
-                    section.sort_inputs(ctx, &self.objs);
-                    section.compute_length(&self.objs);
-                    section.compute_alignment(&self.objs);
-                });
-
-                // Create matricies used for joining the output sections to the
-                // associated input sections in each object file
-                self.sections
-                    .par_iter()
-                    .map(|section| section.create_join_matrix())
-                    .collect::<Vec<_>>()
-            },
-            || {
-                // Allocate new output sections for the needed inputs.
-                // This is done sequentially since in typical scenarios, the number
-                // of new output sections should be relatively small unless
-                // `--no-merge-groups` was specified and large object files were
-                // compiled with `-ffunction-sections -fdata-sections`
                 let arena = ctx.section_pool.get();
                 let mut section_map = HashMap::new();
                 let mut sections = Vec::new();
                 for (key, mut input_sections) in needed_outputs.into_iter().flatten() {
                     let name = key.name();
                     let flags = key.flags();
-                    let output_id = section_map.entry(key).or_insert_with(|| {
-                        let id = OutputSectionId::new(sections.len());
-                        sections.push(arena.alloc_ref(OutputSection::new(name, flags)));
-                        id
+                    let index = *section_map.entry(key).or_insert_with(|| {
+                        let index = sections.len();
+                        let id = OutputSectionId::new(reserved_sections_len + index);
+                        sections.push(arena.alloc_ref(OutputSection::new(id, name, flags)));
+                        index
                     });
-                    sections[output_id.index()]
-                        .inputs
-                        .append(&mut input_sections);
+                    sections[index].inputs.append(&mut input_sections);
                 }
 
-                // Fix metadata for new output sections
-                sections.par_iter_mut().for_each(|section| {
-                    section.sort_inputs(ctx, &self.objs);
-                    section.compute_length(&self.objs);
-                    section.compute_alignment(&self.objs);
-                });
+                // Create matricies used for joining the input sections to the new
+                // output sections
+                let join_mats = sections
+                    .par_iter()
+                    .map(|section| section.create_join_matrix())
+                    .collect::<Vec<_>>();
 
-                sections
+                (sections, join_mats)
+            },
+            || {
+                // Join known outputs
+                self.sections.par_iter_mut().for_each(|section| {
+                    let output_id = section.id;
+                    section.inputs.par_extend(
+                        known_outputs
+                            .par_iter()
+                            .filter_map(|input_map| input_map.get(output_id))
+                            .flat_map_iter(|inputs| inputs.iter().copied()),
+                    );
+                });
             },
         );
 
-        join_mats.reserve_exact(new_outputs.len());
-        join_mats.par_extend(
-            new_outputs
-                .par_iter()
-                .map(|section| section.create_join_matrix()),
-        );
         self.sections.append(&mut new_outputs);
 
-        // Join output sections to the associated inputs
+        // Join newly created outputs with the input sections
         self.objs.par_iter_mut().for_each(|obj| {
             let outputs = join_mats
                 .par_iter()
-                .enumerate()
-                .map(|(index, mat)| (OutputSectionId::new(index), mat))
                 .by_uniform_blocks(1_000_000)
-                .fold(Vec::new, |mut list, (id, mat)| {
+                .fold(Vec::new, |mut list, mat| {
                     if let Some(indicies) = mat.get(obj.id) {
-                        list.extend(indicies.iter().map(|index| (id, *index)));
+                        list.extend(indicies.iter().map(|index| (mat.output_id, *index)));
                     }
                     list
                 })
@@ -361,13 +382,38 @@ impl<'a> Linker<'a> {
                 });
 
             for (output_id, index) in outputs {
-                let section = obj.input_section_mut(index).unwrap();
+                let section = obj.section_mut(index).unwrap();
                 section.output = output_id;
             }
         });
     }
 
-    pub fn rebase_sections(&mut self) {
-        let _timer = ScopedTimer::msg("rebase sections");
+    pub fn claim_undefined_symbols(&mut self, ctx: &LinkContext<'a>) {
+        self.objs
+            .par_iter_mut()
+            .filter(|obj| obj.has_import_data)
+            .for_each(|obj: &mut ArenaRef<'a, ObjectFile<'a>>| {
+                let obj = obj.as_mut();
+                for symbol in obj.symbols.iter().flatten() {
+                    let Some(external_id) = symbol.external_id else {
+                        continue;
+                    };
+
+                    let Some(section_index) = symbol.section_number.index() else {
+                        continue;
+                    };
+
+                    let section = obj.sections[section_index.0].as_mut().unwrap();
+                    if !(section.name == b".text" || section.name == b".text$4") {
+                        continue;
+                    }
+
+                    let external_ref = ctx.symbol_map.get(external_id).unwrap();
+                    let mut global = external_ref.write().unwrap();
+                    if global.owner == obj.id {
+                        global.imported = true;
+                    }
+                }
+            });
     }
 }
