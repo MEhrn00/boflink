@@ -264,10 +264,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
             "InputsReader::create_internal_file() must be called before inputs are added"
         );
 
-        let obj = ArenaRef::new_in(
-            ObjectFile::new(ObjectFileId::new(0), InputFile::internal(), false),
-            &self.store.objs,
-        );
+        let obj = ArenaRef::new_in(ObjectFile::internal_obj(), &self.store.objs);
         self.input_objs.alloc(obj);
     }
 
@@ -388,15 +385,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
                 });
             }
             FileKind::Import => {
-                let machine = ObjectFile::identify_importfile_machine(file.data)?;
-                self.validate_architecture(&file, machine)?;
-                let obj = self.make_new_object_file(ctx, input_ctx, file);
-                let obj = self.input_objs.alloc(obj);
-                scope.spawn(move |_| {
-                    if let Err(e) = obj.parse_importfile(ctx) {
-                        log::error!(logger: ctx, "cannot parse {}: {e}", obj.source());
-                    }
-                });
+                todo!("import files");
             }
             FileKind::Archive => {
                 if file.parent.is_some() {
@@ -407,7 +396,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
                 self.parse_archive_file(ctx, scope, input_ctx, file)?;
             }
             FileKind::ModuleDef => {
-                unimplemented!("parse module def");
+                todo!("module definition files");
             }
         }
 

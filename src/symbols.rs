@@ -43,8 +43,10 @@ pub struct GlobalSymbol<'a> {
     pub value: u32,
     pub section_number: SectionNumber,
     pub index: SymbolIndex,
+    pub weak: bool,
+    pub owner: ObjectFileId,
     pub imported: bool,
-    pub owner: Option<ObjectFileId>,
+    pub needs_thunk: bool,
     pub traced: bool,
 }
 
@@ -54,9 +56,11 @@ impl<'a> std::default::Default for GlobalSymbol<'a> {
             name: &[],
             value: 0,
             section_number: SectionNumber::Undefined,
-            owner: None,
             index: object::SymbolIndex(0),
+            owner: ObjectFileId::new(0),
+            weak: false,
             imported: false,
+            needs_thunk: false,
             traced: false,
         }
     }
@@ -68,12 +72,22 @@ impl<'a> GlobalSymbol<'a> {
         self.section_number == SectionNumber::Undefined && self.value != 0
     }
 
+    /// Returns `true` if this symbol is undefined
+    pub fn is_undefined(&self) -> bool {
+        self.section_number == SectionNumber::Undefined && self.value == 0 && !self.weak
+    }
+
+    /// Returns `true` if this symbol is defined
+    pub fn is_defined(&self) -> bool {
+        self.section_number > SectionNumber::Undefined
+    }
+
     pub fn demangle(
         &self,
-        ctx: &LinkContext<'a>,
+        ctx: &LinkContext,
         architecture: ImageFileMachine,
     ) -> SymbolDemangler<'a> {
-        demangle_symbol(ctx, self, architecture)
+        demangle(ctx, self.name, architecture)
     }
 }
 
@@ -191,13 +205,13 @@ impl<'b, 'a> VacantMapEntry<'b, 'a> {
     }
 }
 
-pub fn demangle_symbol<'a>(
-    ctx: &LinkContext<'a>,
-    symbol: &GlobalSymbol<'a>,
+pub fn demangle<'a>(
+    ctx: &LinkContext,
+    name: &'a [u8],
     architecture: ImageFileMachine,
 ) -> SymbolDemangler<'a> {
     SymbolDemangler {
-        name: symbol.name,
+        name,
         i386: architecture == ImageFileMachine::I386,
         demangle: ctx.options.demangle,
     }

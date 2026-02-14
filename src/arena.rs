@@ -193,6 +193,30 @@ impl<'a, T> ArenaRef<'a, T> {
     }
 }
 
+impl<'a, T: ?Sized> AsMut<T> for ArenaRef<'a, T> {
+    fn as_mut(&mut self) -> &mut T {
+        &mut *self
+    }
+}
+
+impl<'a, T: ?Sized> AsRef<T> for ArenaRef<'a, T> {
+    fn as_ref(&self) -> &T {
+        self
+    }
+}
+
+impl<'a, T: ?Sized> std::borrow::Borrow<T> for ArenaRef<'a, T> {
+    fn borrow(&self) -> &T {
+        self
+    }
+}
+
+impl<'a, T: ?Sized> std::borrow::BorrowMut<T> for ArenaRef<'a, T> {
+    fn borrow_mut(&mut self) -> &mut T {
+        &mut *self
+    }
+}
+
 impl<'a, T: ?Sized> std::ops::Deref for ArenaRef<'a, T> {
     type Target = T;
 
