@@ -346,6 +346,12 @@ impl From<i32> for SectionNumber {
     }
 }
 
+impl From<object::SectionIndex> for SectionNumber {
+    fn from(value: object::SectionIndex) -> Self {
+        Self(value.0 as u32)
+    }
+}
+
 impl SectionNumber {
     pub const fn as_u32(&self) -> u32 {
         self.0

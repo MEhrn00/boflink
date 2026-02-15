@@ -28,6 +28,7 @@ use crate::{
     ErrorContext,
     arena::ArenaRef,
     bail,
+    bit_set::FixedDenseBitSet,
     coff::{
         CoffFlags, ComdatSelection, Feat00Flags, ImageFileMachine, SectionFlags, SectionNumber,
         StorageClass,
@@ -90,14 +91,14 @@ pub struct ObjectFile<'a> {
     /// simplifies things here too. Symbols used 1-based indicies for the section
     /// number of the definition and auxiliary section symbols use 1-based indicies
     /// for associative sections.
-    pub sections: Vec<Option<ObjectSection<'a>>>,
+    pub sections: Vec<Option<InputSection<'a>>>,
 
     /// The initialized input symbols that may contribute to the output file.
     ///
     /// Like with the sections, the symbols in this vec retain the same indicies
     /// as the original object file. This allows relocations to index into this
     /// vec without needing to keep an intermediate lookup table
-    pub symbols: Vec<Option<ObjectSymbol<'a>>>,
+    pub symbols: Vec<Option<InputSymbol<'a>>>,
 
     /// Indicies of COMDAT leader symbols used for handling COMDAT deduplication.
     ///
@@ -375,18 +376,17 @@ impl<'a> ObjectFile<'a> {
                 comdats += 1;
             }
 
-            self.sections[coff_section.index().0] = Some(ObjectSection {
+            self.sections[coff_section.index().0] = Some(InputSection {
                 name,
                 data,
                 length,
-                virtual_address: 0,
                 checksum: 0,
                 characteristics,
                 coff_relocs: relocs.into(),
                 associative_edges: Vec::new(),
                 index: coff_section.index(),
                 discarded: AtomicBool::new(false),
-                visited: AtomicBool::new(false),
+                gc_visited: AtomicBool::new(false),
                 output: OutputSectionId::Null,
             });
         }
@@ -424,21 +424,19 @@ impl<'a> ObjectFile<'a> {
         for coff_symbol in coff.symbols() {
             let image_symbol = coff_symbol.coff_symbol();
 
-            // Helper closures for getting values from the COFF symbol. These
-            // are closures so that these values are lazily acquired. Some symbol
-            // types, such as IMAGE_SYM_DEBUG, do not require reading the symbol
-            // name so do not attempt to read it unless necessary.
+            // These are closures so that they are lazily evaluated. Local symbol
+            // creation depends on a variety of factors. Deferring these makes it
+            // so that they do not perform any work unless needed
+
             let symbol_name = || {
                 coff_symbol
                     .name_bytes()
                     .with_context(|| format!("reading name for symbol {}", coff_symbol.index()))
             };
 
-            // Makes a local copy of the symbol and adds it to the local symbol
-            // table
             let make_symbol =
-                |name: &'a [u8], index: SymbolIndex| -> crate::Result<ObjectSymbol<'a>> {
-                    Ok(ObjectSymbol {
+                |name: &'a [u8], index: SymbolIndex| -> crate::Result<InputSymbol<'a>> {
+                    Ok(InputSymbol {
                         name,
                         index,
                         value: image_symbol.value(),
@@ -699,24 +697,17 @@ impl<'a> ObjectFile<'a> {
     pub fn discard_unclaimed_comdats(&mut self, ctx: &LinkContext<'a>) {
         assert!(*self.live.get_mut());
 
-        // Flag for marking visited COMDATs. Gets set as the virtual address which
-        // will be overwritten during rebasing
-        let visited = 1;
-
         // Visit sections which have not been visited before. If a section has
         // been visited, check its discard status that was set by the last COMDAT leader
         // - If the visited COMDAT is discarded but this leader is kept, continue visiting followers and mark them live
         // - If the visited COMDAT was kept and this leader is kept, stop traversing the follower chain
         // - If the visited COMDAT was kept but this leader was discarded, be conservative and stop
         // traversing the chain to keep the followers live for the other leader
-        let should_visit = |section: &mut ObjectSection, discard: bool| -> bool {
-            section.virtual_address != visited || (*section.discarded.get_mut() && !discard)
+        let should_visit = |section: &mut InputSection, discard: bool| -> bool {
+            *section.discarded.get_mut() && !discard
         };
 
-        let mark = |section: &mut ObjectSection| {
-            section.virtual_address = visited;
-        };
-
+        let mut visited = FixedDenseBitSet::new_empty(self.sections.len());
         for &symbol_index in self.comdat_leaders.iter() {
             let symbol = self.symbols[symbol_index.0].as_ref().unwrap();
 
@@ -736,8 +727,8 @@ impl<'a> ObjectFile<'a> {
             let mut stack = vec![section_index];
             while let Some(section_index) = stack.pop() {
                 let section = self.sections[section_index.0].as_mut().unwrap();
-                if should_visit(section, discard) {
-                    mark(section);
+                if !visited.contains(section.index.0) || should_visit(section, discard) {
+                    visited.insert(section.index.0);
                     *section.discarded.get_mut() = discard;
                     stack.extend(&section.associative_edges);
                 }
@@ -801,19 +792,19 @@ impl<'a> ObjectFile<'a> {
         }
     }
 
-    pub fn section(&self, index: SectionIndex) -> Option<&ObjectSection<'a>> {
+    pub fn section(&self, index: SectionIndex) -> Option<&InputSection<'a>> {
         self.sections
             .get(index.0)
             .and_then(|section| section.as_ref())
     }
 
-    pub fn section_mut(&mut self, index: SectionIndex) -> Option<&mut ObjectSection<'a>> {
+    pub fn section_mut(&mut self, index: SectionIndex) -> Option<&mut InputSection<'a>> {
         self.sections
             .get_mut(index.0)
             .and_then(|section| section.as_mut())
     }
 
-    pub fn symbol(&self, index: SymbolIndex) -> Option<&ObjectSymbol<'a>> {
+    pub fn symbol(&self, index: SymbolIndex) -> Option<&InputSymbol<'a>> {
         self.symbols.get(index.0).and_then(|symbol| symbol.as_ref())
     }
 
@@ -830,10 +821,9 @@ impl<'a> ObjectFile<'a> {
 }
 
 #[derive(Debug)]
-pub struct ObjectSection<'a> {
+pub struct InputSection<'a> {
     pub name: &'a [u8],
     pub data: &'a [u8],
-    pub virtual_address: u32,
     pub checksum: u32,
     pub length: u32,
     pub characteristics: SectionFlags,
@@ -841,11 +831,29 @@ pub struct ObjectSection<'a> {
     pub coff_relocs: Cow<'a, [object::pe::ImageRelocation]>,
     pub associative_edges: Vec<SectionIndex>,
     pub discarded: AtomicBool,
-    pub visited: AtomicBool,
+    pub gc_visited: AtomicBool,
     pub output: OutputSectionId,
 }
 
-impl<'a> ObjectSection<'a> {
+impl<'a> std::default::Default for InputSection<'a> {
+    fn default() -> Self {
+        Self {
+            name: Default::default(),
+            data: Default::default(),
+            checksum: 0,
+            length: 0,
+            characteristics: SectionFlags::empty(),
+            index: SectionIndex(0),
+            coff_relocs: Default::default(),
+            associative_edges: Vec::new(),
+            discarded: AtomicBool::new(false),
+            gc_visited: AtomicBool::new(false),
+            output: OutputSectionId::new(0),
+        }
+    }
+}
+
+impl<'a> InputSection<'a> {
     /// Returns `true` if this is a COMDAT section
     pub fn is_comdat(&self) -> bool {
         self.characteristics.contains(SectionFlags::LnkComdat)
@@ -853,7 +861,7 @@ impl<'a> ObjectSection<'a> {
 }
 
 #[derive(Debug)]
-pub struct ObjectSymbol<'a> {
+pub struct InputSymbol<'a> {
     pub name: &'a [u8],
     pub value: u32,
     pub section_number: SectionNumber,
@@ -865,7 +873,7 @@ pub struct ObjectSymbol<'a> {
     pub external_id: Option<SymbolId>,
 }
 
-impl<'a> ObjectSymbol<'a> {
+impl<'a> InputSymbol<'a> {
     /// Returns `true` if this is a globally scoped symbol.
     pub fn is_global(&self) -> bool {
         self.storage_class == StorageClass::External

@@ -18,7 +18,7 @@ pub struct FixedSparseMap<K, V, B: SparseKeyBuilder<Key = K>, D: DenseIndex = u8
     /// Sparse array.
     ///
     /// Each element in this array is an index into the dense array.
-    sparse: Vec<D>,
+    sparse: Box<[D]>,
 
     /// Dense array
     dense: Vec<V>,
@@ -30,7 +30,7 @@ impl<K, V, B: SparseKeyBuilder<Key = K>, D: DenseIndex> FixedSparseMap<K, V, B, 
     /// Creates a sparse map with the specified domain.
     pub fn new(domain: usize) -> Self {
         Self {
-            sparse: vec![D::tombstone(); domain],
+            sparse: vec![D::tombstone(); domain].into(),
             dense: Vec::new(),
             _builder: PhantomData,
         }

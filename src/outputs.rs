@@ -54,7 +54,7 @@ use crate::{
     arena::ArenaRef,
     coff::SectionFlags,
     context::LinkContext,
-    object::{ObjectFile, ObjectFileId, ObjectSection},
+    object::{InputSection, ObjectFile, ObjectFileId},
     sparse::{FixedSparseMap, SparseKeyBuilder},
 };
 
@@ -303,7 +303,7 @@ pub struct SectionKey<'a> {
 }
 
 impl<'a> SectionKey<'a> {
-    pub fn new(ctx: &LinkContext, section: &ObjectSection<'a>) -> SectionKey<'a> {
+    pub fn new(ctx: &LinkContext, section: &InputSection<'a>) -> SectionKey<'a> {
         let mut key = SectionKey {
             name: section.name,
             flags: section.characteristics.kind_flags(),
