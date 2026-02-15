@@ -1,10 +1,13 @@
 //! Main link driver.
 //!
 //! This module contains implemenrations for the linker passes.
-use std::{collections::HashMap, sync::atomic::Ordering};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use indexmap::IndexMap;
-use object::SymbolIndex;
+use object::SectionIndex;
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
     IntoParallelRefMutIterator, ParallelExtend, ParallelIterator,
@@ -13,15 +16,15 @@ use rayon::iter::{
 use crate::{
     arena::{ArenaHandle, ArenaRef, TypedArena},
     cli::InputArg,
-    coff::{ImageFileMachine, SectionNumber, StorageClass},
+    coff::{ImageFileMachine, SectionFlags},
     context::LinkContext,
     inputs::{InputsReader, InputsStore},
-    object::{ObjectFile, ObjectFileId, ObjectSymbol},
+    object::{InputSection, ObjectFile, ObjectFileId},
     outputs::{
         OutputSection, OutputSectionId, OutputSectionInputsMap, SectionKey,
         create_reserved_sections,
     },
-    symbols::{GlobalSymbol, MapEntry, SymbolId},
+    symbols::{GlobalSymbol, SymbolId},
     timing::ScopedTimer,
 };
 
@@ -42,6 +45,9 @@ pub struct Linker<'a> {
 
     /// Symbols which require definitions at the end of the link
     required_symbol: Vec<SymbolId>,
+
+    /// GC root symbols
+    pub gc_roots: Vec<SymbolId>,
 
     /// Exclusive arena handle for allocating strings
     strings: ArenaHandle<'a, u8>,
@@ -78,6 +84,7 @@ impl<'a> Linker<'a> {
             objs: input_objs.into_vec(),
             sections: Vec::new(),
             required_symbol: Vec::new(),
+            gc_roots: Vec::new(),
             strings,
         })
     }
@@ -97,23 +104,10 @@ impl<'a> Linker<'a> {
     /// The symbol name should not be mangled before calling this function.
     pub fn add_gc_root(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
         let name = self.mangle(name);
-        if let MapEntry::Vacant(entry) = ctx.symbol_map.get_map_entry(name) {
-            let symbol = entry.insert_default();
-            let obj = &mut self.objs[0];
-            let index = SymbolIndex(obj.symbols.len());
-            self.objs[0].symbols.push(Some(ObjectSymbol {
-                name,
-                index,
-                storage_class: StorageClass::External,
-                external_id: Some(symbol.id()),
-                // Make this symbol undefined so that it does not get claimed
-                // by the internal object during symbol resolution
-                value: 0,
-                section_number: SectionNumber::Undefined,
-                definition: None,
-                typ: 0,
-                selection: None,
-            }));
+        let symbol = ctx.symbol_map.get_map_entry(name);
+        let id = symbol.id();
+        if !self.gc_roots.contains(&id) {
+            self.gc_roots.push(id);
         }
     }
 
@@ -155,17 +149,13 @@ impl<'a> Linker<'a> {
         // Figure out what object files should be included based on command line
         // input processing and through which object files define needed symbols
         // in command line options (--entry, --require-defined, --undefined).
-        let live_symbols = std::mem::take(&mut self.objs[0].symbols);
-        for symbol in live_symbols.iter().flatten() {
-            if let Some(external_id) = symbol.external_id {
-                let global = ctx.symbol_map.get_exclusive_symbol(external_id).unwrap();
-                if !global.owner.is_internal() {
-                    *self.objs[global.owner.index()].live.get_mut() = true;
-                }
+        let live_symbols = self.gc_roots.iter().chain(self.required_symbol.iter());
+        for &symbol in live_symbols {
+            let global = ctx.symbol_map.get_exclusive_symbol(symbol).unwrap();
+            if !global.owner.is_internal() {
+                *self.objs[global.owner.index()].live.get_mut() = true;
             }
         }
-
-        self.objs[0].symbols = live_symbols;
 
         let live_objs = self
             .objs
@@ -208,8 +198,6 @@ impl<'a> Linker<'a> {
             }
         });
 
-        ctx.exclusive_check_errored();
-
         // Redo symbol resolution from a clean slate using only the included object
         // files. This fixes the global symbol map in cases where an early object
         // file was chosen during the first symbol resolution pass but a later
@@ -243,11 +231,147 @@ impl<'a> Linker<'a> {
         *ctx.stats.globals.get_mut() = ctx.symbol_map.len();
     }
 
+    /// Converges common symbols to use the correct definitions.
+    ///
+    /// The rules for this are global definition > common definition > weak definition.
+    /// In rare cases, this precedence can be out of order when common symbols
+    /// are intermixed with weak/common symbols from extracted archive members.
+    ///
+    /// Regular symbol resolution will select the first common symbol seen if
+    /// there are duplicates to handle archive extraction. If duplicate common
+    /// symbols are present after archive extraction, the one with the largest
+    /// definition should be used.
+    ///
+    /// There are many weird rules with common symbols. They hardly make sense
+    /// in C/C++ but for some reason, were added to mimic FORTRAN 77 behavior.
+    /// GCC and Clang have defaulted to `-fno-common` so common symbols should
+    /// not be seen when using those compilers.
+    /// MSVC unfortunately still uses common symbols...
+    pub fn merge_commons(&mut self, ctx: &LinkContext<'a>) {
+        let redo = AtomicBool::new(false);
+
+        self.objs
+            .par_iter_mut()
+            .filter(|obj| obj.has_common_symbols)
+            .for_each(|obj| {
+                let obj = obj.as_mut();
+                for symbol in obj.symbols.iter_mut().flatten() {
+                    if !symbol.is_common() {
+                        continue;
+                    }
+
+                    let external_ref = ctx.symbol_map.get(symbol.external_id.unwrap()).unwrap();
+
+                    let mut global = external_ref.write().unwrap();
+                    if global.owner == obj.id {
+                        continue;
+                    }
+
+                    if global.is_common() {
+                        // Duplicate commons requires redoing this after all
+                        // symbols have been visited so that the largest one
+                        // is selected.
+                        redo.store(true, Ordering::Relaxed);
+                        if symbol.value > global.value {
+                            symbol.claim(obj.id, &mut global);
+                        }
+
+                        continue;
+                    }
+
+                    if global.weak {
+                        // Owner is a weak symbol. Common definition should be
+                        // used for it
+                        symbol.claim(obj.id, &mut global);
+                        continue;
+                    }
+
+                    if global.is_defined() {
+                        // Found strongly defined symbol. Make this an undefined
+                        // symbol to use the global definition
+                        symbol.value = 0;
+                    }
+                }
+            });
+
+        if !redo.into_inner() {
+            return;
+        }
+
+        self.objs
+            .par_iter_mut()
+            .filter(|obj| obj.has_common_symbols)
+            .for_each(|obj| {
+                let obj = obj.as_mut();
+                for symbol in obj.symbols.iter_mut().flatten() {
+                    if !symbol.is_common() {
+                        continue;
+                    }
+
+                    let external_ref = ctx.symbol_map.get(symbol.external_id.unwrap()).unwrap();
+
+                    let global = external_ref.read().unwrap();
+                    if global.owner != obj.id {
+                        if ctx.options.warn_common {
+                            log::warn!(
+                                "{}: duplicate common symbol {}",
+                                obj.file.source(),
+                                String::from_utf8_lossy(symbol.name)
+                            );
+                        }
+                        // Other definition won
+                        symbol.value = 0;
+                    }
+                }
+            });
+    }
+
+    /// Create fragmented .bss sections for common symbols.
+    pub fn define_common_symbols(&mut self, ctx: &LinkContext<'a>) {
+        self.objs
+            .par_iter_mut()
+            .filter(|obj| obj.has_common_symbols)
+            .for_each(|obj| {
+                let obj = obj.as_mut();
+                for symbol in obj.symbols.iter_mut().flatten() {
+                    if !symbol.is_common() {
+                        continue;
+                    }
+
+                    let external_ref = ctx.symbol_map.get(symbol.external_id.unwrap()).unwrap();
+                    {
+                        let global = external_ref.read().unwrap();
+                        if global.owner != obj.id {
+                            continue;
+                        }
+                    }
+
+                    let mut characteristics = SectionFlags::CntUninitializedData
+                        | SectionFlags::MemRead
+                        | SectionFlags::MemWrite;
+
+                    characteristics
+                        .set_alignment(symbol.value.next_power_of_two().max(8192u32) as usize);
+
+                    let index = SectionIndex(obj.sections.len());
+                    obj.sections.push(Some(InputSection {
+                        name: b".bss",
+                        characteristics,
+                        index,
+                        length: symbol.value,
+                        ..Default::default()
+                    }));
+
+                    symbol.value = 0;
+                    symbol.section_number = index.into();
+                    let mut global = external_ref.write().unwrap();
+                    symbol.claim(obj.id, &mut global);
+                }
+            });
+    }
+
     /// Reports any duplicate symbols found in the list of object files
     pub fn report_duplicate_symbols(&mut self, ctx: &LinkContext<'a>) {
-        // Collect instead of immediately reporting them so that the output is
-        // deterministic and the order of duplicate symbols being reported follows
-        // the order of input objects
         let duplicate_errors = self
             .objs
             .par_iter()
@@ -258,7 +382,7 @@ impl<'a> Linker<'a> {
 
                 let mut errors = Vec::new();
                 for symbol in obj.symbols.iter().flatten() {
-                    if !symbol.is_global() || symbol.is_weak() || symbol.is_common() {
+                    if !(symbol.is_global() && symbol.is_defined()) {
                         continue;
                     }
 
@@ -421,34 +545,5 @@ impl<'a> Linker<'a> {
                 section.output = output_id;
             }
         });
-    }
-
-    pub fn claim_undefined_symbols(&mut self, ctx: &LinkContext<'a>) {
-        self.objs
-            .par_iter_mut()
-            .filter(|obj| obj.has_import_data)
-            .for_each(|obj| {
-                let obj = obj.as_mut();
-                for symbol in obj.symbols.iter().flatten() {
-                    let Some(external_id) = symbol.external_id else {
-                        continue;
-                    };
-
-                    let Some(section_index) = symbol.section_number.index() else {
-                        continue;
-                    };
-
-                    let section = obj.sections[section_index.0].as_mut().unwrap();
-                    if !(section.name == b".text" || section.name == b".text$4") {
-                        continue;
-                    }
-
-                    let external_ref = ctx.symbol_map.get(external_id).unwrap();
-                    let mut global = external_ref.write().unwrap();
-                    if global.owner == obj.id {
-                        global.imported = true;
-                    }
-                }
-            });
     }
 }

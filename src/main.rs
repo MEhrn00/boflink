@@ -13,6 +13,7 @@ use crate::{
 };
 
 mod arena;
+mod bit_set;
 mod cli;
 mod coff;
 mod concurrent_indexmap;
@@ -136,13 +137,19 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
         linker.objs.len() - 1
     );
 
-    if ctx.options.gc_sections {
-        linker.do_gc(&ctx);
+    linker.merge_commons(&ctx);
+
+    if ctx.options.define_common {
+        linker.define_common_symbols(&ctx);
     }
 
     linker.report_duplicate_symbols(&ctx);
+
+    if ctx.options.gc_sections {
+        linker.do_gc(&mut ctx);
+    }
+
     linker.create_output_sections(&mut ctx);
-    linker.claim_undefined_symbols(&ctx);
 
     let mut stats = std::mem::take(&mut ctx.stats);
     drop(linker);

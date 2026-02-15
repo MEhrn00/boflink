@@ -75,6 +75,8 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
                              Start with an undefined reference to <symbol>
   --warn-unresolved-symbols  Report unresolved symbols as warnings
     --no-warn-unresolved-symbols
+  --warn-common              Warn on duplicate common symbols
+    --no-warn-common
   --whole-archive            Include all objects from following archives
     --no-whole-archive
   -v, --verbose...           Increase logging verbosity
@@ -427,6 +429,7 @@ pub struct CliOptions {
     pub trace_symbol: Vec<String>,
     pub undefined: Vec<String>,
     pub warn_unresolved_symbols: bool,
+    pub warn_common: bool,
     pub verbose: usize,
     pub help: bool,
     pub help_ignored: bool,
@@ -472,6 +475,7 @@ impl std::default::Default for CliOptions {
             trace_symbol: Vec::new(),
             undefined: Vec::new(),
             warn_unresolved_symbols: true,
+            warn_common: false,
             verbose: 0,
             help: false,
             help_ignored: false,
@@ -621,6 +625,8 @@ impl CliOptions {
                 .extend(v?.to_string_lossy().split(',').map(String::from));
         } else if let Some(v) = long_bool("warn-unresolved-symbols") {
             self.warn_unresolved_symbols = v;
+        } else if let Some(v) = long_bool("warn-common") {
+            self.warn_common = v;
         } else if short_opt('v') {
             self.verbose = self.verbose.saturating_add(1);
         } else if let Some(vs) = arg.strip_prefix("-v")
