@@ -19,7 +19,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.92"
-argfile = "0.2.1"
+argfile = "1.0.0"
 bitflags = "2.9.0"
 bumpalo = "3.17.0"
 cpp_demangle = "0.5.0"
