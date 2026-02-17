@@ -128,7 +128,7 @@ impl<'a> std::default::Default for GlobalSymbol<'a> {
             value: 0,
             section_number: 0,
             typ: 0,
-            storage_class: 0,
+            storage_class: pe::IMAGE_SYM_CLASS_EXTERNAL,
             index: object::SymbolIndex(0),
             owner: ObjectFileId::new(0),
             imported: false,

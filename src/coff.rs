@@ -24,9 +24,7 @@
 //! boilerplate needed here.
 
 use bitflags::bitflags;
-use object::{SectionIndex, SymbolIndex, coff::ImageSymbol as _, pe, read::coff};
-
-pub type ComdatKind = object::ComdatKind;
+use object::{SymbolIndex, coff::ImageSymbol as _, pe, read::coff};
 
 use crate::symbols::Symbol;
 

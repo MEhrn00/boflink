@@ -510,7 +510,7 @@ impl<'a> ObjectFile<'a> {
                     // All other COMDATs get marked as pending for the leader to
                     // handle. The leader symbol will get set to the section
                     // symbol until it is paired with the correct leader
-                    let _ = comdat_sels[section_index.0] = aux_section.selection;
+                    comdat_sels[section_index.0] = aux_section.selection;
                 }
 
                 continue;
@@ -559,7 +559,7 @@ impl<'a> ObjectFile<'a> {
             let should_claim = |global: &GlobalSymbol| {
                 // Always claim symbols if the global one is undefined and owned
                 // by the internal object file
-                if global.owner.is_internal() {
+                if global.owner.is_internal() && global.is_undefined() {
                     return true;
                 }
 
@@ -668,10 +668,6 @@ impl<'a> ObjectFile<'a> {
             let mut global = external_ref.write();
 
             let should_claim = |global: &GlobalSymbol| {
-                if global.owner.is_internal() && global.is_undefined() {
-                    return true;
-                }
-
                 let owner = &objs[global.owner.index()];
                 if !owner.live.load(Ordering::Relaxed) {
                     return true;
@@ -731,63 +727,6 @@ impl<'a> ObjectFile<'a> {
                     *section.discarded.get_mut() = discard;
                     stack.extend(&section.followers);
                 }
-            }
-        }
-    }
-
-    /// Fixes definitions for common symbols
-    ///
-    /// The rules for this are global definition > common definition > weak definition.
-    /// In rare cases, this precedence can be out of order when common symbols
-    /// are intermixed with weak/common symbols from extracted archive members.
-    ///
-    /// Regular symbol resolution will select the first common symbol seen if
-    /// there are duplicates to handle archive extraction. If duplicate common
-    /// symbols are present after archive extraction, the one with the largest
-    /// definition should be used.
-    ///
-    /// There are many weird rules with common symbols. They hardly make sense
-    /// in C/C++ but for some reason, were added to mimic FORTRAN 77 behavior.
-    /// GCC and Clang have defaulted to `-fno-common` so common symbols should
-    /// not be seen when using those compilers.
-    /// MSVC unfortunately still uses common symbols...
-    pub fn fix_commons_resolution(&mut self, ctx: &LinkContext<'a>) {
-        if !self.has_common_symbols {
-            return;
-        }
-
-        for (i, symbol) in self.coff_symbols.iter() {
-            if !symbol.is_common() {
-                continue;
-            }
-
-            let (_, external_ref) = self.external_symbol_ref(ctx, i).unwrap();
-            let mut global = external_ref.write();
-            if global.owner == self.id {
-                continue;
-            }
-
-            if global.is_common() {
-                if symbol.value() > global.value() {
-                    global.owner = self.id;
-                    global.value = symbol.value();
-                    global.section_number = symbol.section_number();
-                    global.typ = symbol.typ();
-                    global.storage_class = symbol.storage_class();
-                    global.index = i;
-                }
-
-                continue;
-            }
-
-            if global.is_weak() {
-                global.owner = self.id;
-                global.value = symbol.value();
-                global.section_number = symbol.section_number();
-                global.typ = symbol.typ();
-                global.storage_class = symbol.storage_class();
-                global.index = i;
-                continue;
             }
         }
     }
@@ -884,8 +823,6 @@ impl<'a> ObjectFile<'a> {
 
         errors
     }
-
-    pub fn claim_undefined_symbols(&mut self, ctx: &LinkContext<'a>) {}
 
     pub fn section(&self, index: SectionIndex) -> Option<&InputSection<'a>> {
         self.sections
@@ -1116,20 +1053,6 @@ pub struct ExternalSymbol {
     /// This is used so that weak symbols do not cause archive extraction if
     /// that is not intended.
     pub hidden: bool,
-}
-
-/// COMDAT group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ComdatGroup {
-    /// Index of the leader symbol.
-    ///
-    /// This will be the index of the section symbol if there is no leader symbol.
-    /// It is technically invalid to have a COMDAT section without a leader but
-    /// MinGW will create them anyway.
-    pub leader: SymbolIndex,
-
-    /// COMDAT selection type
-    pub selection: u8,
 }
 
 fn section_checksum(data: &[u8]) -> u32 {
