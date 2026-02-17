@@ -9,29 +9,41 @@
 use std::{
     hash::{BuildHasher, Hash, RandomState},
     marker::PhantomData,
+    num::NonZeroU32,
     ops::{Deref, DerefMut},
     ptr::NonNull,
-    sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 use crossbeam_utils::CachePadded;
 use indexmap::IndexMap;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator};
 
 /// Index value returned for retrieving items later
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Index {
-    slot: u32,
+    slotnum: NonZeroU32,
     index: u32,
 }
 
 impl Index {
     pub const fn slot(&self) -> usize {
-        self.slot as usize
+        (self.slotnum.get() - 1) as usize
     }
 
     pub const fn index(&self) -> usize {
         self.index as usize
+    }
+
+    fn slot_index_num(slot_index: usize) -> NonZeroU32 {
+        NonZeroU32::new((slot_index + 1) as u32).unwrap()
+    }
+
+    fn new(slot_index: usize, map_index: usize) -> Self {
+        Self {
+            slotnum: Self::slot_index_num(slot_index),
+            index: map_index.try_into().expect("map index value overflowed"),
+        }
     }
 }
 
@@ -65,7 +77,7 @@ impl<K, V> ConcurrentIndexMap<K, V, RandomState> {
     pub fn len(&self) -> usize {
         self.slots
             .iter()
-            .fold(0, |acc, slot| acc + slot.read().unwrap().len())
+            .fold(0, |acc, slot| acc + slot.read().len())
     }
 }
 
@@ -95,7 +107,7 @@ impl<K, V, S: Clone> ConcurrentIndexMap<K, V, S> {
         slot_count: usize,
     ) -> Self {
         assert!(slot_count > 1);
-        assert!(slot_count.is_power_of_two());
+        assert!(slot_count < u32::MAX as usize);
 
         // Distribute initial capacity evenly among slots
         if capacity > 0 {
@@ -122,14 +134,14 @@ impl<K: Send + Sync, V: Send + Sync, S: Send + Sync> ConcurrentIndexMap<K, V, S>
     #[allow(unused)]
     pub fn par_for_each_value(&self, f: impl Fn(&V) + Send + Sync) {
         self.slots.par_iter().for_each(|slot| {
-            let slot = slot.read().unwrap();
+            let slot = slot.read();
             slot.par_values().for_each(&f);
         });
     }
 
     pub fn par_for_each_value_mut(&mut self, f: impl Fn(&mut V) + Send + Sync) {
         self.slots.par_iter_mut().for_each(|slot| {
-            let slot = slot.get_mut().unwrap();
+            let slot = slot.get_mut();
             slot.par_values_mut().for_each(&f);
         });
     }
@@ -160,7 +172,7 @@ where
 
     /// Gets a read reference to the entry at `index`
     pub fn get(&self, index: Index) -> Option<Ref<'_, K, V, S>> {
-        let slot = self.slots[index.slot()].read().unwrap();
+        let slot = self.slots[index.slot()].read();
         let (key, value) = slot.get_index(index.index())?;
         Some(Ref {
             key: NonNull::from(key),
@@ -175,7 +187,7 @@ where
     /// This will acquire a write lock on the slot that the entry is located in
     #[allow(unused)]
     pub fn get_mut(&self, index: Index) -> Option<RefMut<'_, K, V, S>> {
-        let mut slot = self.slots[index.slot()].write().unwrap();
+        let mut slot = self.slots[index.slot()].write();
         let (key, value) = slot.get_index_mut(index.index())?;
         Some(RefMut {
             key: NonNull::from(key),
@@ -193,21 +205,16 @@ where
     pub fn entry(&self, key: K) -> Entry<'_, K, V, S> {
         let slot_idx = self.compute_slot(&key);
         let map = &self.slots[slot_idx];
-        let mut guard = map.write().unwrap();
+        let mut guard = map.write();
+
         match guard.entry(key) {
             indexmap::map::Entry::Vacant(entry) => Entry::Vacant(VacantEntry {
-                index: Index {
-                    slot: slot_idx as u32,
-                    index: entry.index() as u32,
-                },
+                index: Index::new(slot_idx, entry.index()),
                 key: entry.into_key(),
                 map: guard,
             }),
             indexmap::map::Entry::Occupied(entry) => Entry::Occupied(OccupiedEntry {
-                index: Index {
-                    slot: slot_idx as u32,
-                    index: entry.index() as u32,
-                },
+                index: Index::new(slot_idx, entry.index()),
                 map: guard,
             }),
         }
@@ -218,16 +225,16 @@ where
     /// This allows bypassing read/write locks when accessing values.
     pub fn exclusive_entry(&mut self, key: K) -> ExclusiveEntry<'_, K, V> {
         let slot_idx = self.compute_slot(&key);
-        let slot = self.slots[slot_idx].get_mut().unwrap();
+        let slot = self.slots[slot_idx].get_mut();
         match slot.entry(key) {
             indexmap::map::Entry::Occupied(entry) => {
                 ExclusiveEntry::Occupied(ExclusiveOccupiedEntry {
-                    slot: slot_idx as u32,
+                    slotnum: Index::slot_index_num(slot_idx),
                     entry,
                 })
             }
             indexmap::map::Entry::Vacant(entry) => ExclusiveEntry::Vacant(ExclusiveVacantEntry {
-                slot: slot_idx as u32,
+                slotnum: Index::slot_index_num(slot_idx),
                 entry,
             }),
         }
@@ -235,7 +242,7 @@ where
 
     /// Get an exclusive reference to the key-value pair at `index`.
     pub fn get_exclusive(&mut self, index: Index) -> Option<(&K, &mut V)> {
-        let slot = self.slots[index.slot()].get_mut().unwrap();
+        let slot = self.slots[index.slot()].get_mut();
         slot.get_index_mut(index.index())
     }
 
@@ -268,11 +275,10 @@ where
         let mut debug_map = f.debug_map();
 
         for slot in self.slots.iter() {
-            if let Ok(map) = slot.read() {
-                map.iter().for_each(|(k, v)| {
-                    debug_map.entry(k, v);
-                });
-            }
+            let map = slot.read();
+            map.iter().for_each(|(k, v)| {
+                debug_map.entry(k, v);
+            });
         }
 
         debug_map.finish()
@@ -438,14 +444,14 @@ impl<'a, K, V> ExclusiveEntry<'a, K, V> {
 }
 
 pub struct ExclusiveOccupiedEntry<'a, K, V> {
-    slot: u32,
+    slotnum: NonZeroU32,
     entry: indexmap::map::OccupiedEntry<'a, K, V>,
 }
 
 impl<'a, K, V> ExclusiveOccupiedEntry<'a, K, V> {
     pub fn index(&self) -> Index {
         Index {
-            slot: self.slot,
+            slotnum: self.slotnum,
             index: self.entry.index() as u32,
         }
     }
@@ -460,14 +466,14 @@ impl<'a, K, V> ExclusiveOccupiedEntry<'a, K, V> {
 }
 
 pub struct ExclusiveVacantEntry<'a, K, V> {
-    slot: u32,
+    slotnum: NonZeroU32,
     entry: indexmap::map::VacantEntry<'a, K, V>,
 }
 
 impl<'a, K, V> ExclusiveVacantEntry<'a, K, V> {
     pub fn index(&self) -> Index {
         Index {
-            slot: self.slot,
+            slotnum: self.slotnum,
             index: self.entry.index() as u32,
         }
     }
@@ -483,7 +489,7 @@ impl<'a, K, V> ExclusiveVacantEntry<'a, K, V> {
 
     pub fn insert_entry(self, value: V) -> ExclusiveOccupiedEntry<'a, K, V> {
         ExclusiveOccupiedEntry {
-            slot: self.slot,
+            slotnum: self.slotnum,
             entry: self.entry.insert_entry(value),
         }
     }

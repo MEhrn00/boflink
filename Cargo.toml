@@ -27,6 +27,7 @@ indexmap = { version = "2.7.1", features = ["rayon"] }
 log = { version = "0.4.26", features = ["std"] }
 memmap2 = "0.9.9"
 os_str_bytes = "7.1.1"
+parking_lot = "0.12.5"
 rayon = "1.11.0"
 rustc-demangle = "0.1.26"
 typed-arena = "2.0.2"
