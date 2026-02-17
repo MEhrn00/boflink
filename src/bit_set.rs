@@ -1,14 +1,14 @@
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FixedDenseBitSet {
     domain: usize,
-    entries: Vec<u64>,
+    entries: Box<[u64]>,
 }
 
 impl FixedDenseBitSet {
     pub fn new_empty(domain: usize) -> Self {
         Self {
             domain,
-            entries: vec![0u64; domain.div_ceil(u64::BITS as usize)],
+            entries: vec![0u64; domain.div_ceil(u64::BITS as usize)].into(),
         }
     }
 

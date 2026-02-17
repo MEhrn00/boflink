@@ -1,6 +1,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use crate::{arena::ArenaPool, cli::CliOptions, outputs::OutputSection, symbols::SymbolMap};
+use crate::{
+    arena::ArenaPool, cli::CliOptions, outputs::OutputSection, symbols::SymbolMap,
+    timing::DurationExt,
+};
 
 /// Context structure which holds miscellaneous the program context used
 /// throughout the entire program.
@@ -13,6 +16,8 @@ use crate::{arena::ArenaPool, cli::CliOptions, outputs::OutputSection, symbols::
 pub struct LinkContext<'a> {
     /// The raw command line options passed to the program
     pub options: &'a CliOptions,
+
+    /// Map of symbol names to global symbols
     pub symbol_map: SymbolMap<'a>,
 
     /// Flag indicating if the program has encountered an error.
@@ -36,12 +41,15 @@ impl<'a> LinkContext<'a> {
         // fall back to 1 if it is not.
         let active_threads = options.threads.map(|num| num.get()).unwrap_or(1);
 
+        // Use the active number of threads to determine slot count for the symbol map.
+        let map_slots = active_threads.next_power_of_two().clamp(2, 256);
+
         Self {
             options,
             string_pool,
             section_pool,
             errored: AtomicBool::new(false),
-            symbol_map: SymbolMap::with_slot_count(active_threads),
+            symbol_map: SymbolMap::with_slot_count(map_slots),
             stats: Default::default(),
         }
     }
@@ -97,6 +105,23 @@ impl LinkStats {
     /// This method takes `self` as `&mut self` to ensure that only a single
     /// thread is accessing the link stats during printing.
     pub fn write_yaml(&mut self, mut w: impl std::io::Write) -> std::io::Result<()> {
+        let read_files = *self.read.files.get_mut();
+        let read_coffs = *self.read.coffs.get_mut();
+        let read_archives = *self.read.archives.get_mut();
+        let parse_coffs = *self.parse.coffs.get_mut();
+        let parse_input_sections = *self.parse.input_sections.get_mut();
+        let parse_input_symbols = *self.parse.input_symbols.get_mut();
+        let parse_local_symbols = *self.parse.local_symbols.get_mut();
+        let parse_comdats = *self.parse.comdats.get_mut();
+        let parse_time = self.parse.time.display();
+        let globals = *self.globals.get_mut();
+
+        let avg_input_sections = parse_input_sections / parse_coffs as usize;
+        let avg_input_symbols = parse_input_symbols / parse_coffs as usize;
+        let avg_local_symbols = parse_local_symbols / parse_coffs as usize;
+        let avg_comdats = parse_comdats / parse_coffs as usize;
+        let avg_time = (self.parse.time / parse_coffs).display().to_string();
+
         write!(
             w,
             r#"stats:
@@ -110,17 +135,15 @@ impl LinkStats {
     input_symbols: {parse_input_symbols}
     local_symbols: {parse_local_symbols}
     comdats: {parse_comdats}
+    time: {parse_time}
+  avg:
+    input_sections: {avg_input_sections}
+    input_symbols: {avg_input_symbols}
+    local_symbols: {avg_local_symbols}
+    comdats: {avg_comdats}
+    time: {avg_time}
   globals: {globals}
-"#,
-            read_files = *self.read.files.get_mut(),
-            read_coffs = *self.read.coffs.get_mut(),
-            read_archives = *self.read.archives.get_mut(),
-            parse_coffs = *self.parse.coffs.get_mut(),
-            parse_input_sections = *self.parse.input_sections.get_mut(),
-            parse_input_symbols = *self.parse.input_symbols.get_mut(),
-            parse_local_symbols = *self.parse.local_symbols.get_mut(),
-            parse_comdats = *self.parse.comdats.get_mut(),
-            globals = *self.globals.get_mut(),
+"#
         )
     }
 }
@@ -137,6 +160,7 @@ pub struct ParseStats {
     pub coffs: AtomicU32,
     pub input_sections: AtomicUsize,
     pub input_symbols: AtomicUsize,
-    pub local_symbols: AtomicU32,
+    pub local_symbols: AtomicUsize,
     pub comdats: AtomicUsize,
+    pub time: std::time::Duration,
 }

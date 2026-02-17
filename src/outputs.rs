@@ -55,7 +55,7 @@ use crate::{
     coff::SectionFlags,
     context::LinkContext,
     object::{InputSection, ObjectFile, ObjectFileId},
-    sparse::{FixedSparseMap, SparseKeyBuilder},
+    sparse_set::{FixedSparseMap, SparseKeyBuilder},
 };
 
 /// ID for an output section.

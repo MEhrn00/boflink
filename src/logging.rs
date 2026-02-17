@@ -114,7 +114,9 @@ impl log::Log for Logger {
                 .prepend
                 .lock()
                 .expect("logger internal mutex is poisoned");
-            eprintln!("{prepend}{CARGO_PKG_NAME}: {tag} too many errors emitted, exiting");
+            eprintln!(
+                "{prepend}{CARGO_PKG_NAME}: {tag} too many errors emitted, exiting (use --error-limit to increase this threshold)"
+            );
             std::process::exit(1);
         }
     }
