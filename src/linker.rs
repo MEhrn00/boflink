@@ -264,12 +264,36 @@ impl<'a> Linker<'a> {
     /// GCC and Clang have defaulted to `-fno-common` so common symbols should
     /// not be seen when using those compilers.
     /// MSVC unfortunately still uses common symbols...
-    pub fn fix_commons(&mut self, ctx: &LinkContext<'a>) {
-        let _timer = ScopedTimer::msg("fix commons");
+    pub fn fix_commons_resolution(&mut self, ctx: &LinkContext<'a>) {
+        self.objs
+            .par_iter_mut()
+            .filter(|obj| obj.has_common_symbols)
+            .for_each(|obj| {
+                let obj = obj.as_mut();
 
-        self.objs.par_iter_mut().for_each(|obj| {
-            obj.fix_commons_resolution(ctx);
-        });
+                for (i, symbol) in obj.coff_symbols.iter() {
+                    if !symbol.is_common() {
+                        continue;
+                    }
+
+                    let (_, external_ref) = obj.external_symbol_ref(ctx, i).unwrap();
+                    let mut global = external_ref.write();
+                    if global.owner == obj.id {
+                        continue;
+                    }
+
+                    // Two common definitions for the same symbol should use the largest
+                    // one. Common symbols also use the definition for weak symbols.
+                    if global.is_weak() || (global.is_common() && symbol.value() > global.value()) {
+                        global.owner = obj.id;
+                        global.value = symbol.value();
+                        global.section_number = symbol.section_number();
+                        global.typ = symbol.typ();
+                        global.storage_class = symbol.storage_class();
+                        global.index = i;
+                    }
+                }
+            });
     }
 
     /// Creates fragmented .bss sections in object files for common symbol definitions
@@ -468,9 +492,42 @@ impl<'a> Linker<'a> {
         });
     }
 
+    /// Globals initialization will only create undefined symbols but does not
+    /// populate them. Symbol resolution will only handle claiming defined symbols.
+    /// Undefined symbols added to the symbol table are left partially initialized
+    /// and pointing to the internal object file.
+    ///
+    /// This will do a symbol resolution round to set owners for undefined symbols
+    /// and also set symbols resolved to weak symbols to use the weak default.
     pub fn claim_undefined_symbols(&mut self, ctx: &LinkContext<'a>) {
         self.objs.par_iter_mut().for_each(|obj| {
-            obj.claim_undefined_symbols(ctx);
+            let obj = obj.as_mut();
+
+            for (i, symbol) in obj.coff_symbols.iter() {
+                if symbol.is_undefined() {
+                    let (_, external_ref) = obj.external_symbol_ref(ctx, i).unwrap();
+                    let mut global = external_ref.write();
+                    if global.is_undefined()
+                        && (global.owner.is_internal() || obj.id < global.owner)
+                    {
+                        global.owner = obj.id;
+                        global.index = i;
+                    }
+                } else if symbol.is_weak() {
+                    let (external, external_ref) = obj.external_symbol_ref(ctx, i).unwrap();
+                    let mut global = external_ref.write();
+                    if global.owner == obj.id && global.index == i {
+                        // TODO: check recursive weak definitions and handle cycles.
+                        // Should not be a thing but it is technically possible...
+                        let default_symbol = obj.coff_symbol(external.weak_default).unwrap();
+                        global.value = default_symbol.value();
+                        global.section_number = default_symbol.section_number();
+                        global.typ = default_symbol.typ();
+                        global.storage_class = default_symbol.storage_class();
+                        global.index = external.weak_default;
+                    }
+                }
+            }
         });
     }
 }

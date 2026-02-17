@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use object::SectionIndex;
+use object::{SectionIndex, SymbolIndex};
 use rayon::{
     Scope,
     iter::{
@@ -150,18 +150,6 @@ fn visit_section<'scope, 'a: 'scope>(
     // called
     debug_assert!(section.gc_visited.load(Ordering::Relaxed));
 
-    let visit_definition = |obj: ObjectFileId, number: Option<SectionIndex>| {
-        if let Some(section_index) = number {
-            let owner = &objs[obj.index()];
-            let section = owner.sections[section_index.0].as_ref().unwrap();
-            if section_is_live(section) && should_visit(section) {
-                scope.spawn(|scope| {
-                    visit_section(ctx, objs, owner.id, section.index, scope);
-                });
-            }
-        }
-    };
-
     let associative_relocs = section
         .followers
         .iter()
@@ -177,9 +165,45 @@ fn visit_section<'scope, 'a: 'scope>(
         if symbol.is_global() {
             let (_, external_ref) = obj.external_symbol_ref(ctx, reloc.symbol()).unwrap();
             let global = external_ref.read();
-            visit_definition(global.owner, global.section());
+            visit_symbol(ctx, objs, global.owner, global.index, scope);
         } else {
-            visit_definition(obj.id, symbol.section());
+            visit_definition(ctx, objs, obj.id, symbol.section(), scope);
+        }
+    }
+}
+
+fn visit_symbol<'scope, 'a: 'scope>(
+    ctx: &'scope LinkContext<'a>,
+    objs: &'scope [ArenaRef<'a, ObjectFile<'a>>],
+    obj: ObjectFileId,
+    index: SymbolIndex,
+    scope: &Scope<'scope>,
+) {
+    let obj = &objs[obj.index()];
+    let symbol = obj.coff_symbol(index).unwrap();
+    // Visit the default symbol if visiting a weak external
+    if symbol.is_weak() {
+        let weak_aux = obj.coff_symbols.aux_weak_external(index).unwrap();
+        visit_symbol(ctx, objs, obj.id, weak_aux.default_symbol(), scope);
+    } else {
+        visit_definition(ctx, objs, obj.id, symbol.section(), scope);
+    }
+}
+
+fn visit_definition<'scope, 'a: 'scope>(
+    ctx: &'scope LinkContext<'a>,
+    objs: &'scope [ArenaRef<'a, ObjectFile<'a>>],
+    obj: ObjectFileId,
+    number: Option<SectionIndex>,
+    scope: &Scope<'scope>,
+) {
+    if let Some(section_index) = number {
+        let owner = &objs[obj.index()];
+        let section = owner.section(section_index).unwrap();
+        if section_is_live(section) && should_visit(section) {
+            scope.spawn(|scope| {
+                visit_section(ctx, objs, owner.id, section.index, scope);
+            });
         }
     }
 }

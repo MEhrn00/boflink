@@ -140,7 +140,7 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
         linker.objs.len() - 1
     );
 
-    linker.fix_commons(&ctx);
+    linker.fix_commons_resolution(&ctx);
 
     if ctx.options.define_common {
         linker.define_common_symbols(&ctx);
@@ -148,8 +148,6 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
 
     linker.report_duplicate_symbols(&ctx);
 
-    // TODO: Set weak default definitions before doing GC sections so that the
-    // right symbol gets visited
     if ctx.options.gc_sections {
         linker.do_gc(&mut ctx);
     }
