@@ -25,7 +25,7 @@ mod linker;
 mod logging;
 mod object;
 mod outputs;
-mod sparse;
+mod sparse_set;
 mod stdext;
 mod symbols;
 mod timing;
@@ -58,7 +58,7 @@ fn main() -> ExitCode {
     }
 
     if args.options.color_used {
-        log::warn!("'--color' is deprecated and will be removed in the next release");
+        log::warn!("'--color' is deprecated and will be removed in a future release");
     }
 
     if let Err(e) = res {
@@ -75,12 +75,15 @@ fn main() -> ExitCode {
 }
 
 fn try_main(mut args: CliArgs) -> Result<()> {
-    // Get the number of threads and update the configuration to reflect the
-    // number of active threads being used
     let num_threads = args.options.threads.get_or_insert_with(|| {
-        std::thread::available_parallelism()
-            .ok()
-            .unwrap_or(NonZeroUsize::new(1).unwrap_or_else(|| unreachable!()))
+        std::thread::available_parallelism().map_or_else(
+            |_| NonZeroUsize::new(1).unwrap(),
+            |threads| {
+                // Cap the number of threads to 16 if Rust detects more than 16
+                // available parallel units.
+                threads.min(NonZeroUsize::new(16).unwrap())
+            },
+        )
     });
 
     let thread_pool = rayon::ThreadPoolBuilder::new()
@@ -137,7 +140,7 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
         linker.objs.len() - 1
     );
 
-    linker.merge_commons(&ctx);
+    linker.fix_commons(&ctx);
 
     if ctx.options.define_common {
         linker.define_common_symbols(&ctx);
@@ -145,11 +148,14 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
 
     linker.report_duplicate_symbols(&ctx);
 
+    // TODO: Set weak default definitions before doing GC sections so that the
+    // right symbol gets visited
     if ctx.options.gc_sections {
         linker.do_gc(&mut ctx);
     }
 
     linker.create_output_sections(&mut ctx);
+    linker.claim_undefined_symbols(&ctx);
 
     let mut stats = std::mem::take(&mut ctx.stats);
     drop(linker);

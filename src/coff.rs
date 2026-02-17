@@ -24,43 +24,11 @@
 //! boilerplate needed here.
 
 use bitflags::bitflags;
-use object::{
-    SectionIndex,
-    pe::{
-        IMAGE_COMDAT_SELECT_ANY, IMAGE_COMDAT_SELECT_ASSOCIATIVE, IMAGE_COMDAT_SELECT_EXACT_MATCH,
-        IMAGE_COMDAT_SELECT_LARGEST, IMAGE_COMDAT_SELECT_NODUPLICATES,
-        IMAGE_COMDAT_SELECT_SAME_SIZE, IMAGE_FILE_32BIT_MACHINE, IMAGE_FILE_BYTES_REVERSED_HI,
-        IMAGE_FILE_BYTES_REVERSED_LO, IMAGE_FILE_DEBUG_STRIPPED, IMAGE_FILE_DLL,
-        IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE, IMAGE_FILE_LINE_NUMS_STRIPPED,
-        IMAGE_FILE_LOCAL_SYMS_STRIPPED, IMAGE_FILE_MACHINE_ALPHA, IMAGE_FILE_MACHINE_ALPHA64,
-        IMAGE_FILE_MACHINE_AM33, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM,
-        IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_ARM64EC, IMAGE_FILE_MACHINE_ARM64X,
-        IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_EBC, IMAGE_FILE_MACHINE_I386,
-        IMAGE_FILE_MACHINE_IA64, IMAGE_FILE_MACHINE_M32R, IMAGE_FILE_MACHINE_MIPS16,
-        IMAGE_FILE_MACHINE_MIPSFPU, IMAGE_FILE_MACHINE_MIPSFPU16, IMAGE_FILE_MACHINE_POWERPC,
-        IMAGE_FILE_MACHINE_POWERPCFP, IMAGE_FILE_MACHINE_R3000, IMAGE_FILE_MACHINE_R4000,
-        IMAGE_FILE_MACHINE_R10000, IMAGE_FILE_MACHINE_RISCV32, IMAGE_FILE_MACHINE_RISCV64,
-        IMAGE_FILE_MACHINE_RISCV128, IMAGE_FILE_MACHINE_SH3, IMAGE_FILE_MACHINE_SH3DSP,
-        IMAGE_FILE_MACHINE_SH4, IMAGE_FILE_MACHINE_SH5, IMAGE_FILE_MACHINE_THUMB,
-        IMAGE_FILE_MACHINE_UNKNOWN, IMAGE_FILE_MACHINE_WCEMIPSV2, IMAGE_FILE_NET_RUN_FROM_SWAP,
-        IMAGE_FILE_RELOCS_STRIPPED, IMAGE_FILE_REMOVABLE_RUN_FROM_SWAP, IMAGE_FILE_SYSTEM,
-        IMAGE_FILE_UP_SYSTEM_ONLY, IMAGE_SCN_CNT_CODE, IMAGE_SCN_CNT_INITIALIZED_DATA,
-        IMAGE_SCN_CNT_UNINITIALIZED_DATA, IMAGE_SCN_GPREL, IMAGE_SCN_LNK_COMDAT,
-        IMAGE_SCN_LNK_INFO, IMAGE_SCN_LNK_NRELOC_OVFL, IMAGE_SCN_LNK_OTHER, IMAGE_SCN_LNK_REMOVE,
-        IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_NOT_CACHED,
-        IMAGE_SCN_MEM_NOT_PAGED, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_SHARED, IMAGE_SCN_MEM_WRITE,
-        IMAGE_SCN_TYPE_NO_PAD, IMAGE_SYM_CLASS_ARGUMENT, IMAGE_SYM_CLASS_AUTOMATIC,
-        IMAGE_SYM_CLASS_BIT_FIELD, IMAGE_SYM_CLASS_BLOCK, IMAGE_SYM_CLASS_CLR_TOKEN,
-        IMAGE_SYM_CLASS_END_OF_FUNCTION, IMAGE_SYM_CLASS_END_OF_STRUCT, IMAGE_SYM_CLASS_ENUM_TAG,
-        IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_EXTERNAL_DEF, IMAGE_SYM_CLASS_FILE,
-        IMAGE_SYM_CLASS_FUNCTION, IMAGE_SYM_CLASS_LABEL, IMAGE_SYM_CLASS_MEMBER_OF_ENUM,
-        IMAGE_SYM_CLASS_MEMBER_OF_STRUCT, IMAGE_SYM_CLASS_MEMBER_OF_UNION, IMAGE_SYM_CLASS_NULL,
-        IMAGE_SYM_CLASS_REGISTER, IMAGE_SYM_CLASS_REGISTER_PARAM, IMAGE_SYM_CLASS_SECTION,
-        IMAGE_SYM_CLASS_STATIC, IMAGE_SYM_CLASS_STRUCT_TAG, IMAGE_SYM_CLASS_TYPE_DEFINITION,
-        IMAGE_SYM_CLASS_UNDEFINED_LABEL, IMAGE_SYM_CLASS_UNDEFINED_STATIC,
-        IMAGE_SYM_CLASS_UNION_TAG, IMAGE_SYM_CLASS_WEAK_EXTERNAL,
-    },
-};
+use object::{SectionIndex, SymbolIndex, coff::ImageSymbol as _, pe, read::coff};
+
+pub type ComdatKind = object::ComdatKind;
+
+use crate::symbols::Symbol;
 
 #[derive(Debug)]
 pub struct TryFromImageFileMachineError(u16);
@@ -78,37 +46,37 @@ impl std::error::Error for TryFromImageFileMachineError {}
 #[repr(u16)]
 pub enum ImageFileMachine {
     #[default]
-    Unknown = IMAGE_FILE_MACHINE_UNKNOWN,
-    Alpha = IMAGE_FILE_MACHINE_ALPHA,
-    Alpha64 = IMAGE_FILE_MACHINE_ALPHA64,
-    Am33 = IMAGE_FILE_MACHINE_AM33,
-    Amd64 = IMAGE_FILE_MACHINE_AMD64,
-    Arm = IMAGE_FILE_MACHINE_ARM,
-    Arm64 = IMAGE_FILE_MACHINE_ARM64,
-    Arm64Ec = IMAGE_FILE_MACHINE_ARM64EC,
-    Arm64X = IMAGE_FILE_MACHINE_ARM64X,
-    ArmNt = IMAGE_FILE_MACHINE_ARMNT,
-    Ebc = IMAGE_FILE_MACHINE_EBC,
-    I386 = IMAGE_FILE_MACHINE_I386,
-    Ia64 = IMAGE_FILE_MACHINE_IA64,
-    M32R = IMAGE_FILE_MACHINE_M32R,
-    Mips16 = IMAGE_FILE_MACHINE_MIPS16,
-    MipsFpu = IMAGE_FILE_MACHINE_MIPSFPU,
-    MipsFpu16 = IMAGE_FILE_MACHINE_MIPSFPU16,
-    PowerPc = IMAGE_FILE_MACHINE_POWERPC,
-    PowerPcFp = IMAGE_FILE_MACHINE_POWERPCFP,
-    R3000 = IMAGE_FILE_MACHINE_R3000,
-    R4000 = IMAGE_FILE_MACHINE_R4000,
-    R10000 = IMAGE_FILE_MACHINE_R10000,
-    RiscV32 = IMAGE_FILE_MACHINE_RISCV32,
-    RiscV64 = IMAGE_FILE_MACHINE_RISCV64,
-    RiscV128 = IMAGE_FILE_MACHINE_RISCV128,
-    Sh3 = IMAGE_FILE_MACHINE_SH3,
-    Sh3Dsp = IMAGE_FILE_MACHINE_SH3DSP,
-    Sh4 = IMAGE_FILE_MACHINE_SH4,
-    Sh5 = IMAGE_FILE_MACHINE_SH5,
-    Thumb = IMAGE_FILE_MACHINE_THUMB,
-    WceMipsV2 = IMAGE_FILE_MACHINE_WCEMIPSV2,
+    Unknown = pe::IMAGE_FILE_MACHINE_UNKNOWN,
+    Alpha = pe::IMAGE_FILE_MACHINE_ALPHA,
+    Alpha64 = pe::IMAGE_FILE_MACHINE_ALPHA64,
+    Am33 = pe::IMAGE_FILE_MACHINE_AM33,
+    Amd64 = pe::IMAGE_FILE_MACHINE_AMD64,
+    Arm = pe::IMAGE_FILE_MACHINE_ARM,
+    Arm64 = pe::IMAGE_FILE_MACHINE_ARM64,
+    Arm64Ec = pe::IMAGE_FILE_MACHINE_ARM64EC,
+    Arm64X = pe::IMAGE_FILE_MACHINE_ARM64X,
+    ArmNt = pe::IMAGE_FILE_MACHINE_ARMNT,
+    Ebc = pe::IMAGE_FILE_MACHINE_EBC,
+    I386 = pe::IMAGE_FILE_MACHINE_I386,
+    Ia64 = pe::IMAGE_FILE_MACHINE_IA64,
+    M32R = pe::IMAGE_FILE_MACHINE_M32R,
+    Mips16 = pe::IMAGE_FILE_MACHINE_MIPS16,
+    MipsFpu = pe::IMAGE_FILE_MACHINE_MIPSFPU,
+    MipsFpu16 = pe::IMAGE_FILE_MACHINE_MIPSFPU16,
+    PowerPc = pe::IMAGE_FILE_MACHINE_POWERPC,
+    PowerPcFp = pe::IMAGE_FILE_MACHINE_POWERPCFP,
+    R3000 = pe::IMAGE_FILE_MACHINE_R3000,
+    R4000 = pe::IMAGE_FILE_MACHINE_R4000,
+    R10000 = pe::IMAGE_FILE_MACHINE_R10000,
+    RiscV32 = pe::IMAGE_FILE_MACHINE_RISCV32,
+    RiscV64 = pe::IMAGE_FILE_MACHINE_RISCV64,
+    RiscV128 = pe::IMAGE_FILE_MACHINE_RISCV128,
+    Sh3 = pe::IMAGE_FILE_MACHINE_SH3,
+    Sh3Dsp = pe::IMAGE_FILE_MACHINE_SH3DSP,
+    Sh4 = pe::IMAGE_FILE_MACHINE_SH4,
+    Sh5 = pe::IMAGE_FILE_MACHINE_SH5,
+    Thumb = pe::IMAGE_FILE_MACHINE_THUMB,
+    WceMipsV2 = pe::IMAGE_FILE_MACHINE_WCEMIPSV2,
 }
 
 impl std::fmt::Display for ImageFileMachine {
@@ -126,37 +94,37 @@ impl TryFrom<u16> for ImageFileMachine {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         Ok(match value {
-            IMAGE_FILE_MACHINE_UNKNOWN => Self::Unknown,
-            IMAGE_FILE_MACHINE_ALPHA => Self::Alpha,
-            IMAGE_FILE_MACHINE_ALPHA64 => Self::Alpha64,
-            IMAGE_FILE_MACHINE_AM33 => Self::Am33,
-            IMAGE_FILE_MACHINE_AMD64 => Self::Amd64,
-            IMAGE_FILE_MACHINE_ARM => Self::Arm,
-            IMAGE_FILE_MACHINE_ARM64 => Self::Arm64,
-            IMAGE_FILE_MACHINE_ARM64EC => Self::Arm64Ec,
-            IMAGE_FILE_MACHINE_ARM64X => Self::Arm64X,
-            IMAGE_FILE_MACHINE_ARMNT => Self::ArmNt,
-            IMAGE_FILE_MACHINE_EBC => Self::Ebc,
-            IMAGE_FILE_MACHINE_I386 => Self::I386,
-            IMAGE_FILE_MACHINE_IA64 => Self::Ia64,
-            IMAGE_FILE_MACHINE_M32R => Self::M32R,
-            IMAGE_FILE_MACHINE_MIPS16 => Self::Mips16,
-            IMAGE_FILE_MACHINE_MIPSFPU => Self::MipsFpu,
-            IMAGE_FILE_MACHINE_MIPSFPU16 => Self::Mips16,
-            IMAGE_FILE_MACHINE_POWERPC => Self::PowerPc,
-            IMAGE_FILE_MACHINE_POWERPCFP => Self::PowerPcFp,
-            IMAGE_FILE_MACHINE_R3000 => Self::R3000,
-            IMAGE_FILE_MACHINE_R4000 => Self::R4000,
-            IMAGE_FILE_MACHINE_R10000 => Self::R10000,
-            IMAGE_FILE_MACHINE_RISCV32 => Self::RiscV32,
-            IMAGE_FILE_MACHINE_RISCV64 => Self::RiscV64,
-            IMAGE_FILE_MACHINE_RISCV128 => Self::RiscV128,
-            IMAGE_FILE_MACHINE_SH3 => Self::Sh3,
-            IMAGE_FILE_MACHINE_SH3DSP => Self::Sh3Dsp,
-            IMAGE_FILE_MACHINE_SH4 => Self::Sh4,
-            IMAGE_FILE_MACHINE_SH5 => Self::Sh5,
-            IMAGE_FILE_MACHINE_THUMB => Self::Thumb,
-            IMAGE_FILE_MACHINE_WCEMIPSV2 => Self::WceMipsV2,
+            pe::IMAGE_FILE_MACHINE_UNKNOWN => Self::Unknown,
+            pe::IMAGE_FILE_MACHINE_ALPHA => Self::Alpha,
+            pe::IMAGE_FILE_MACHINE_ALPHA64 => Self::Alpha64,
+            pe::IMAGE_FILE_MACHINE_AM33 => Self::Am33,
+            pe::IMAGE_FILE_MACHINE_AMD64 => Self::Amd64,
+            pe::IMAGE_FILE_MACHINE_ARM => Self::Arm,
+            pe::IMAGE_FILE_MACHINE_ARM64 => Self::Arm64,
+            pe::IMAGE_FILE_MACHINE_ARM64EC => Self::Arm64Ec,
+            pe::IMAGE_FILE_MACHINE_ARM64X => Self::Arm64X,
+            pe::IMAGE_FILE_MACHINE_ARMNT => Self::ArmNt,
+            pe::IMAGE_FILE_MACHINE_EBC => Self::Ebc,
+            pe::IMAGE_FILE_MACHINE_I386 => Self::I386,
+            pe::IMAGE_FILE_MACHINE_IA64 => Self::Ia64,
+            pe::IMAGE_FILE_MACHINE_M32R => Self::M32R,
+            pe::IMAGE_FILE_MACHINE_MIPS16 => Self::Mips16,
+            pe::IMAGE_FILE_MACHINE_MIPSFPU => Self::MipsFpu,
+            pe::IMAGE_FILE_MACHINE_MIPSFPU16 => Self::Mips16,
+            pe::IMAGE_FILE_MACHINE_POWERPC => Self::PowerPc,
+            pe::IMAGE_FILE_MACHINE_POWERPCFP => Self::PowerPcFp,
+            pe::IMAGE_FILE_MACHINE_R3000 => Self::R3000,
+            pe::IMAGE_FILE_MACHINE_R4000 => Self::R4000,
+            pe::IMAGE_FILE_MACHINE_R10000 => Self::R10000,
+            pe::IMAGE_FILE_MACHINE_RISCV32 => Self::RiscV32,
+            pe::IMAGE_FILE_MACHINE_RISCV64 => Self::RiscV64,
+            pe::IMAGE_FILE_MACHINE_RISCV128 => Self::RiscV128,
+            pe::IMAGE_FILE_MACHINE_SH3 => Self::Sh3,
+            pe::IMAGE_FILE_MACHINE_SH3DSP => Self::Sh3Dsp,
+            pe::IMAGE_FILE_MACHINE_SH4 => Self::Sh4,
+            pe::IMAGE_FILE_MACHINE_SH5 => Self::Sh5,
+            pe::IMAGE_FILE_MACHINE_THUMB => Self::Thumb,
+            pe::IMAGE_FILE_MACHINE_WCEMIPSV2 => Self::WceMipsV2,
             o => return Err(TryFromImageFileMachineError(o)),
         })
     }
@@ -169,37 +137,37 @@ struct MachineDisplay(u16);
 impl MachineDisplay {
     const fn as_str(&self) -> Option<&'static str> {
         Some(match self.0 {
-            IMAGE_FILE_MACHINE_UNKNOWN => stringify!(IMAGE_FILE_MACHINE_UNKNOWN),
-            IMAGE_FILE_MACHINE_ALPHA => stringify!(IMAGE_FILE_MACHINE_ALPHA),
-            IMAGE_FILE_MACHINE_ALPHA64 => stringify!(IMAGE_FILE_MACHINE_ALPHA64),
-            IMAGE_FILE_MACHINE_AM33 => stringify!(IMAGE_FILE_MACHINE_AM33),
-            IMAGE_FILE_MACHINE_AMD64 => stringify!(IMAGE_FILE_MACHINE_AMD64),
-            IMAGE_FILE_MACHINE_ARM => stringify!(IMAGE_FILE_MACHINE_ARM),
-            IMAGE_FILE_MACHINE_ARM64 => stringify!(IMAGE_FILE_MACHINE_ARM64),
-            IMAGE_FILE_MACHINE_ARM64EC => stringify!(IMAGE_FILE_MACHINE_ARM64EC),
-            IMAGE_FILE_MACHINE_ARM64X => stringify!(IMAGE_FILE_MACHINE_ARM64X),
-            IMAGE_FILE_MACHINE_ARMNT => stringify!(IMAGE_FILE_MACHINE_ARMNT),
-            IMAGE_FILE_MACHINE_EBC => stringify!(IMAGE_FILE_MACHINE_EBC),
-            IMAGE_FILE_MACHINE_I386 => stringify!(IMAGE_FILE_MACHINE_I386),
-            IMAGE_FILE_MACHINE_IA64 => stringify!(IMAGE_FILE_MACHINE_IA64),
-            IMAGE_FILE_MACHINE_M32R => stringify!(IMAGE_FILE_MACHINE_M32R),
-            IMAGE_FILE_MACHINE_MIPS16 => stringify!(IMAGE_FILE_MACHINE_MIPS16),
-            IMAGE_FILE_MACHINE_MIPSFPU => stringify!(IMAGE_FILE_MACHINE_MIPSFPU),
-            IMAGE_FILE_MACHINE_MIPSFPU16 => stringify!(IMAGE_FILE_MACHINE_MIPSFPU16),
-            IMAGE_FILE_MACHINE_POWERPC => stringify!(IMAGE_FILE_MACHINE_POWERPC),
-            IMAGE_FILE_MACHINE_POWERPCFP => stringify!(IMAGE_FILE_MACHINE_POWERPCFP),
-            IMAGE_FILE_MACHINE_R3000 => stringify!(IMAGE_FILE_MACHINE_R3000),
-            IMAGE_FILE_MACHINE_R4000 => stringify!(IMAGE_FILE_MACHINE_R4000),
-            IMAGE_FILE_MACHINE_R10000 => stringify!(IMAGE_FILE_MACHINE_R10000),
-            IMAGE_FILE_MACHINE_RISCV32 => stringify!(IMAGE_FILE_MACHINE_RISCV32),
-            IMAGE_FILE_MACHINE_RISCV64 => stringify!(IMAGE_FILE_MACHINE_RISCV64),
-            IMAGE_FILE_MACHINE_RISCV128 => stringify!(IMAGE_FILE_MACHINE_RISCV128),
-            IMAGE_FILE_MACHINE_SH3 => stringify!(IMAGE_FILE_MACHINE_SH3),
-            IMAGE_FILE_MACHINE_SH3DSP => stringify!(IMAGE_FILE_MACHINE_SH3DSP),
-            IMAGE_FILE_MACHINE_SH4 => stringify!(IMAGE_FILE_MACHINE_SH4),
-            IMAGE_FILE_MACHINE_SH5 => stringify!(IMAGE_FILE_MACHINE_SH5),
-            IMAGE_FILE_MACHINE_THUMB => stringify!(IMAGE_FILE_MACHINE_THUMB),
-            IMAGE_FILE_MACHINE_WCEMIPSV2 => stringify!(IMAGE_FILE_MACHINE_WCEMIPSV2),
+            pe::IMAGE_FILE_MACHINE_UNKNOWN => stringify!(IMAGE_FILE_MACHINE_UNKNOWN),
+            pe::IMAGE_FILE_MACHINE_ALPHA => stringify!(IMAGE_FILE_MACHINE_ALPHA),
+            pe::IMAGE_FILE_MACHINE_ALPHA64 => stringify!(IMAGE_FILE_MACHINE_ALPHA64),
+            pe::IMAGE_FILE_MACHINE_AM33 => stringify!(IMAGE_FILE_MACHINE_AM33),
+            pe::IMAGE_FILE_MACHINE_AMD64 => stringify!(IMAGE_FILE_MACHINE_AMD64),
+            pe::IMAGE_FILE_MACHINE_ARM => stringify!(IMAGE_FILE_MACHINE_ARM),
+            pe::IMAGE_FILE_MACHINE_ARM64 => stringify!(IMAGE_FILE_MACHINE_ARM64),
+            pe::IMAGE_FILE_MACHINE_ARM64EC => stringify!(IMAGE_FILE_MACHINE_ARM64EC),
+            pe::IMAGE_FILE_MACHINE_ARM64X => stringify!(IMAGE_FILE_MACHINE_ARM64X),
+            pe::IMAGE_FILE_MACHINE_ARMNT => stringify!(IMAGE_FILE_MACHINE_ARMNT),
+            pe::IMAGE_FILE_MACHINE_EBC => stringify!(IMAGE_FILE_MACHINE_EBC),
+            pe::IMAGE_FILE_MACHINE_I386 => stringify!(IMAGE_FILE_MACHINE_I386),
+            pe::IMAGE_FILE_MACHINE_IA64 => stringify!(IMAGE_FILE_MACHINE_IA64),
+            pe::IMAGE_FILE_MACHINE_M32R => stringify!(IMAGE_FILE_MACHINE_M32R),
+            pe::IMAGE_FILE_MACHINE_MIPS16 => stringify!(IMAGE_FILE_MACHINE_MIPS16),
+            pe::IMAGE_FILE_MACHINE_MIPSFPU => stringify!(IMAGE_FILE_MACHINE_MIPSFPU),
+            pe::IMAGE_FILE_MACHINE_MIPSFPU16 => stringify!(IMAGE_FILE_MACHINE_MIPSFPU16),
+            pe::IMAGE_FILE_MACHINE_POWERPC => stringify!(IMAGE_FILE_MACHINE_POWERPC),
+            pe::IMAGE_FILE_MACHINE_POWERPCFP => stringify!(IMAGE_FILE_MACHINE_POWERPCFP),
+            pe::IMAGE_FILE_MACHINE_R3000 => stringify!(IMAGE_FILE_MACHINE_R3000),
+            pe::IMAGE_FILE_MACHINE_R4000 => stringify!(IMAGE_FILE_MACHINE_R4000),
+            pe::IMAGE_FILE_MACHINE_R10000 => stringify!(IMAGE_FILE_MACHINE_R10000),
+            pe::IMAGE_FILE_MACHINE_RISCV32 => stringify!(IMAGE_FILE_MACHINE_RISCV32),
+            pe::IMAGE_FILE_MACHINE_RISCV64 => stringify!(IMAGE_FILE_MACHINE_RISCV64),
+            pe::IMAGE_FILE_MACHINE_RISCV128 => stringify!(IMAGE_FILE_MACHINE_RISCV128),
+            pe::IMAGE_FILE_MACHINE_SH3 => stringify!(IMAGE_FILE_MACHINE_SH3),
+            pe::IMAGE_FILE_MACHINE_SH3DSP => stringify!(IMAGE_FILE_MACHINE_SH3DSP),
+            pe::IMAGE_FILE_MACHINE_SH4 => stringify!(IMAGE_FILE_MACHINE_SH4),
+            pe::IMAGE_FILE_MACHINE_SH5 => stringify!(IMAGE_FILE_MACHINE_SH5),
+            pe::IMAGE_FILE_MACHINE_THUMB => stringify!(IMAGE_FILE_MACHINE_THUMB),
+            pe::IMAGE_FILE_MACHINE_WCEMIPSV2 => stringify!(IMAGE_FILE_MACHINE_WCEMIPSV2),
             _ => return None,
         })
     }
@@ -211,20 +179,20 @@ pub struct CoffFlags(u16);
 
 bitflags! {
     impl CoffFlags: u16 {
-        const RelocsStripped = IMAGE_FILE_RELOCS_STRIPPED;
-        const ExecutableImage = IMAGE_FILE_EXECUTABLE_IMAGE;
-        const LineNumsStripped = IMAGE_FILE_LINE_NUMS_STRIPPED;
-        const LocalSymsStripped = IMAGE_FILE_LOCAL_SYMS_STRIPPED;
-        const LargeAddressAware = IMAGE_FILE_LARGE_ADDRESS_AWARE;
-        const BytesReversedLo = IMAGE_FILE_BYTES_REVERSED_LO;
-        const ThirtyTwoBitMachine = IMAGE_FILE_32BIT_MACHINE;
-        const DebugStripped = IMAGE_FILE_DEBUG_STRIPPED;
-        const RemovableRunFromSwap = IMAGE_FILE_REMOVABLE_RUN_FROM_SWAP;
-        const NetRunFromSwap = IMAGE_FILE_NET_RUN_FROM_SWAP;
-        const System = IMAGE_FILE_SYSTEM;
-        const Dll = IMAGE_FILE_DLL;
-        const UpSystemOnly = IMAGE_FILE_UP_SYSTEM_ONLY;
-        const BytesReversedHi = IMAGE_FILE_BYTES_REVERSED_HI;
+        const RelocsStripped = pe::IMAGE_FILE_RELOCS_STRIPPED;
+        const ExecutableImage = pe::IMAGE_FILE_EXECUTABLE_IMAGE;
+        const LineNumsStripped = pe::IMAGE_FILE_LINE_NUMS_STRIPPED;
+        const LocalSymsStripped = pe::IMAGE_FILE_LOCAL_SYMS_STRIPPED;
+        const LargeAddressAware = pe::IMAGE_FILE_LARGE_ADDRESS_AWARE;
+        const BytesReversedLo = pe::IMAGE_FILE_BYTES_REVERSED_LO;
+        const ThirtyTwoBitMachine = pe::IMAGE_FILE_32BIT_MACHINE;
+        const DebugStripped = pe::IMAGE_FILE_DEBUG_STRIPPED;
+        const RemovableRunFromSwap = pe::IMAGE_FILE_REMOVABLE_RUN_FROM_SWAP;
+        const NetRunFromSwap = pe::IMAGE_FILE_NET_RUN_FROM_SWAP;
+        const System = pe::IMAGE_FILE_SYSTEM;
+        const Dll = pe::IMAGE_FILE_DLL;
+        const UpSystemOnly = pe::IMAGE_FILE_UP_SYSTEM_ONLY;
+        const BytesReversedHi = pe::IMAGE_FILE_BYTES_REVERSED_HI;
 
         // Allow externally set flags
         const _ = !0;
@@ -242,24 +210,24 @@ pub struct SectionFlags(u32);
 
 bitflags! {
     impl SectionFlags: u32 {
-        const TypeNoPad = IMAGE_SCN_TYPE_NO_PAD;
-        const CntCode = IMAGE_SCN_CNT_CODE;
-        const CntInitializedData = IMAGE_SCN_CNT_INITIALIZED_DATA;
-        const CntUninitializedData = IMAGE_SCN_CNT_UNINITIALIZED_DATA;
-        const LnkOther = IMAGE_SCN_LNK_OTHER;
-        const LnkInfo = IMAGE_SCN_LNK_INFO;
-        const LnkRemove = IMAGE_SCN_LNK_REMOVE;
-        const LnkComdat = IMAGE_SCN_LNK_COMDAT;
-        const GpRel = IMAGE_SCN_GPREL;
+        const TypeNoPad = pe::IMAGE_SCN_TYPE_NO_PAD;
+        const CntCode = pe::IMAGE_SCN_CNT_CODE;
+        const CntInitializedData = pe::IMAGE_SCN_CNT_INITIALIZED_DATA;
+        const CntUninitializedData = pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA;
+        const LnkOther = pe::IMAGE_SCN_LNK_OTHER;
+        const LnkInfo = pe::IMAGE_SCN_LNK_INFO;
+        const LnkRemove = pe::IMAGE_SCN_LNK_REMOVE;
+        const LnkComdat = pe::IMAGE_SCN_LNK_COMDAT;
+        const GpRel = pe::IMAGE_SCN_GPREL;
         // Alignment is numeric not flags
-        const LnkNRelocOvfl = IMAGE_SCN_LNK_NRELOC_OVFL;
-        const MemDiscardable = IMAGE_SCN_MEM_DISCARDABLE;
-        const MemNotCached = IMAGE_SCN_MEM_NOT_CACHED;
-        const MemNotPaged = IMAGE_SCN_MEM_NOT_PAGED;
-        const MemShared = IMAGE_SCN_MEM_SHARED;
-        const MemExecute = IMAGE_SCN_MEM_EXECUTE;
-        const MemRead = IMAGE_SCN_MEM_READ;
-        const MemWrite = IMAGE_SCN_MEM_WRITE;
+        const LnkNRelocOvfl = pe::IMAGE_SCN_LNK_NRELOC_OVFL;
+        const MemDiscardable = pe::IMAGE_SCN_MEM_DISCARDABLE;
+        const MemNotCached = pe::IMAGE_SCN_MEM_NOT_CACHED;
+        const MemNotPaged = pe::IMAGE_SCN_MEM_NOT_PAGED;
+        const MemShared = pe::IMAGE_SCN_MEM_SHARED;
+        const MemExecute = pe::IMAGE_SCN_MEM_EXECUTE;
+        const MemRead = pe::IMAGE_SCN_MEM_READ;
+        const MemWrite = pe::IMAGE_SCN_MEM_WRITE;
 
         // Allow externally set flags
         const _ = !0;
@@ -324,180 +292,126 @@ impl SectionFlags {
     }
 }
 
-/// A section **number** for a symbol.
-///
-/// The section number is 1-based and stored internally as a `u32`.
-/// The associated [`SectionNumber::index()`] method can be used for getting
-/// the section index value if the section number refers to a section.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Default)]
 #[repr(transparent)]
-pub struct SectionNumber(u32);
+pub struct SymbolTable<'a>(coff::SymbolTable<'a>);
 
-#[allow(non_upper_case_globals)]
-impl SectionNumber {
-    pub const Undefined: Self = Self(0);
-    pub const Absolute: Self = Self(u32::MAX);
-    pub const Debug: Self = Self(u32::MAX - 1);
-}
+impl<'a> SymbolTable<'a> {
+    pub fn parse(header: &pe::ImageFileHeader, data: &'a [u8]) -> object::Result<Self> {
+        match coff::SymbolTable::parse(header, data) {
+            Ok(table) => Ok(Self(table)),
+            Err(e) => Err(e),
+        }
+    }
 
-impl From<i32> for SectionNumber {
-    fn from(value: i32) -> Self {
-        Self(value.cast_unsigned())
+    pub fn strings(&self) -> object::read::StringTable<'a> {
+        self.0.strings()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter<'table>(&'table self) -> impl Iterator<Item = (SymbolIndex, CoffSymbolRef<'a>)> {
+        self.0
+            .iter()
+            .map(|(index, symbol)| (index, CoffSymbolRef(symbol)))
+    }
+
+    pub fn symbol(&self, index: SymbolIndex) -> object::Result<CoffSymbolRef<'a>> {
+        match self.0.symbol(index) {
+            Ok(symbol) => Ok(CoffSymbolRef(symbol)),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn aux_section(&self, index: SymbolIndex) -> object::Result<&'a pe::ImageAuxSymbolSection> {
+        self.0.aux_section(index)
+    }
+
+    pub fn aux_weak_external(
+        &self,
+        index: SymbolIndex,
+    ) -> object::Result<&'a pe::ImageAuxSymbolWeak> {
+        self.0.aux_weak_external(index)
     }
 }
 
-impl From<object::SectionIndex> for SectionNumber {
-    fn from(value: object::SectionIndex) -> Self {
-        Self(value.0 as u32)
-    }
-}
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+pub struct CoffSymbolRef<'a>(&'a pe::ImageSymbol);
 
-impl SectionNumber {
-    pub const fn as_u32(&self) -> u32 {
+impl<'a> CoffSymbolRef<'a> {
+    pub fn new(inner: &'a object::pe::ImageSymbol) -> Self {
+        Self(inner)
+    }
+
+    pub fn image_symbol(&self) -> &'a object::pe::ImageSymbol {
         self.0
     }
 
-    /// Returns the 1-based section index if the section number refers to a section
-    pub const fn index(self) -> Option<SectionIndex> {
-        if 0 < self.0 && self.0 < SectionNumber::Absolute.0 {
-            Some(SectionIndex(self.0 as usize))
-        } else {
-            None
-        }
+    /// Returns the number of auxiliary symbols following this symbol
+    pub fn number_of_aux_symbols(&self) -> u8 {
+        self.0.number_of_aux_symbols
+    }
+
+    /// Gets the name of the symbol using the specified string table.
+    pub fn name_bytes<'data>(
+        &self,
+        strings: object::read::StringTable<'data>,
+    ) -> object::Result<&'data [u8]>
+    where
+        'a: 'data,
+    {
+        self.0.name(strings)
+    }
+
+    pub fn has_aux_file_name(&self) -> bool {
+        self.number_of_aux_symbols() > 0 && self.storage_class() == pe::IMAGE_SYM_CLASS_FILE
+    }
+
+    pub fn has_aux_function(&self) -> bool {
+        self.number_of_aux_symbols() > 0
+            && self.complex_type() == pe::IMAGE_SYM_DTYPE_FUNCTION
+            && (self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
+                || self.storage_class() == pe::IMAGE_SYM_CLASS_STATIC)
+    }
+
+    pub fn has_aux_section(&self) -> bool {
+        self.number_of_aux_symbols() > 0
+            && self.storage_class() == pe::IMAGE_SYM_CLASS_STATIC
+            && self.typ() == 0
+    }
+
+    pub fn has_aux_weak_external(&self) -> bool {
+        self.number_of_aux_symbols() > 0
+            && self.is_weak()
+            && self.section_number() == pe::IMAGE_SYM_UNDEFINED as u16
+            && self.value() == 0
     }
 }
 
-/// Symbol storage class values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum StorageClass {
-    EndOfFunction = IMAGE_SYM_CLASS_END_OF_FUNCTION,
-    Null = IMAGE_SYM_CLASS_NULL,
-    Automatic = IMAGE_SYM_CLASS_AUTOMATIC,
-    External = IMAGE_SYM_CLASS_EXTERNAL,
-    Static = IMAGE_SYM_CLASS_STATIC,
-    Register = IMAGE_SYM_CLASS_REGISTER,
-    ExternalDef = IMAGE_SYM_CLASS_EXTERNAL_DEF,
-    Label = IMAGE_SYM_CLASS_LABEL,
-    UndefinedLabel = IMAGE_SYM_CLASS_UNDEFINED_LABEL,
-    MemberOfStruct = IMAGE_SYM_CLASS_MEMBER_OF_STRUCT,
-    Argument = IMAGE_SYM_CLASS_ARGUMENT,
-    StructTag = IMAGE_SYM_CLASS_STRUCT_TAG,
-    MemberOfUnion = IMAGE_SYM_CLASS_MEMBER_OF_UNION,
-    UnionTag = IMAGE_SYM_CLASS_UNION_TAG,
-    TypeDefinition = IMAGE_SYM_CLASS_TYPE_DEFINITION,
-    UndefinedStatic = IMAGE_SYM_CLASS_UNDEFINED_STATIC,
-    EnumTag = IMAGE_SYM_CLASS_ENUM_TAG,
-    MemberOfEnum = IMAGE_SYM_CLASS_MEMBER_OF_ENUM,
-    RegisterParam = IMAGE_SYM_CLASS_REGISTER_PARAM,
-    BitField = IMAGE_SYM_CLASS_BIT_FIELD,
-    Block = IMAGE_SYM_CLASS_BLOCK,
-    Function = IMAGE_SYM_CLASS_FUNCTION,
-    EndOfStruct = IMAGE_SYM_CLASS_END_OF_STRUCT,
-    File = IMAGE_SYM_CLASS_FILE,
-    Section = IMAGE_SYM_CLASS_SECTION,
-    WeakExternal = IMAGE_SYM_CLASS_WEAK_EXTERNAL,
-    ClrToken = IMAGE_SYM_CLASS_CLR_TOKEN,
-}
+impl Symbol for CoffSymbolRef<'_> {
+    fn value(&self) -> u32 {
+        self.0.value.get(object::LittleEndian)
+    }
 
-impl TryFrom<u8> for StorageClass {
-    type Error = TryFromStorageClassError;
+    fn section_number(&self) -> u16 {
+        self.0.section_number.get(object::LittleEndian)
+    }
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Ok(match value {
-            IMAGE_SYM_CLASS_END_OF_FUNCTION => Self::EndOfFunction,
-            IMAGE_SYM_CLASS_NULL => Self::Null,
-            IMAGE_SYM_CLASS_AUTOMATIC => Self::Automatic,
-            IMAGE_SYM_CLASS_EXTERNAL => Self::External,
-            IMAGE_SYM_CLASS_STATIC => Self::Static,
-            IMAGE_SYM_CLASS_REGISTER => Self::Register,
-            IMAGE_SYM_CLASS_EXTERNAL_DEF => Self::ExternalDef,
-            IMAGE_SYM_CLASS_LABEL => Self::Label,
-            IMAGE_SYM_CLASS_UNDEFINED_LABEL => Self::UndefinedLabel,
-            IMAGE_SYM_CLASS_MEMBER_OF_STRUCT => Self::MemberOfStruct,
-            IMAGE_SYM_CLASS_ARGUMENT => Self::Argument,
-            IMAGE_SYM_CLASS_STRUCT_TAG => Self::StructTag,
-            IMAGE_SYM_CLASS_MEMBER_OF_UNION => Self::MemberOfUnion,
-            IMAGE_SYM_CLASS_UNION_TAG => Self::UnionTag,
-            IMAGE_SYM_CLASS_TYPE_DEFINITION => Self::TypeDefinition,
-            IMAGE_SYM_CLASS_UNDEFINED_STATIC => Self::UndefinedStatic,
-            IMAGE_SYM_CLASS_ENUM_TAG => Self::EnumTag,
-            IMAGE_SYM_CLASS_MEMBER_OF_ENUM => Self::MemberOfEnum,
-            IMAGE_SYM_CLASS_REGISTER_PARAM => Self::RegisterParam,
-            IMAGE_SYM_CLASS_BIT_FIELD => Self::BitField,
-            IMAGE_SYM_CLASS_BLOCK => Self::Block,
-            IMAGE_SYM_CLASS_FUNCTION => Self::Function,
-            IMAGE_SYM_CLASS_END_OF_STRUCT => Self::EndOfStruct,
-            IMAGE_SYM_CLASS_FILE => Self::File,
-            IMAGE_SYM_CLASS_SECTION => Self::Section,
-            IMAGE_SYM_CLASS_WEAK_EXTERNAL => Self::WeakExternal,
-            IMAGE_SYM_CLASS_CLR_TOKEN => Self::ClrToken,
-            o => return Err(TryFromStorageClassError(o)),
-        })
+    fn typ(&self) -> u16 {
+        self.0.typ.get(object::LittleEndian)
+    }
+
+    fn storage_class(&self) -> u8 {
+        self.0.storage_class
     }
 }
-
-#[derive(Debug)]
-pub struct TryFromStorageClassError(u8);
-
-impl std::fmt::Display for TryFromStorageClassError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown 'IMAGE_SYM_CLASS_*' value '{}'", self.0)
-    }
-}
-
-impl std::error::Error for TryFromStorageClassError {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum ComdatSelection {
-    NoDuplicates = IMAGE_COMDAT_SELECT_NODUPLICATES,
-    Any = IMAGE_COMDAT_SELECT_ANY,
-    SameSize = IMAGE_COMDAT_SELECT_SAME_SIZE,
-    ExactMatch = IMAGE_COMDAT_SELECT_EXACT_MATCH,
-    Associative = IMAGE_COMDAT_SELECT_ASSOCIATIVE,
-    Largest = IMAGE_COMDAT_SELECT_LARGEST,
-}
-
-impl From<ComdatSelection> for u8 {
-    fn from(value: ComdatSelection) -> Self {
-        match value {
-            ComdatSelection::NoDuplicates => IMAGE_COMDAT_SELECT_NODUPLICATES,
-            ComdatSelection::Any => IMAGE_COMDAT_SELECT_ANY,
-            ComdatSelection::SameSize => IMAGE_COMDAT_SELECT_SAME_SIZE,
-            ComdatSelection::ExactMatch => IMAGE_COMDAT_SELECT_EXACT_MATCH,
-            ComdatSelection::Associative => IMAGE_COMDAT_SELECT_ASSOCIATIVE,
-            ComdatSelection::Largest => IMAGE_COMDAT_SELECT_LARGEST,
-        }
-    }
-}
-
-impl TryFrom<u8> for ComdatSelection {
-    type Error = TryFromComdatSelectionError;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Ok(match value {
-            IMAGE_COMDAT_SELECT_NODUPLICATES => Self::NoDuplicates,
-            IMAGE_COMDAT_SELECT_ANY => Self::Any,
-            IMAGE_COMDAT_SELECT_SAME_SIZE => Self::SameSize,
-            IMAGE_COMDAT_SELECT_EXACT_MATCH => Self::ExactMatch,
-            IMAGE_COMDAT_SELECT_ASSOCIATIVE => Self::Associative,
-            IMAGE_COMDAT_SELECT_LARGEST => Self::Largest,
-            o => return Err(TryFromComdatSelectionError(o)),
-        })
-    }
-}
-
-#[derive(Debug)]
-pub struct TryFromComdatSelectionError(u8);
-
-impl std::fmt::Display for TryFromComdatSelectionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown 'IMAGE_COMDAT_SELECT_*' value '{}'", self.0)
-    }
-}
-
-impl std::error::Error for TryFromComdatSelectionError {}
 
 /// @feat.00 symbol flags.
 ///

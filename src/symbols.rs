@@ -16,12 +16,13 @@
 //! Using an id value to get a symbol does not require handling collisions and
 //! is essentially the same has doing a constant-time array index.
 
-use std::{hash::Hash, sync::RwLock};
+use std::hash::Hash;
 
-use object::SymbolIndex;
+use object::{SectionIndex, SymbolIndex, pe};
+use parking_lot::RwLock;
 
 use crate::{
-    coff::{ImageFileMachine, SectionNumber},
+    coff::ImageFileMachine,
     concurrent_indexmap::{self, ConcurrentIndexMap, Index, Ref},
     context::LinkContext,
     object::ObjectFileId,
@@ -37,14 +38,84 @@ impl std::fmt::Debug for SymbolId {
     }
 }
 
+pub trait Symbol {
+    fn value(&self) -> u32;
+    fn section_number(&self) -> u16;
+    fn typ(&self) -> u16;
+    fn storage_class(&self) -> u8;
+
+    /// Returns the base type of the symbol
+    fn base_type(&self) -> u16 {
+        self.typ() & pe::N_BTMASK
+    }
+
+    /// Returns the complex type of the symbol
+    fn complex_type(&self) -> u16 {
+        (self.typ() & pe::N_TMASK) >> pe::N_BTSHFT
+    }
+
+    /// Returns the index of the section this symbol is defined in
+    fn section(&self) -> Option<SectionIndex> {
+        let section_number = self.section_number();
+        if section_number > pe::IMAGE_SYM_UNDEFINED as u16
+            && section_number < (pe::IMAGE_SYM_DEBUG as i16).cast_unsigned()
+        {
+            Some(SectionIndex(section_number as usize))
+        } else {
+            None
+        }
+    }
+
+    /// Returns `true` if this is a symbol for debug info
+    fn is_debug(&self) -> bool {
+        self.section_number() == (pe::IMAGE_SYM_DEBUG as i16).cast_unsigned()
+    }
+
+    /// Returns `true` if this is an absolute symbol
+    fn is_absolute(&self) -> bool {
+        self.section_number() == (pe::IMAGE_SYM_ABSOLUTE as i16).cast_unsigned()
+    }
+
+    /// Returns `true` if this is a globally visible symbol
+    fn is_global(&self) -> bool {
+        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
+            || self.storage_class() == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
+    }
+
+    /// Returns `true` if this symbol is locally scoped
+    fn is_local(&self) -> bool {
+        !self.is_global()
+    }
+
+    /// Returns `true` if this symbol is a globally visible undefined external
+    fn is_undefined(&self) -> bool {
+        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
+            && self.section_number() == pe::IMAGE_SYM_UNDEFINED as u16
+            && self.value() == 0
+    }
+
+    /// Returns `true` if this is a common symbol
+    fn is_common(&self) -> bool {
+        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
+            && self.section_number() == pe::IMAGE_SYM_UNDEFINED as u16
+            && self.value() > 0
+    }
+
+    /// Returns `true` if this is a weak external symbol
+    fn is_weak(&self) -> bool {
+        self.storage_class() == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
+    }
+}
+
 #[derive(Debug)]
 pub struct GlobalSymbol<'a> {
     pub name: &'a [u8],
     pub value: u32,
-    pub section_number: SectionNumber,
-    pub index: SymbolIndex,
-    pub weak: bool,
+    pub section_number: u16,
+    pub typ: u16,
+    pub storage_class: u8,
     pub owner: ObjectFileId,
+    pub index: SymbolIndex,
     pub imported: bool,
     pub needs_thunk: bool,
     pub traced: bool,
@@ -55,10 +126,11 @@ impl<'a> std::default::Default for GlobalSymbol<'a> {
         Self {
             name: &[],
             value: 0,
-            section_number: SectionNumber::Undefined,
+            section_number: 0,
+            typ: 0,
+            storage_class: 0,
             index: object::SymbolIndex(0),
             owner: ObjectFileId::new(0),
-            weak: false,
             imported: false,
             needs_thunk: false,
             traced: false,
@@ -67,21 +139,6 @@ impl<'a> std::default::Default for GlobalSymbol<'a> {
 }
 
 impl<'a> GlobalSymbol<'a> {
-    /// Returns `true` if this is a COMMON symbol
-    pub fn is_common(&self) -> bool {
-        self.section_number == SectionNumber::Undefined && self.value != 0
-    }
-
-    /// Returns `true` if this symbol is undefined
-    pub fn is_undefined(&self) -> bool {
-        self.section_number == SectionNumber::Undefined && self.value == 0 && !self.weak
-    }
-
-    /// Returns `true` if this symbol is defined
-    pub fn is_defined(&self) -> bool {
-        self.section_number > SectionNumber::Undefined
-    }
-
     pub fn demangle(
         &self,
         ctx: &LinkContext,
@@ -89,7 +146,108 @@ impl<'a> GlobalSymbol<'a> {
     ) -> SymbolDemangler<'a> {
         demangle(ctx, self.name, architecture)
     }
+
+    pub fn priority(&self, live: bool) -> SymbolPriority {
+        SymbolPriority::new(self, live)
+    }
 }
+
+impl<'a> Symbol for GlobalSymbol<'a> {
+    fn value(&self) -> u32 {
+        self.value
+    }
+
+    fn section_number(&self) -> u16 {
+        self.section_number
+    }
+
+    fn typ(&self) -> u16 {
+        self.typ
+    }
+
+    fn storage_class(&self) -> u8 {
+        self.storage_class
+    }
+}
+
+impl<'a> Symbol for &GlobalSymbol<'a> {
+    fn value(&self) -> u32 {
+        self.value
+    }
+
+    fn section_number(&self) -> u16 {
+        self.section_number
+    }
+
+    fn typ(&self) -> u16 {
+        self.typ
+    }
+
+    fn storage_class(&self) -> u8 {
+        self.storage_class
+    }
+}
+
+impl<'a> Symbol for &mut GlobalSymbol<'a> {
+    fn value(&self) -> u32 {
+        self.value
+    }
+
+    fn section_number(&self) -> u16 {
+        self.section_number
+    }
+
+    fn typ(&self) -> u16 {
+        self.typ
+    }
+
+    fn storage_class(&self) -> u8 {
+        self.storage_class
+    }
+}
+
+/// Symbol priorities.
+///
+/// These are ordered and can be compared to see if one kind has a higher resolution
+/// strength over the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SymbolPriority {
+    Unknown,
+    LazyCommon,
+    Common,
+    LazyWeak,
+    LazyDefined,
+    Weak,
+    Defined,
+}
+
+impl SymbolPriority {
+    pub fn new<S: Symbol>(symbol: S, live: bool) -> SymbolPriority {
+        if symbol.is_common() {
+            if live {
+                SymbolPriority::Common
+            } else {
+                SymbolPriority::LazyCommon
+            }
+        } else if symbol.is_weak() {
+            if live {
+                SymbolPriority::Weak
+            } else {
+                SymbolPriority::LazyWeak
+            }
+        } else if !symbol.is_undefined() {
+            if live {
+                SymbolPriority::Defined
+            } else {
+                SymbolPriority::LazyDefined
+            }
+        } else {
+            SymbolPriority::Unknown
+        }
+    }
+}
+
+pub type ExternalRef<'s, 'a> = concurrent_indexmap::Ref<'s, &'a [u8], RwLock<GlobalSymbol<'a>>>;
 
 #[derive(Debug)]
 pub struct SymbolMap<'a> {
@@ -99,7 +257,7 @@ pub struct SymbolMap<'a> {
 impl<'a> SymbolMap<'a> {
     pub fn with_slot_count(count: usize) -> Self {
         Self {
-            map: ConcurrentIndexMap::with_slot_count(count.next_power_of_two()),
+            map: ConcurrentIndexMap::with_slot_count(count),
         }
     }
 
@@ -124,7 +282,7 @@ impl<'a> SymbolMap<'a> {
     pub fn get_exclusive_symbol(&mut self, symbol: SymbolId) -> Option<&mut GlobalSymbol<'a>> {
         self.map
             .get_exclusive_value(symbol.0)
-            .map(|symbol| symbol.get_mut().unwrap())
+            .map(|symbol| symbol.get_mut())
     }
 
     pub fn get_map_entry(&mut self, name: &'a [u8]) -> MapEntry<'_, 'a> {
@@ -144,7 +302,7 @@ impl<'a> SymbolMap<'a> {
 
     pub fn par_for_each_symbol(&mut self, f: impl Fn(&mut GlobalSymbol<'a>) + Send + Sync) {
         self.map.par_for_each_value_mut(|symbol| {
-            let symbol = symbol.get_mut().unwrap();
+            let symbol = symbol.get_mut();
             f(symbol);
         });
     }
@@ -181,7 +339,7 @@ impl<'b, 'a> OccupiedMapEntry<'b, 'a> {
     }
 
     pub fn into_mut_symbol(self) -> &'b mut GlobalSymbol<'a> {
-        self.entry.into_mut().get_mut().unwrap()
+        self.entry.into_mut().get_mut()
     }
 }
 

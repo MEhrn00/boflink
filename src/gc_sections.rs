@@ -11,11 +11,12 @@ use rayon::{
 
 use crate::{
     arena::ArenaRef,
-    coff::{SectionFlags, SectionNumber},
+    coff::SectionFlags,
     context::LinkContext,
     fatal,
     linker::Linker,
     object::{InputSection, ObjectFile, ObjectFileId},
+    symbols::Symbol,
     timing::ScopedTimer,
 };
 
@@ -30,8 +31,8 @@ impl<'a> Linker<'a> {
                     .iter()
                     .filter_map(|&symbol| {
                         let symbol = ctx.symbol_map.get(symbol).unwrap();
-                        let global = symbol.read().unwrap();
-                        let section_index = global.section_number.index()?;
+                        let global = symbol.read();
+                        let section_index = global.section()?;
                         let owner = &self.objs[global.owner.index()];
                         let section = owner.sections[section_index.0].as_ref().unwrap();
                         if section_is_live(section) && should_visit(section) {
@@ -52,11 +53,11 @@ impl<'a> Linker<'a> {
                                 return None;
                             }
 
-                            if retained_section(section)
+                            if metadata_section(section)
                                 && section_is_live(section)
                                 && should_visit(section)
                                 && (!section.coff_relocs.is_empty()
-                                    || !section.associative_edges.is_empty())
+                                    || !section.followers.is_empty())
                             {
                                 Some((obj.id, section.index))
                             } else {
@@ -69,8 +70,10 @@ impl<'a> Linker<'a> {
         );
 
         // If the list of GC roots derived from symbols is empty, the result of
-        // --gc-sections would discard every section since the kept sections from
-        // object files are metadata sections. Exit with an error if that is the case
+        // --gc-sections would discard every section except for metadata sections
+        // and their outgoing references.
+        // Exit with an error if that is the case since this would discard sections
+        // that need to be included.
         if symbol_roots.is_empty() {
             fatal!(
                 "cannot establish --gc-sections roots from --entry, --undefined, and --require-defined option set"
@@ -147,8 +150,8 @@ fn visit_section<'scope, 'a: 'scope>(
     // called
     debug_assert!(section.gc_visited.load(Ordering::Relaxed));
 
-    let visit_definition = |obj: ObjectFileId, number: SectionNumber| {
-        if let Some(section_index) = number.index() {
+    let visit_definition = |obj: ObjectFileId, number: Option<SectionIndex>| {
+        if let Some(section_index) = number {
             let owner = &objs[obj.index()];
             let section = owner.sections[section_index.0].as_ref().unwrap();
             if section_is_live(section) && should_visit(section) {
@@ -160,28 +163,23 @@ fn visit_section<'scope, 'a: 'scope>(
     };
 
     let associative_relocs = section
-        .associative_edges
+        .followers
         .iter()
         .flat_map(|index| obj.sections[index.0].as_ref())
         .flat_map(|section| section.coff_relocs.iter());
 
     for reloc in section.coff_relocs.iter().chain(associative_relocs) {
-        let symbol_index = reloc.symbol();
         // Skip over relocations to invalid symbols
-        let Some(symbol) = obj.symbols.get(symbol_index.0) else {
+        let Some(symbol) = obj.coff_symbol(reloc.symbol()) else {
             continue;
         };
 
-        let Some(symbol) = symbol.as_ref() else {
-            continue;
-        };
-
-        if let Some(external_ref) = symbol.external_id {
-            let global_ref = ctx.symbol_map.get(external_ref).unwrap();
-            let global = global_ref.read().unwrap();
-            visit_definition(global.owner, global.section_number);
+        if symbol.is_global() {
+            let (_, external_ref) = obj.external_symbol_ref(ctx, reloc.symbol()).unwrap();
+            let global = external_ref.read();
+            visit_definition(global.owner, global.section());
         } else {
-            visit_definition(obj.id, symbol.section_number);
+            visit_definition(obj.id, symbol.section());
         }
     }
 }
@@ -198,7 +196,7 @@ fn should_visit(section: &InputSection) -> bool {
         .unwrap_or(false)
 }
 
-fn retained_section(section: &InputSection) -> bool {
+fn metadata_section(section: &InputSection) -> bool {
     // Always keep debug sections. These should not be present unless `--no-strip-debug`
     // was specified
 
