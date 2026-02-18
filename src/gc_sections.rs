@@ -119,7 +119,7 @@ impl<'a> Linker<'a> {
                 // to reduce clutter
                 let names: [&[u8]; 3] = [b".text", b".data", b".bss"];
                 if obj.has_import_data
-                    && names.contains(&section.name)
+                    && names.iter().any(|name| *name == section.name)
                     && section.length == 0
                     && section.coff_relocs.is_empty()
                 {

@@ -23,6 +23,8 @@
 
 use std::{ffi::OsStr, marker::PhantomData, mem::ManuallyDrop, sync::Mutex};
 
+use bstr::BStr;
+
 #[repr(transparent)]
 pub struct TypedArena<T>(typed_arena::Arena<T>);
 
@@ -57,6 +59,14 @@ impl TypedArena<u8> {
         self.alloc_extend(b.iter().copied())
     }
 
+    pub fn alloc_bstr(&self, bytes: &[u8]) -> InvariantRef<'_, BStr> {
+        let bytes = self.alloc_bytes(bytes);
+        InvariantRef {
+            inner: BStr::new(bytes),
+            invariant: PhantomData,
+        }
+    }
+
     pub fn alloc_os_str(&self, s: &OsStr) -> InvariantRef<'_, OsStr> {
         let b = self.alloc_bytes(s.as_encoded_bytes());
         let allocd = unsafe { OsStr::from_encoded_bytes_unchecked(b) };
@@ -73,10 +83,22 @@ impl<T> std::default::Default for TypedArena<T> {
     }
 }
 
+/// Thin reference wrapper used to make the lifetime of `&T` invariant over `T`.
+///
+/// This is used as a hack to support allocating types that can be constructed
+/// from `&[u8]` but cannot be constructed using `&mut [u8]` to make it invariant.
+/// It is needed so that arena allocations can return a reference to `T` with
+/// the lifetime bound to the arena instead of to the arena borrow of the arena.
 #[repr(transparent)]
 pub struct InvariantRef<'a, T: ?Sized> {
     inner: &'a T,
     invariant: PhantomData<&'a mut T>,
+}
+
+impl<'a, T: ?Sized> InvariantRef<'a, T> {
+    pub fn into_inner(self) -> &'a T {
+        self.inner
+    }
 }
 
 impl<'a, T: ?Sized> std::ops::Deref for InvariantRef<'a, T> {
@@ -166,6 +188,14 @@ impl<'a> ArenaHandle<'a, u8> {
 
     pub fn alloc_bytes(&self, b: &[u8]) -> &'a mut [u8] {
         self.alloc_extend(b.iter().copied())
+    }
+
+    pub fn alloc_bstr<B: ?Sized + AsRef<[u8]>>(&self, bytes: &B) -> InvariantRef<'_, BStr> {
+        let bytes = self.alloc_bytes(bytes.as_ref());
+        InvariantRef {
+            inner: BStr::new(bytes),
+            invariant: PhantomData,
+        }
     }
 
     pub fn alloc_os_str(&self, s: &OsStr) -> InvariantRef<'a, OsStr> {

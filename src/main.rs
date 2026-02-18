@@ -1,5 +1,6 @@
 use std::{collections::HashSet, num::NonZeroUsize, path::Path, process::ExitCode};
 
+use bstr::BStr;
 use typed_arena::Arena;
 
 use crate::{
@@ -121,17 +122,17 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
         .chain(args.options.require_defined.iter())
         .chain(args.options.undefined.iter())
     {
-        linker.add_gc_root(&mut ctx, symbol.as_bytes());
+        linker.add_gc_root(&mut ctx, BStr::new(symbol.as_bytes()));
     }
 
     // Add require defined symbols
     for symbol in args.options.require_defined.iter() {
-        linker.add_required_symbol(&mut ctx, symbol.as_bytes());
+        linker.add_required_symbol(&mut ctx, BStr::new(symbol.as_bytes()));
     }
 
     // Add traced symbols
     for symbol in args.options.trace_symbol.iter() {
-        linker.add_traced_symbol(&mut ctx, symbol.as_bytes());
+        linker.add_traced_symbol(&mut ctx, BStr::new(symbol.as_bytes()));
     }
 
     linker.resolve_symbols(&mut ctx);
@@ -146,6 +147,7 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
         linker.define_common_symbols(&ctx);
     }
 
+    linker.mark_idata_imports(&ctx);
     linker.report_duplicate_symbols(&ctx);
 
     if ctx.options.gc_sections {
@@ -154,6 +156,7 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
 
     linker.create_output_sections(&mut ctx);
     linker.claim_undefined_symbols(&ctx);
+    linker.rewrite_dfr_imports(&ctx);
 
     let mut stats = std::mem::take(&mut ctx.stats);
     drop(linker);
