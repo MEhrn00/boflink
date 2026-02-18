@@ -1,7 +1,13 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
+use bstr::BStr;
+
 use crate::{
-    arena::ArenaPool, cli::CliOptions, outputs::OutputSection, symbols::SymbolMap,
+    arena::ArenaPool,
+    cli::CliOptions,
+    coff::ImageFileMachine,
+    outputs::OutputSection,
+    symbols::{ManglingScheme, SymbolDemangler, SymbolMap},
     timing::DurationExt,
 };
 
@@ -69,6 +75,21 @@ impl<'a> LinkContext<'a> {
             std::process::exit(1);
         }
     }
+
+    pub fn demangle<'s>(
+        &self,
+        symbol: &'s BStr,
+        machine: ImageFileMachine,
+    ) -> ContextDemangler<'s> {
+        if self.options.demangle {
+            ContextDemangler::Demangle(SymbolDemangler::new(
+                symbol,
+                ManglingScheme::machine(machine),
+            ))
+        } else {
+            ContextDemangler::Plain(symbol)
+        }
+    }
 }
 
 impl<'a> log::Log for &LinkContext<'a> {
@@ -85,6 +106,22 @@ impl<'a> log::Log for &LinkContext<'a> {
 
     fn flush(&self) {
         log::logger().flush();
+    }
+}
+
+/// Symbol demangler that conditionally demangles a symbol
+#[derive(Debug)]
+pub enum ContextDemangler<'a> {
+    Demangle(SymbolDemangler<'a>),
+    Plain(&'a BStr),
+}
+
+impl<'a> std::fmt::Display for ContextDemangler<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Demangle(demangler) => demangler.fmt(f),
+            Self::Plain(name) => name.fmt(f),
+        }
     }
 }
 

@@ -388,7 +388,7 @@ impl<'a> CoffSymbolRef<'a> {
     pub fn has_aux_weak_external(&self) -> bool {
         self.number_of_aux_symbols() > 0
             && self.is_weak()
-            && self.section_number() == pe::IMAGE_SYM_UNDEFINED as u16
+            && self.section_number() == pe::IMAGE_SYM_UNDEFINED
             && self.value() == 0
     }
 }
@@ -398,8 +398,13 @@ impl Symbol for CoffSymbolRef<'_> {
         self.0.value.get(object::LittleEndian)
     }
 
-    fn section_number(&self) -> u16 {
-        self.0.section_number.get(object::LittleEndian)
+    fn section_number(&self) -> i32 {
+        let section_number = self.0.section_number.get(object::LittleEndian);
+        if section_number >= pe::IMAGE_SYM_SECTION_MAX {
+            (section_number as i16) as i32
+        } else {
+            section_number as i32
+        }
     }
 
     fn typ(&self) -> u16 {

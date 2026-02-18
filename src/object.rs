@@ -10,9 +10,11 @@
 //! and, in the future, LTO COFFs.
 use std::{
     borrow::Cow,
+    collections::HashSet,
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use bstr::BStr;
 use object::{
     ReadRef, SectionIndex, SymbolIndex, U16Bytes,
     coff::{CoffFile, CoffHeader, SectionTable},
@@ -285,7 +287,7 @@ impl<'a> ObjectFile<'a> {
                 "ObjectFile::initialize_externals() found existing entry at {i}"
             );
             let _ = entry.insert(InputSymbol::External(ExternalSymbol {
-                id: ctx.symbol_map.get_or_create_default(name),
+                id: ctx.symbol_map.get_or_create_default(BStr::new(name)),
                 weak_default,
                 hidden,
                 selection: 0,
@@ -389,7 +391,7 @@ impl<'a> ObjectFile<'a> {
                 "ObjectFile::initialize_sections() found existing entry at {i}"
             );
             let _ = entry.insert(InputSection {
-                name,
+                name: BStr::new(name),
                 data,
                 length,
                 checksum: 0,
@@ -578,7 +580,6 @@ impl<'a> ObjectFile<'a> {
                 global.owner = self.id;
                 global.value = symbol.value();
                 global.section_number = symbol.section_number();
-                global.typ = symbol.typ();
                 global.storage_class = symbol.storage_class();
                 global.index = i;
             }
@@ -608,11 +609,11 @@ impl<'a> ObjectFile<'a> {
             let global = external_ref.read();
             if global.traced {
                 if !symbol.is_undefined() {
-                    log::info!(logger: ctx, "{}: definition of {}", self.source(), global.demangle(ctx, self.machine));
+                    log::info!(logger: ctx, "{}: definition of {}", self.source(), ctx.demangle(global.name, self.machine));
                 } else if symbol.is_weak() {
-                    log::info!(logger: ctx, "{}: weak external for {}", self.source(), global.demangle(ctx, self.machine));
+                    log::info!(logger: ctx, "{}: weak external for {}", self.source(), ctx.demangle(global.name, self.machine));
                 } else {
-                    log::info!(logger: ctx, "{}: reference to {}", self.source(), global.demangle(ctx, self.machine));
+                    log::info!(logger: ctx, "{}: reference to {}", self.source(), ctx.demangle(global.name, self.machine));
                 }
             }
 
@@ -632,7 +633,7 @@ impl<'a> ObjectFile<'a> {
 
             if symbol_is_needed && should_visit(owner) {
                 if global.traced {
-                    log::info!(logger: ctx, "{}: needs {} from {}", self.source(), global.demangle(ctx, self.machine), owner.source());
+                    log::info!(logger: ctx, "{}: needs {} from {}", self.source(), ctx.demangle(global.name, self.machine), owner.source());
                 }
 
                 scope.spawn(move |scope| {
@@ -688,7 +689,6 @@ impl<'a> ObjectFile<'a> {
                 global.owner = self.id;
                 global.value = symbol.value();
                 global.section_number = symbol.section_number();
-                global.typ = symbol.typ();
                 global.index = i;
             }
         }
@@ -794,7 +794,7 @@ impl<'a> ObjectFile<'a> {
                         "multiply defined symbol: {name}\n\
                             defined at {owner}\n\
                             defined at {this}",
-                        name = global.demangle(ctx, self.machine),
+                        name = ctx.demangle(global.name, self.machine),
                         owner = owner.source(),
                         this = self.source(),
                     ));
@@ -813,7 +813,7 @@ impl<'a> ObjectFile<'a> {
                         "duplicate symbol: {name}\n\
                                     defined at {owner}\n\
                                     defined at {this}",
-                        name = global.demangle(ctx, self.machine),
+                        name = ctx.demangle(global.name, self.machine),
                         owner = owner.source(),
                         this = self.source(),
                     ));
@@ -822,6 +822,84 @@ impl<'a> ObjectFile<'a> {
         }
 
         errors
+    }
+
+    /// If this is an object file with import information, this will resolve the
+    /// name of the DLL that the import refers to.
+    ///
+    /// This follows the import scheme from MinGW import libraries since they
+    /// are the only common import library variants that still use full COFFs
+    /// with .idata sections to handle imports instead of short import files.
+    ///
+    /// MinGW uses dlltool from binutils to create the prepacked import libraries.
+    /// The layout and creation of these import files can be found at
+    /// <https://git.sr.ht/~sourceware/binutils-gdb/tree/master/item/binutils/dlltool.c>.
+    ///
+    /// This can be called from any of the MinGW import COFFs to find the DLL
+    /// name. The function will recursively search undefined references until
+    /// it finds a symbol defined inside the .idata$7 section
+    pub fn resolve_import_dllname(
+        &self,
+        ctx: &LinkContext<'a>,
+        objs: &[ArenaRef<'a, ObjectFile<'a>>],
+    ) -> Option<&'a [u8]> {
+        if !self.has_import_data {
+            return None;
+        }
+
+        let mut visited = HashSet::new();
+        let mut stack = vec![self.id];
+        while let Some(obj) = stack.pop() {
+            let obj = &objs[obj.index()];
+            if !obj.has_import_data {
+                // Searched into a COFF without import data. Assume the search
+                // failed.
+                return None;
+            }
+
+            // If visiting an object file already visited, assume the search failed.
+            if !visited.insert(obj.id) {
+                return None;
+            }
+
+            for (i, symbol) in obj.coff_symbols.iter() {
+                if symbol.is_local() {
+                    continue;
+                }
+
+                let (_, external_ref) = obj.external_symbol_ref(ctx, i).unwrap();
+                if symbol.is_undefined() {
+                    let global = external_ref.read();
+                    stack.push(global.owner);
+                } else if let Some(section_index) = symbol.section() {
+                    let section = obj.section(section_index).unwrap();
+                    if section.name == b".idata$7"
+                        && section.characteristics.contains(
+                            SectionFlags::CntInitializedData
+                                | SectionFlags::MemRead
+                                | SectionFlags::MemWrite,
+                        )
+                    {
+                        let mut name = section.data;
+                        let nullbyte = section.data.iter().position(|&b| b == 0);
+                        if let Some(nullbyte) = nullbyte {
+                            name = &name[..nullbyte];
+                        }
+
+                        // Trim off the .dll suffix
+                        if let Some(suffix) = name.get(name.len() - 4..)
+                            && suffix.eq_ignore_ascii_case(b".dll")
+                        {
+                            name = &name[..name.len() - 4];
+                        }
+
+                        return Some(name);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     pub fn section(&self, index: SectionIndex) -> Option<&InputSection<'a>> {
@@ -883,7 +961,7 @@ impl<'a> ObjectFile<'a> {
 
 #[derive(Debug)]
 pub struct InputSection<'a> {
-    pub name: &'a [u8],
+    pub name: &'a BStr,
     pub data: &'a [u8],
     pub checksum: u32,
     pub length: u32,
@@ -984,7 +1062,7 @@ impl<'a> InputSymbol<'a> {
 pub struct LocalSymbol<'a> {
     pub name: &'a [u8],
     pub value: u32,
-    pub section_number: u16,
+    pub section_number: i32,
     pub typ: u16,
     pub storage_class: u8,
 }
@@ -994,7 +1072,7 @@ impl<'a> Symbol for &LocalSymbol<'a> {
         self.value
     }
 
-    fn section_number(&self) -> u16 {
+    fn section_number(&self) -> i32 {
         self.section_number
     }
 
@@ -1012,7 +1090,7 @@ impl<'a> Symbol for &mut LocalSymbol<'a> {
         self.value
     }
 
-    fn section_number(&self) -> u16 {
+    fn section_number(&self) -> i32 {
         self.section_number
     }
 

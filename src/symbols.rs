@@ -16,32 +16,42 @@
 //! Using an id value to get a symbol does not require handling collisions and
 //! is essentially the same has doing a constant-time array index.
 
-use std::hash::Hash;
+use bstr::{BStr, ByteSlice};
 
 use object::{SectionIndex, SymbolIndex, pe};
 use parking_lot::RwLock;
 
 use crate::{
     coff::ImageFileMachine,
-    concurrent_indexmap::{self, ConcurrentIndexMap, Index, Ref},
-    context::LinkContext,
+    concurrent_indexmap::{self, ConcurrentIndexMap, Index},
     object::ObjectFileId,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct SymbolId(Index);
-
-impl std::fmt::Debug for SymbolId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SymbolId").field(&self.0).finish()
-    }
-}
-
+/// This trait is used to abstract various routines when dealing with COFF symbols.
+///
+/// COFF symbols include 4 main metadata fields.
+/// - Value
+/// - SectionNumber
+/// - Type
+/// - StorageClass
+///
+/// Some of these fields are insignificant on their own without being paired with
+/// values from other fields.
+/// This trait requires implementors to add accessors for these metadata fields.
+///
+/// The rest of the trait methods allow querying for different attributes of
+/// symbols through the associated fields.
 pub trait Symbol {
+    /// Returns the raw `Value` from the symbol
     fn value(&self) -> u32;
-    fn section_number(&self) -> u16;
+
+    /// Returns the raw `SectionNumber` from the symbol
+    fn section_number(&self) -> i32;
+
+    /// Returns the raw `Type` from the symbol
     fn typ(&self) -> u16;
+
+    /// Returns the raw `StorageClass` from the symbol
     fn storage_class(&self) -> u8;
 
     /// Returns the base type of the symbol
@@ -57,47 +67,75 @@ pub trait Symbol {
     /// Returns the index of the section this symbol is defined in
     fn section(&self) -> Option<SectionIndex> {
         let section_number = self.section_number();
-        if section_number > pe::IMAGE_SYM_UNDEFINED as u16
-            && section_number < (pe::IMAGE_SYM_DEBUG as i16).cast_unsigned()
-        {
+        if section_number > pe::IMAGE_SYM_UNDEFINED {
             Some(SectionIndex(section_number as usize))
         } else {
             None
         }
     }
 
-    /// Returns `true` if this is a symbol for debug info
+    /// Returns `true` if this is a symbol for a debug item
     fn is_debug(&self) -> bool {
-        self.section_number() == (pe::IMAGE_SYM_DEBUG as i16).cast_unsigned()
+        self.section_number() == pe::IMAGE_SYM_DEBUG
     }
 
-    /// Returns `true` if this is an absolute symbol
+    /// Returns `true` if this is an absolute symbol.
+    ///
+    /// The value is interpreted as the symbol value.
     fn is_absolute(&self) -> bool {
-        self.section_number() == (pe::IMAGE_SYM_ABSOLUTE as i16).cast_unsigned()
+        self.section_number() == pe::IMAGE_SYM_ABSOLUTE
     }
 
-    /// Returns `true` if this is a globally visible symbol
+    /// Returns `true` if this is a relocatable symbol.
+    ///
+    /// A relocatable symbol means that the value field refers to an RVA inside
+    /// the section referred to by the section number.
+    fn is_relocatable(&self) -> bool {
+        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
+            || self.storage_class() == pe::IMAGE_SYM_CLASS_STATIC
+            || self.storage_class() == pe::IMAGE_SYM_CLASS_LABEL
+    }
+
+    /// Returns `true` if this is a globally visible symbol.
+    ///
+    /// Globally visible symbols are symbols with `IMAGE_SYM_CLASS_EXTERNAL` or
+    /// `IMAGE_SYM_CLASS_WEAK_EXTERNAL` storage class
     fn is_global(&self) -> bool {
         self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
             || self.storage_class() == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
     }
 
-    /// Returns `true` if this symbol is locally scoped
+    /// Returns `true` if this symbol is locally scoped.
+    ///
+    /// Local symbols are all other symbols that do not fall under the category of
+    /// [`Symbol::is_global()`]
     fn is_local(&self) -> bool {
         !self.is_global()
     }
 
-    /// Returns `true` if this symbol is a globally visible undefined external
+    /// Returns `true` if this symbol is an undefined external symbol.
+    ///
+    /// An undefined external symbol is a symbol with `IMAGE_SYM_CLASS_EXTERNAL`
+    /// storage class, a section number of 0 (`IMAGE_SYM_UNDEFINED`) and a value
+    /// of 0.
+    ///
+    /// # Note
+    /// Common symbols [`Symbol::is_common()`] and weak externals [`Symbol::is_weak()`]
+    /// do not fall under this category
     fn is_undefined(&self) -> bool {
         self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
-            && self.section_number() == pe::IMAGE_SYM_UNDEFINED as u16
+            && self.section_number() == pe::IMAGE_SYM_UNDEFINED
             && self.value() == 0
     }
 
-    /// Returns `true` if this is a common symbol
+    /// Returns `true` if this is a common symbol.
+    ///
+    /// A common symbol has `IMAGE_SYM_CLASS_EXTERNAL` storage class, a section
+    /// number of 0 (`IMAGE_SYM_UNDEFINED`) and a value that is non-zero. The
+    /// value field is interpreted as the symbol size/alignment
     fn is_common(&self) -> bool {
         self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
-            && self.section_number() == pe::IMAGE_SYM_UNDEFINED as u16
+            && self.section_number() == pe::IMAGE_SYM_UNDEFINED
             && self.value() > 0
     }
 
@@ -109,44 +147,34 @@ pub trait Symbol {
 
 #[derive(Debug)]
 pub struct GlobalSymbol<'a> {
-    pub name: &'a [u8],
+    pub name: &'a BStr,
     pub value: u32,
-    pub section_number: u16,
-    pub typ: u16,
+    pub section_number: i32,
     pub storage_class: u8,
     pub owner: ObjectFileId,
     pub index: SymbolIndex,
-    pub imported: bool,
-    pub needs_thunk: bool,
     pub traced: bool,
+    pub imported: bool,
+    pub dfr: bool,
 }
 
 impl<'a> std::default::Default for GlobalSymbol<'a> {
     fn default() -> Self {
         Self {
-            name: &[],
+            name: BStr::new(b""),
             value: 0,
             section_number: 0,
-            typ: 0,
             storage_class: pe::IMAGE_SYM_CLASS_EXTERNAL,
             index: object::SymbolIndex(0),
             owner: ObjectFileId::new(0),
             imported: false,
-            needs_thunk: false,
             traced: false,
+            dfr: false,
         }
     }
 }
 
 impl<'a> GlobalSymbol<'a> {
-    pub fn demangle(
-        &self,
-        ctx: &LinkContext,
-        architecture: ImageFileMachine,
-    ) -> SymbolDemangler<'a> {
-        demangle(ctx, self.name, architecture)
-    }
-
     pub fn priority(&self, live: bool) -> SymbolPriority {
         SymbolPriority::new(self, live)
     }
@@ -157,12 +185,13 @@ impl<'a> Symbol for GlobalSymbol<'a> {
         self.value
     }
 
-    fn section_number(&self) -> u16 {
+    fn section_number(&self) -> i32 {
         self.section_number
     }
 
     fn typ(&self) -> u16 {
-        self.typ
+        // Symbol type is mostly useless for globals
+        0
     }
 
     fn storage_class(&self) -> u8 {
@@ -175,12 +204,12 @@ impl<'a> Symbol for &GlobalSymbol<'a> {
         self.value
     }
 
-    fn section_number(&self) -> u16 {
+    fn section_number(&self) -> i32 {
         self.section_number
     }
 
     fn typ(&self) -> u16 {
-        self.typ
+        0
     }
 
     fn storage_class(&self) -> u8 {
@@ -193,12 +222,12 @@ impl<'a> Symbol for &mut GlobalSymbol<'a> {
         self.value
     }
 
-    fn section_number(&self) -> u16 {
+    fn section_number(&self) -> i32 {
         self.section_number
     }
 
     fn typ(&self) -> u16 {
-        self.typ
+        0
     }
 
     fn storage_class(&self) -> u8 {
@@ -247,11 +276,21 @@ impl SymbolPriority {
     }
 }
 
-pub type ExternalRef<'s, 'a> = concurrent_indexmap::Ref<'s, &'a [u8], RwLock<GlobalSymbol<'a>>>;
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct SymbolId(Index);
+
+impl std::fmt::Debug for SymbolId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SymbolId").field(&self.0).finish()
+    }
+}
+
+pub type ExternalRef<'s, 'a> = concurrent_indexmap::Ref<'s, &'a BStr, RwLock<GlobalSymbol<'a>>>;
 
 #[derive(Debug)]
 pub struct SymbolMap<'a> {
-    map: ConcurrentIndexMap<&'a [u8], RwLock<GlobalSymbol<'a>>>,
+    map: ConcurrentIndexMap<&'a BStr, RwLock<GlobalSymbol<'a>>>,
 }
 
 impl<'a> SymbolMap<'a> {
@@ -267,7 +306,7 @@ impl<'a> SymbolMap<'a> {
 
     /// Gets the symbol id for `name` or inserts a new default symbol if not
     /// already present.
-    pub fn get_or_create_default(&self, name: &'a [u8]) -> SymbolId {
+    pub fn get_or_create_default(&self, name: &'a BStr) -> SymbolId {
         let entry = self.map.entry(name);
         let index = entry.index();
         entry.or_insert_with(|| {
@@ -285,7 +324,7 @@ impl<'a> SymbolMap<'a> {
             .map(|symbol| symbol.get_mut())
     }
 
-    pub fn get_map_entry(&mut self, name: &'a [u8]) -> MapEntry<'_, 'a> {
+    pub fn get_map_entry(&mut self, name: &'a BStr) -> MapEntry<'_, 'a> {
         match self.map.exclusive_entry(name) {
             concurrent_indexmap::ExclusiveEntry::Vacant(entry) => {
                 MapEntry::Vacant(VacantMapEntry { entry })
@@ -296,7 +335,7 @@ impl<'a> SymbolMap<'a> {
         }
     }
 
-    pub fn get(&self, symbol: SymbolId) -> Option<Ref<'_, &'a [u8], RwLock<GlobalSymbol<'a>>>> {
+    pub fn get(&self, symbol: SymbolId) -> Option<ExternalRef<'_, 'a>> {
         self.map.get(symbol.0)
     }
 
@@ -330,7 +369,7 @@ impl<'b, 'a> MapEntry<'b, 'a> {
 }
 
 pub struct OccupiedMapEntry<'b, 'a> {
-    entry: concurrent_indexmap::ExclusiveOccupiedEntry<'b, &'a [u8], RwLock<GlobalSymbol<'a>>>,
+    entry: concurrent_indexmap::ExclusiveOccupiedEntry<'b, &'a BStr, RwLock<GlobalSymbol<'a>>>,
 }
 
 impl<'b, 'a> OccupiedMapEntry<'b, 'a> {
@@ -344,7 +383,7 @@ impl<'b, 'a> OccupiedMapEntry<'b, 'a> {
 }
 
 pub struct VacantMapEntry<'b, 'a> {
-    entry: concurrent_indexmap::ExclusiveVacantEntry<'b, &'a [u8], RwLock<GlobalSymbol<'a>>>,
+    entry: concurrent_indexmap::ExclusiveVacantEntry<'b, &'a BStr, RwLock<GlobalSymbol<'a>>>,
 }
 
 impl<'b, 'a> VacantMapEntry<'b, 'a> {
@@ -363,58 +402,106 @@ impl<'b, 'a> VacantMapEntry<'b, 'a> {
     }
 }
 
-pub fn demangle<'a>(
-    ctx: &LinkContext,
-    name: &'a [u8],
-    architecture: ImageFileMachine,
-) -> SymbolDemangler<'a> {
-    SymbolDemangler {
-        name,
-        i386: architecture == ImageFileMachine::I386,
-        demangle: ctx.options.demangle,
+/// Architecture specified mangling scheme for global symbol names.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManglingScheme {
+    #[default]
+    None,
+
+    I386,
+}
+
+impl ManglingScheme {
+    /// Returns the mangling scheme matching the specified machine value
+    pub fn machine(machine: ImageFileMachine) -> Self {
+        if machine == ImageFileMachine::I386 {
+            Self::I386
+        } else {
+            Self::None
+        }
+    }
+
+    /// Returns the global prefix as a char for the mangling scheme.
+    pub fn global_prefix_char(self) -> Option<char> {
+        if self == Self::I386 { Some('_') } else { None }
+    }
+
+    /// Returns the global prefix for the mangling scheme.
+    pub fn global_prefix(self) -> Option<u8> {
+        self.global_prefix_char().map(|ch| ch as u8)
+    }
+
+    /// Returns the prefix used for DLL imports for the mangling scheme.
+    ///
+    /// This will add the leading global prefix if I386
+    pub fn dllimport_prefix(self) -> &'static BStr {
+        if self == Self::I386 {
+            BStr::new(b"__imp__")
+        } else {
+            BStr::new(b"__imp_")
+        }
+    }
+
+    /// Returns the global prefix for the mangling scheme as a byte slice.
+    ///
+    /// The byte slice will be empty if there is no prefix.
+    pub fn global_prefix_bytes(self) -> &'static BStr {
+        if self == Self::I386 {
+            BStr::new(b"_")
+        } else {
+            BStr::new(b"")
+        }
     }
 }
 
+/// Demangler for a symbol name that is possibly itanium, Rust or MSVC mangled.
 #[derive(Debug, Clone)]
 pub struct SymbolDemangler<'a> {
-    name: &'a [u8],
-    i386: bool,
-    demangle: bool,
+    name: &'a BStr,
+    scheme: ManglingScheme,
+}
+
+impl<'a> SymbolDemangler<'a> {
+    pub fn new(name: &'a BStr, scheme: ManglingScheme) -> Self {
+        Self { name, scheme }
+    }
 }
 
 impl std::fmt::Display for SymbolDemangler<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name_string = String::from_utf8_lossy(self.name);
-        if !self.demangle {
-            f.write_str(&name_string)?;
-            return Ok(());
-        }
-
-        let mut name = name_string.as_ref();
-        if let Some(trimmed) = name.strip_prefix("__imp_") {
-            name = trimmed;
+        let mut name = self.name;
+        if let Some(trimmed) = name.strip_prefix(b"__imp_") {
+            name = BStr::new(trimmed);
             write!(f, "__declspec(dllimport) ")?;
         }
 
         let try_demangle = |f: &mut std::fmt::Formatter<'_>| -> Option<()> {
-            demangle_msvc(f, name, self.i386)
-                .or_else(|| demangle_cpp(f, name, self.i386))
-                .or_else(|| demangle_rustc(f, name, self.i386))
+            demangle_msvc(f, name, self.scheme == ManglingScheme::I386)
+                .or_else(|| demangle_cpp(f, name, self.scheme))
+                .or_else(|| demangle_rustc(f, name, self.scheme))
         };
 
         if try_demangle(f).is_none() {
-            f.write_str(name)?;
+            name.fmt(f)?;
         }
 
         Ok(())
     }
 }
 
-fn demangle_cpp(f: &mut std::fmt::Formatter<'_>, symbol: &str, i386: bool) -> Option<()> {
-    let is_cpp_mangled =
-        |symbol: &str| (i386 && symbol.starts_with("__Z")) || symbol.starts_with("_Z");
+fn demangle_cpp(
+    f: &mut std::fmt::Formatter<'_>,
+    mut symbol: &[u8],
+    mangling: ManglingScheme,
+) -> Option<()> {
+    if mangling
+        .global_prefix()
+        .is_some_and(|prefix| symbol.first() == Some(&prefix))
+    {
+        symbol = &symbol[1..];
+    }
 
-    if is_cpp_mangled(symbol) {
+    if symbol.starts_with(b"_Z") {
         let demangler = cpp_demangle::Symbol::new(symbol).ok()?;
         demangler.structured_demangle(f, &Default::default()).ok()
     } else {
@@ -422,17 +509,25 @@ fn demangle_cpp(f: &mut std::fmt::Formatter<'_>, symbol: &str, i386: bool) -> Op
     }
 }
 
-fn demangle_rustc(f: &mut std::fmt::Formatter<'_>, mut symbol: &str, i386: bool) -> Option<()> {
-    if i386 {
-        symbol = symbol.trim_start_matches('_');
+fn demangle_rustc(
+    f: &mut std::fmt::Formatter<'_>,
+    mut symbol: &[u8],
+    mangling: ManglingScheme,
+) -> Option<()> {
+    if mangling
+        .global_prefix()
+        .is_some_and(|prefix| symbol.first() == Some(&prefix))
+    {
+        symbol = &symbol[1..];
     }
 
-    let demangler = rustc_demangle::try_demangle(symbol).ok()?;
+    let symbol = symbol.to_str_lossy();
+    let demangler = rustc_demangle::try_demangle(&symbol).ok()?;
     write!(f, "{demangler}").ok()
 }
 
 #[cfg(not(windows))]
-fn demangle_msvc(_f: &mut std::fmt::Formatter<'_>, _symbol: &str, _i386: bool) -> Option<()> {
+fn demangle_msvc(_f: &mut std::fmt::Formatter<'_>, _symbol: &[u8], _i386: bool) -> Option<()> {
     None
 }
 

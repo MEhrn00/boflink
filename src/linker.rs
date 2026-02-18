@@ -3,8 +3,10 @@
 //! This module contains implemenrations for the linker passes.
 use std::{collections::HashMap, sync::atomic::Ordering};
 
+use bstr::BStr;
 use indexmap::IndexMap;
 use object::SectionIndex;
+use parking_lot::RwLockUpgradableReadGuard;
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
     IntoParallelRefMutIterator, ParallelExtend, ParallelIterator,
@@ -88,19 +90,21 @@ impl<'a> Linker<'a> {
 
     /// Mangles the specified name using the mangling scheme from the linker
     /// architecture.
-    pub fn mangle(&self, name: &'a [u8]) -> &'a [u8] {
+    pub fn arch_mangle(&self, name: &'a BStr) -> &'a BStr {
         if self.architecture != ImageFileMachine::I386 {
             return name;
         }
 
-        self.strings.alloc_bytes([b"_", name].concat().as_slice())
+        let mangled = [b"_", AsRef::<[u8]>::as_ref(name)].concat();
+        let mangled = self.strings.alloc_bytes(&mangled);
+        BStr::new(mangled)
     }
 
     /// Adds the specified symbol as a GC root.
     ///
     /// The symbol name should not be mangled before calling this function.
-    pub fn add_gc_root(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
-        let name = self.mangle(name);
+    pub fn add_gc_root(&mut self, ctx: &mut LinkContext<'a>, name: &'a BStr) {
+        let name = self.arch_mangle(name);
         let symbol = ctx.symbol_map.get_map_entry(name);
         let id = symbol.id();
         if !self.gc_roots.contains(&id) {
@@ -112,8 +116,8 @@ impl<'a> Linker<'a> {
     ///
     /// This only adds the symbol and stores an ID for. The check needs to be
     /// done explicitly
-    pub fn add_required_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
-        let name = self.mangle(name);
+    pub fn add_required_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a BStr) {
+        let name = self.arch_mangle(name);
         let symbol = ctx.symbol_map.get_map_entry(name);
         let id = symbol.id();
         if !self.required_symbol.contains(&id) {
@@ -122,8 +126,11 @@ impl<'a> Linker<'a> {
     }
 
     /// Marks the specified symbol for trace output
-    pub fn add_traced_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a [u8]) {
-        let symbol = ctx.symbol_map.get_map_entry(self.mangle(name)).or_default();
+    pub fn add_traced_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a BStr) {
+        let symbol = ctx
+            .symbol_map
+            .get_map_entry(self.arch_mangle(name))
+            .or_default();
         symbol.traced = true;
     }
 
@@ -288,7 +295,6 @@ impl<'a> Linker<'a> {
                         global.owner = obj.id;
                         global.value = symbol.value();
                         global.section_number = symbol.section_number();
-                        global.typ = symbol.typ();
                         global.storage_class = symbol.storage_class();
                         global.index = i;
                     }
@@ -326,7 +332,7 @@ impl<'a> Linker<'a> {
 
                     let index = SectionIndex(obj.sections.len());
                     obj.sections.push(Some(InputSection {
-                        name: b".bss",
+                        name: BStr::new(b".bss"),
                         characteristics,
                         index,
                         length: symbol.value(),
@@ -337,7 +343,42 @@ impl<'a> Linker<'a> {
                     // not be any race condition due to double-locking
                     let mut global = external_ref.write();
                     global.value = 0;
-                    global.section_number = index.0 as u16;
+                    global.section_number = index.0 as i32;
+                }
+            });
+    }
+
+    /// Set symbols defined in .idata IAT sections as imports
+    pub fn mark_idata_imports(&mut self, ctx: &LinkContext<'a>) {
+        self.objs
+            .par_iter()
+            .filter(|obj| obj.has_import_data)
+            .for_each(|obj| {
+                for (i, symbol) in obj.coff_symbols.iter() {
+                    if symbol.is_local() {
+                        continue;
+                    }
+
+                    let Some(section_index) = symbol.section() else {
+                        continue;
+                    };
+
+                    let section = obj.section(section_index).unwrap();
+                    if section.name == b".idata$5"
+                        && section.characteristics.contains(
+                            SectionFlags::CntInitializedData
+                                | SectionFlags::MemRead
+                                | SectionFlags::MemWrite,
+                        )
+                    {
+                        let (_, external_ref) = obj.external_symbol_ref(ctx, i).unwrap();
+                        let mut global = external_ref.write();
+                        if global.owner == obj.id {
+                            global.imported = true;
+                            // All imports are marked for using DFR by default
+                            global.dfr = true;
+                        }
+                    }
                 }
             });
     }
@@ -522,12 +563,56 @@ impl<'a> Linker<'a> {
                         let default_symbol = obj.coff_symbol(external.weak_default).unwrap();
                         global.value = default_symbol.value();
                         global.section_number = default_symbol.section_number();
-                        global.typ = default_symbol.typ();
                         global.storage_class = default_symbol.storage_class();
                         global.index = external.weak_default;
                     }
                 }
             }
         });
+    }
+
+    /// Rewrites DLL imported symbols to use DFR
+    pub fn rewrite_dfr_imports(&mut self, ctx: &LinkContext<'a>) {
+        self.objs
+            .par_iter()
+            .filter(|obj| obj.has_import_data)
+            .for_each_init(
+                || ctx.string_pool.get(),
+                |strings, obj| {
+                    for (i, symbol) in obj.coff_symbols.iter() {
+                        if symbol.is_local() {
+                            continue;
+                        }
+
+                        let (_, external_ref) = obj.external_symbol_ref(ctx, i).unwrap();
+
+                        // There should not be any potential for deadlocks when
+                        // resolving the DLL name but acquire a read lock initially
+                        // for resolving the name then upgrade it to a write lock
+                        // if successfully resolved
+                        let global = external_ref.upgradable_read();
+                        if global.owner != obj.id || !(global.imported && global.dfr) {
+                            continue;
+                        }
+
+                        let owner = &self.objs[global.owner.index()];
+                        let Some(dllname) = owner.resolve_import_dllname(ctx, &self.objs) else {
+                            continue;
+                        };
+
+                        let mut global = RwLockUpgradableReadGuard::upgrade(global);
+                        let mut name = global.name.strip_prefix(b"__imp_").unwrap_or(global.name);
+                        if obj.machine == ImageFileMachine::I386 {
+                            name = name.strip_prefix(b"_").unwrap_or(name);
+                            name = strings
+                                .alloc_bytes([b"__imp__", dllname, b"$", name].concat().as_slice());
+                        } else {
+                            name = strings
+                                .alloc_bytes([b"__imp_", dllname, b"$", name].concat().as_slice());
+                        };
+                        global.name = BStr::new(name);
+                    }
+                },
+            );
     }
 }
