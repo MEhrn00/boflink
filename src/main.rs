@@ -147,7 +147,7 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
         linker.define_common_symbols(&ctx);
     }
 
-    linker.mark_idata_imports(&ctx);
+    linker.mark_import_symbols(&ctx);
     linker.report_duplicate_symbols(&ctx);
 
     if ctx.options.gc_sections {
@@ -156,6 +156,7 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
 
     linker.create_output_sections(&mut ctx);
     linker.claim_undefined_symbols(&ctx);
+    linker.scan_relocations(&ctx);
     linker.rewrite_dfr_imports(&ctx);
 
     let mut stats = std::mem::take(&mut ctx.stats);

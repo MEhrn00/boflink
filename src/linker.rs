@@ -5,7 +5,6 @@ use std::{collections::HashMap, sync::atomic::Ordering};
 
 use bstr::BStr;
 use indexmap::IndexMap;
-use object::SectionIndex;
 use parking_lot::RwLockUpgradableReadGuard;
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
@@ -23,7 +22,7 @@ use crate::{
         OutputSection, OutputSectionId, OutputSectionInputsMap, SectionKey,
         create_reserved_sections,
     },
-    symbols::{GlobalSymbol, Symbol, SymbolId},
+    symbols::{GlobalSymbol, GlobalSymbolFlags, Symbol, SymbolId},
     timing::ScopedTimer,
 };
 
@@ -131,7 +130,7 @@ impl<'a> Linker<'a> {
             .symbol_map
             .get_map_entry(self.arch_mangle(name))
             .or_default();
-        symbol.traced = true;
+        symbol.set_traced(true);
     }
 
     /// Handles resolving symbols from the currently held object files.
@@ -207,7 +206,7 @@ impl<'a> Linker<'a> {
 
         ctx.exclusive_check_errored();
 
-        // Resolve COMDAT leaders for live objects. This needs to happen live
+        // Resolve COMDAT leaders for live objects. This needs to happen for live
         // objects to select the correct definition that should be used
         self.objs.par_iter().for_each(|obj| {
             if obj.live.load(Ordering::Relaxed) {
@@ -229,7 +228,7 @@ impl<'a> Linker<'a> {
         ctx.symbol_map.par_for_each_symbol(|symbol| {
             *symbol = GlobalSymbol {
                 name: symbol.name,
-                traced: symbol.traced,
+                flags: symbol.flags,
                 ..Default::default()
             };
         });
@@ -283,7 +282,7 @@ impl<'a> Linker<'a> {
                         continue;
                     }
 
-                    let (_, external_ref) = obj.external_symbol_ref(ctx, i).unwrap();
+                    let external_ref = obj.symbols.external_symbol_ref(ctx, i).unwrap();
                     let mut global = external_ref.write();
                     if global.owner == obj.id {
                         continue;
@@ -315,7 +314,7 @@ impl<'a> Linker<'a> {
                         continue;
                     }
 
-                    let (_, external_ref) = obj.external_symbol_ref(ctx, i).unwrap();
+                    let external_ref = obj.symbols.external_symbol_ref(ctx, i).unwrap();
                     {
                         let global = external_ref.read();
                         if global.owner != obj.id {
@@ -330,14 +329,12 @@ impl<'a> Linker<'a> {
                     characteristics
                         .set_alignment(symbol.value().next_power_of_two().max(8192u32) as usize);
 
-                    let index = SectionIndex(obj.sections.len());
-                    obj.sections.push(Some(InputSection {
+                    let index = obj.sections.push(InputSection {
                         name: BStr::new(b".bss"),
                         characteristics,
-                        index,
                         length: symbol.value(),
                         ..Default::default()
-                    }));
+                    });
 
                     // Only one symbol should acquire this lock so there should
                     // not be any race condition due to double-locking
@@ -348,12 +345,12 @@ impl<'a> Linker<'a> {
             });
     }
 
-    /// Set symbols defined in .idata IAT sections as imports
-    pub fn mark_idata_imports(&mut self, ctx: &LinkContext<'a>) {
+    pub fn mark_import_symbols(&mut self, ctx: &LinkContext<'a>) {
         self.objs
-            .par_iter()
+            .par_iter_mut()
             .filter(|obj| obj.has_import_data)
             .for_each(|obj| {
+                let obj = obj.as_mut();
                 for (i, symbol) in obj.coff_symbols.iter() {
                     if symbol.is_local() {
                         continue;
@@ -363,21 +360,16 @@ impl<'a> Linker<'a> {
                         continue;
                     };
 
-                    let section = obj.section(section_index).unwrap();
-                    if section.name == b".idata$5"
-                        && section.characteristics.contains(
-                            SectionFlags::CntInitializedData
-                                | SectionFlags::MemRead
-                                | SectionFlags::MemWrite,
-                        )
-                    {
-                        let (_, external_ref) = obj.external_symbol_ref(ctx, i).unwrap();
-                        let mut global = external_ref.write();
-                        if global.owner == obj.id {
-                            global.imported = true;
-                            // All imports are marked for using DFR by default
-                            global.dfr = true;
-                        }
+                    let section = &mut obj.sections[section_index];
+                    *section.discarded.get_mut() = true;
+                    let mut flags = GlobalSymbolFlags::Imported;
+                    if section.is_iat_entry() {
+                        flags.insert(GlobalSymbolFlags::DFR);
+                    }
+                    let external_ref = obj.symbols.external_symbol_ref(ctx, i).unwrap();
+                    let mut global = external_ref.write();
+                    if global.owner == obj.id {
+                        global.flags.insert(flags);
                     }
                 }
             });
@@ -438,13 +430,12 @@ impl<'a> Linker<'a> {
             .map(|obj| {
                 let objid = obj.id;
                 obj.sections
-                    .iter_mut()
-                    .flatten()
-                    .filter_map(|section| {
+                    .enumerate_mut()
+                    .filter_map(|(section_index, section)| {
                         if *section.discarded.get_mut() {
                             None
                         } else {
-                            Some(section)
+                            Some((section_index, section))
                         }
                     })
                     .fold(
@@ -452,15 +443,15 @@ impl<'a> Linker<'a> {
                             OutputSectionInputsMap::new(reserved_sections_len),
                             IndexMap::new(),
                         ),
-                        |(mut known, mut needed), section| {
+                        |(mut known, mut needed), (section_index, section)| {
                             let key = SectionKey::new(ctx, section);
                             if let Some(id) = key.known_id() {
                                 section.output = id;
                                 let entry = known.get_or_default(id);
-                                entry.push((objid, section.index));
+                                entry.push((objid, section_index));
                             } else {
                                 let entry: &mut Vec<_> = needed.entry(key).or_default();
-                                entry.push((objid, section.index));
+                                entry.push((objid, section_index));
                             }
                             (known, needed)
                         },
@@ -527,8 +518,7 @@ impl<'a> Linker<'a> {
                 });
 
             for (output_id, index) in outputs {
-                let section = obj.section_mut(index).unwrap();
-                section.output = output_id;
+                obj.sections[index].output = output_id;
             }
         });
     }
@@ -546,7 +536,7 @@ impl<'a> Linker<'a> {
 
             for (i, symbol) in obj.coff_symbols.iter() {
                 if symbol.is_undefined() {
-                    let (_, external_ref) = obj.external_symbol_ref(ctx, i).unwrap();
+                    let external_ref = obj.symbols.external_symbol_ref(ctx, i).unwrap();
                     let mut global = external_ref.write();
                     if global.is_undefined()
                         && (global.owner.is_internal() || obj.id < global.owner)
@@ -555,18 +545,29 @@ impl<'a> Linker<'a> {
                         global.index = i;
                     }
                 } else if symbol.is_weak() {
-                    let (external, external_ref) = obj.external_symbol_ref(ctx, i).unwrap();
+                    let (external, external_ref) =
+                        obj.symbols.external_symbol_ref2(ctx, i).unwrap();
                     let mut global = external_ref.write();
                     if global.owner == obj.id && global.index == i {
                         // TODO: check recursive weak definitions and handle cycles.
                         // Should not be a thing but it is technically possible...
-                        let default_symbol = obj.coff_symbol(external.weak_default).unwrap();
+                        let default_symbol =
+                            obj.coff_symbols.symbol(external.weak_default).unwrap();
                         global.value = default_symbol.value();
                         global.section_number = default_symbol.section_number();
                         global.storage_class = default_symbol.storage_class();
                         global.index = external.weak_default;
                     }
                 }
+            }
+        });
+    }
+
+    pub fn scan_relocations(&self, ctx: &LinkContext<'a>) {
+        let objs = &self.objs;
+        self.objs.par_iter().for_each(|obj| {
+            if let Err(e) = obj.scan_relocations(ctx, objs) {
+                log::error!(logger: ctx, "{e}");
             }
         });
     }
@@ -580,18 +581,21 @@ impl<'a> Linker<'a> {
                 || ctx.string_pool.get(),
                 |strings, obj| {
                     for (i, symbol) in obj.coff_symbols.iter() {
-                        if symbol.is_local() {
+                        if symbol.is_local() || symbol.is_undefined() {
                             continue;
                         }
 
-                        let (_, external_ref) = obj.external_symbol_ref(ctx, i).unwrap();
+                        let section = &obj.sections[symbol.section().unwrap()];
+                        // If the section is discarded, this means that the
+                        // imported symbol is unreferenced by non-import objects.
+                        if section.discarded.load(Ordering::Relaxed) {
+                            continue;
+                        }
 
-                        // There should not be any potential for deadlocks when
-                        // resolving the DLL name but acquire a read lock initially
-                        // for resolving the name then upgrade it to a write lock
-                        // if successfully resolved
+                        let external_ref = obj.symbols.external_symbol_ref(ctx, i).unwrap();
+
                         let global = external_ref.upgradable_read();
-                        if global.owner != obj.id || !(global.imported && global.dfr) {
+                        if global.owner != obj.id || !global.is_dfr_import() {
                             continue;
                         }
 
