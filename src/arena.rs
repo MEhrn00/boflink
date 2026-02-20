@@ -21,9 +21,10 @@
 //! should only acquire an arena when needed and keep it active until the end of
 //! its runtime.
 
-use std::{ffi::OsStr, marker::PhantomData, mem::ManuallyDrop, sync::Mutex};
+use std::{ffi::OsStr, marker::PhantomData, mem::ManuallyDrop};
 
 use bstr::BStr;
+use parking_lot::Mutex;
 
 #[repr(transparent)]
 pub struct TypedArena<T>(typed_arena::Arena<T>);
@@ -139,13 +140,7 @@ impl<T> ArenaPool<T> {
 
     pub fn get(&self) -> ArenaHandle<'_, T> {
         ArenaHandle {
-            inner: ManuallyDrop::new(
-                self.0
-                    .lock()
-                    .expect("ArenaPool Mutex poisoned")
-                    .pop()
-                    .unwrap_or_default(),
-            ),
+            inner: ManuallyDrop::new(self.0.lock().pop().unwrap_or_default()),
             pool: self,
         }
     }
@@ -209,7 +204,7 @@ impl<'a> ArenaHandle<'a, u8> {
 
 impl<T> Drop for ArenaHandle<'_, T> {
     fn drop(&mut self) {
-        let mut pool = self.pool.0.lock().expect("ArenaPool Mutex poisoned");
+        let mut pool = self.pool.0.lock();
         pool.push(unsafe { ManuallyDrop::take(&mut self.inner) });
     }
 }

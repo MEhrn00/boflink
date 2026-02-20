@@ -31,7 +31,9 @@ use crate::{
     inputs::{InputFile, InputFileSource},
     make_error,
     outputs::OutputSectionId,
-    symbols::{ExternalRef, GlobalSymbol, Symbol, SymbolId, SymbolPriority},
+    symbols::{
+        ExternalRef, GlobalSymbol, Symbol, SymbolId, SymbolPriority, is_possible_user_identifier,
+    },
 };
 
 /// Id for an object file. This is a tagged index using a `u32`.
@@ -93,7 +95,7 @@ pub struct ObjectFile<'a> {
     /// simplifies things here too. Symbols used 1-based indicies for the section
     /// number of the definition and auxiliary section symbols use 1-based indicies
     /// for associative sections.
-    pub sections: Vec<Option<InputSection<'a>>>,
+    pub sections: InputSectionTable<'a>,
 
     /// Raw COFF symbol table.
     ///
@@ -107,7 +109,7 @@ pub struct ObjectFile<'a> {
     ///
     /// The symbols in this vec can be indexed using the original symbol indicies
     /// from the COFF.
-    pub symbols: Vec<Option<InputSymbol<'a>>>,
+    pub symbols: ObjectFileSymbolTable<'a>,
 
     /// Indicies of COMDAT leader symbols.
     ///
@@ -183,8 +185,8 @@ impl<'a> ObjectFile<'a> {
             characteristics: CoffFlags::empty(),
             coff_sections: Default::default(),
             coff_symbols: Default::default(),
-            symbols: Vec::new(),
-            sections: Vec::new(),
+            symbols: ObjectFileSymbolTable::new(),
+            sections: InputSectionTable::new(),
             addrsig_index: SectionIndex(0),
             feat_flags: Feat00Flags::empty(),
             comdat_leaders: Vec::new(),
@@ -281,12 +283,12 @@ impl<'a> ObjectFile<'a> {
                 }
             }
 
-            let entry = &mut self.symbols[i.0];
+            let entry = self.symbols.symbol_entry_mut(i).unwrap();
             debug_assert!(
                 entry.is_none(),
                 "ObjectFile::initialize_externals() found existing entry at {i}"
             );
-            let _ = entry.insert(InputSymbol::External(ExternalSymbol {
+            let _ = entry.insert(ObjectFileSymbol::External(ExternalSymbol {
                 id: ctx.symbol_map.get_or_create_default(BStr::new(name)),
                 weak_default,
                 hidden,
@@ -385,7 +387,7 @@ impl<'a> ObjectFile<'a> {
                 comdats += 1;
             }
 
-            let entry = &mut self.sections[i.0];
+            let entry = self.sections.section_entry_mut(i).unwrap();
             debug_assert!(
                 entry.is_none(),
                 "ObjectFile::initialize_sections() found existing entry at {i}"
@@ -397,7 +399,6 @@ impl<'a> ObjectFile<'a> {
                 checksum: 0,
                 characteristics,
                 coff_relocs: relocs.into(),
-                index: i,
                 followers: Vec::new(),
                 discarded: AtomicBool::new(false),
                 gc_visited: AtomicBool::new(false),
@@ -446,12 +447,12 @@ impl<'a> ObjectFile<'a> {
             }
 
             if symbol.is_local() {
-                let entry = &mut self.symbols[i.0];
+                let entry = self.symbols.symbol_entry_mut(i).unwrap();
                 debug_assert!(
                     entry.is_none(),
                     "ObjectFile::initialize_locals() found existing local symbol entry at {i}"
                 );
-                let _ = entry.insert(InputSymbol::Local(LocalSymbol {
+                let _ = entry.insert(ObjectFileSymbol::Local(LocalSymbol {
                     name,
                     value: symbol.value(),
                     section_number: symbol.section_number(),
@@ -465,9 +466,14 @@ impl<'a> ObjectFile<'a> {
             };
 
             let section = {
-                let section = self.sections.get_mut(section_index.0).ok_or_else(|| {
-                    make_error!("symbol at index {i}: section number is invalid {section_index}",)
-                })?;
+                let section = self
+                    .sections
+                    .section_entry_mut(section_index)
+                    .ok_or_else(|| {
+                        make_error!(
+                            "symbol at index {i}: section number is invalid {section_index}",
+                        )
+                    })?;
 
                 let Some(section) = section else {
                     continue;
@@ -482,6 +488,8 @@ impl<'a> ObjectFile<'a> {
                     .aux_section(i)
                     .with_context(|| format!("symbol at index {i}"))?;
 
+                section.checksum = aux_section.check_sum.get(object::LittleEndian);
+
                 // Overwrite section length using the auxiliary symbol length
                 // if non-zero. GCC will insert padding at the end of sections
                 // that contain initialized data. The length field here reflects
@@ -490,16 +498,16 @@ impl<'a> ObjectFile<'a> {
                 if length > 0 {
                     section.length = length;
                 }
-                section.checksum = aux_section.check_sum.get(object::LittleEndian);
 
                 if aux_section.selection == pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE {
                     // Add the associative section to the parent's adjacency list
                     let number = aux_section.number.get(object::LittleEndian);
                     let parent_index = SectionIndex(number as usize);
-                    let parent = self.sections
-                        .get_mut(parent_index.0)
-                        .and_then(|section| section.as_mut())
-                        .with_context(|| format!("auxiliary section symbol at index {i} associative section is invalid"))?;
+                    let parent = self.sections.section_mut(parent_index).with_context(|| {
+                        format!(
+                            "auxiliary section symbol at index {i} associative section is invalid"
+                        )
+                    })?;
                     parent.followers.push(section_index);
                 } else if aux_section.selection == pe::IMAGE_COMDAT_SELECT_EXACT_MATCH
                     && section.checksum == 0
@@ -521,10 +529,7 @@ impl<'a> ObjectFile<'a> {
                 let selection_entry = &mut comdat_sels[section_index.0];
                 if *selection_entry > 0 {
                     let selection = std::mem::replace(selection_entry, 0);
-                    if let Some(external) = self.symbols[i.0]
-                        .as_mut()
-                        .and_then(|symbol| symbol.external_mut())
-                    {
+                    if let Some(external) = self.symbols.external_symbol_mut(i) {
                         external.selection = selection;
                         self.comdat_leaders.push(i);
                     }
@@ -542,18 +547,20 @@ impl<'a> ObjectFile<'a> {
                 continue;
             }
 
-            if let Some(section) = symbol.section().and_then(|index| self.section(index))
+            if let Some(section) = symbol
+                .section()
+                .and_then(|index| self.sections.section(index))
                 && section.discarded.load(Ordering::Relaxed)
             {
                 continue;
             }
 
-            let external_symbol = self.external_symbol(i).unwrap();
+            let (external_symbol, external_ref) =
+                self.symbols.external_symbol_ref2(ctx, i).unwrap();
             if external_symbol.hidden {
                 continue;
             }
 
-            let (_, external_ref) = self.external_symbol_ref(ctx, i).unwrap();
             let mut global = external_ref.write();
 
             // Check if our copy of the symbol should be become the new global
@@ -600,14 +607,14 @@ impl<'a> ObjectFile<'a> {
                 continue;
             }
 
-            let external = self.external_symbol(i).unwrap();
-            if external.hidden {
+            let (external_symbol, external_ref) =
+                self.symbols.external_symbol_ref2(ctx, i).unwrap();
+            if external_symbol.hidden {
                 continue;
             }
 
-            let (_, external_ref) = self.external_symbol_ref(ctx, i).unwrap();
             let global = external_ref.read();
-            if global.traced {
+            if global.is_traced() {
                 if !symbol.is_undefined() {
                     log::info!(logger: ctx, "{}: definition of {}", self.source(), ctx.demangle(global.name, self.machine));
                 } else if symbol.is_weak() {
@@ -625,14 +632,11 @@ impl<'a> ObjectFile<'a> {
 
             let symbol_is_needed = symbol.is_undefined() || symbol.is_common();
             let should_visit = |obj: &ArenaRef<'a, ObjectFile>| {
-                obj.live
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .map(|live| !live)
-                    .unwrap_or(false)
+                !(obj.live.load(Ordering::Relaxed) || obj.live.swap(true, Ordering::Relaxed))
             };
 
             if symbol_is_needed && should_visit(owner) {
-                if global.traced {
+                if global.is_traced() {
                     log::info!(logger: ctx, "{}: needs {} from {}", self.source(), ctx.demangle(global.name, self.machine), owner.source());
                 }
 
@@ -651,9 +655,9 @@ impl<'a> ObjectFile<'a> {
         assert!(self.live.load(Ordering::Relaxed));
 
         for &i in self.comdat_leaders.iter() {
-            let Some((external, external_ref)) = self.external_symbol_ref(ctx, i) else {
+            let Some((external, external_ref)) = self.symbols.external_symbol_ref2(ctx, i) else {
                 // Global COMDATs should always have an external reference.
-                assert!(!self.coff_symbol(i).unwrap().is_global());
+                assert!(!self.coff_symbols.symbol(i).unwrap().is_global());
                 continue;
             };
 
@@ -665,7 +669,7 @@ impl<'a> ObjectFile<'a> {
                 continue;
             }
 
-            let symbol = self.coff_symbol(i).unwrap();
+            let symbol = self.coff_symbols.symbol(i).unwrap();
             let mut global = external_ref.write();
 
             let should_claim = |global: &GlobalSymbol| {
@@ -674,10 +678,10 @@ impl<'a> ObjectFile<'a> {
                     return true;
                 }
 
-                let owner_symbol = owner.coff_symbol(global.index).unwrap();
-                let section = self.section(symbol.section().unwrap()).unwrap();
+                let owner_symbol = owner.coff_symbols.symbol(global.index).unwrap();
+                let section = &self.sections[symbol.section().unwrap()];
 
-                let owner_section = owner.section(owner_symbol.section().unwrap()).unwrap();
+                let owner_section = &owner.sections[owner_symbol.section().unwrap()];
                 match section.length.cmp(&owner_section.length) {
                     // Choose the first definition if they are the same size
                     std::cmp::Ordering::Equal => self.id < owner.id,
@@ -709,21 +713,21 @@ impl<'a> ObjectFile<'a> {
 
         let mut visited = FixedDenseBitSet::new_empty(self.sections.len());
         for &i in self.comdat_leaders.iter() {
-            let Some((_, external_ref)) = self.external_symbol_ref(ctx, i) else {
+            let Some(external_ref) = self.symbols.external_symbol_ref(ctx, i) else {
                 continue;
             };
 
             // Set the discard status
             let discard = external_ref.read().owner != self.id;
-            let symbol = self.coff_symbol(i).unwrap();
+            let symbol = self.coff_symbols.symbol(i).unwrap();
             let section_index = symbol.section().unwrap();
 
             // Do a DFS traversal over followers to update discard status
             let mut stack = vec![section_index];
             while let Some(section_index) = stack.pop() {
-                let section = self.sections[section_index.0].as_mut().unwrap();
-                if !visited.contains(section.index.0) || should_visit(section, discard) {
-                    visited.insert(section.index.0);
+                let section = &mut self.sections[section_index];
+                if !visited.contains(section_index.0) || should_visit(section, discard) {
+                    visited.insert(section_index.0);
                     *section.discarded.get_mut() = discard;
                     stack.extend(&section.followers);
                 }
@@ -747,7 +751,7 @@ impl<'a> ObjectFile<'a> {
                 continue;
             }
 
-            let (external, external_ref) = self.external_symbol_ref(ctx, i).unwrap();
+            let (external, external_ref) = self.symbols.external_symbol_ref2(ctx, i).unwrap();
 
             // Handle COMDAT selections
             if external.selection != 0 {
@@ -765,15 +769,15 @@ impl<'a> ObjectFile<'a> {
                 let multiply_defined = match external.selection {
                     pe::IMAGE_COMDAT_SELECT_NODUPLICATES => global.owner != self.id,
                     pe::IMAGE_COMDAT_SELECT_SAME_SIZE => {
-                        let section = self.section(symbol.section().unwrap()).unwrap();
+                        let section = &self.sections[symbol.section().unwrap()];
                         let owner = &objs[global.owner.index()];
-                        let owner_section = owner.section(global.section().unwrap()).unwrap();
+                        let owner_section = &owner.sections[global.section().unwrap()];
                         section.length != owner_section.length
                     }
                     pe::IMAGE_COMDAT_SELECT_EXACT_MATCH => {
-                        let section = self.section(symbol.section().unwrap()).unwrap();
+                        let section = &self.sections[symbol.section().unwrap()];
                         let owner = &objs[global.owner.index()];
-                        let owner_section = owner.section(global.section().unwrap()).unwrap();
+                        let owner_section = &owner.sections[global.section().unwrap()];
 
                         section.length == owner_section.length
                             && section.checksum == owner_section.checksum
@@ -799,7 +803,7 @@ impl<'a> ObjectFile<'a> {
                         this = self.source(),
                     ));
                 }
-            } else if let Some(section) = self.section(symbol.section().unwrap())
+            } else if let Some(section) = self.sections.section(symbol.section().unwrap())
                 && section.discarded.load(Ordering::Relaxed)
             {
                 // Symbol is defined in a section discarded due to COMDAT deduplication.
@@ -822,6 +826,77 @@ impl<'a> ObjectFile<'a> {
         }
 
         errors
+    }
+
+    pub fn scan_relocations(
+        &self,
+        ctx: &LinkContext<'a>,
+        objs: &[ArenaRef<'a, ObjectFile<'a>>],
+    ) -> crate::Result<()> {
+        for (i, _) in self.sections.enumerate() {
+            self.scan_section_relocations(ctx, i, objs)?;
+        }
+
+        Ok(())
+    }
+
+    fn scan_section_relocations(
+        &self,
+        ctx: &LinkContext<'a>,
+        index: SectionIndex,
+        objs: &[ArenaRef<'a, ObjectFile<'a>>],
+    ) -> crate::Result<()> {
+        let section = &self.sections[index];
+        if section.discarded.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        for reloc in section.coff_relocs.iter() {
+            let target_symbol = self.coff_symbols.symbol(reloc.symbol()).with_context(|| {
+                format!(
+                    "{}: relocation at '{}+{:#x}' references invalid symbol",
+                    self.source(),
+                    section.name,
+                    reloc.virtual_address.get(object::LittleEndian)
+                )
+            })?;
+
+            if target_symbol.is_local() {
+                continue;
+            }
+
+            let external_ref = self
+                .symbols
+                .external_symbol_ref(ctx, reloc.symbol())
+                .unwrap();
+            let global = external_ref.read();
+            if global.is_imported() {
+                let owner = &objs[global.owner.index()];
+                let section_index = global.section().unwrap();
+                let section = &owner.sections[section_index];
+
+                let mark_live = |section: &InputSection| -> bool {
+                    section
+                        .discarded
+                        .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
+                        .unwrap_or(false)
+                };
+
+                // Mark the section containing the import definition as live.
+                // If it was newly marked as live, scan its relocations
+                if mark_live(section) {
+                    owner.scan_section_relocations(ctx, section_index, objs)?;
+                }
+
+                continue;
+            }
+
+            if global.is_undefined() {
+                // TODO: Report undefined symbols
+            }
+        }
+
+        Ok(())
     }
 
     /// If this is an object file with import information, this will resolve the
@@ -851,14 +926,9 @@ impl<'a> ObjectFile<'a> {
         let mut stack = vec![self.id];
         while let Some(obj) = stack.pop() {
             let obj = &objs[obj.index()];
-            if !obj.has_import_data {
-                // Searched into a COFF without import data. Assume the search
-                // failed.
-                return None;
-            }
-
-            // If visiting an object file already visited, assume the search failed.
-            if !visited.insert(obj.id) {
+            // If visiting an object file without import data or that has already
+            // been visited before, assume the search failed.
+            if !obj.has_import_data || !visited.insert(obj.id) {
                 return None;
             }
 
@@ -867,12 +937,12 @@ impl<'a> ObjectFile<'a> {
                     continue;
                 }
 
-                let (_, external_ref) = obj.external_symbol_ref(ctx, i).unwrap();
+                let external_ref = obj.symbols.external_symbol_ref(ctx, i).unwrap();
                 if symbol.is_undefined() {
                     let global = external_ref.read();
                     stack.push(global.owner);
                 } else if let Some(section_index) = symbol.section() {
-                    let section = obj.section(section_index).unwrap();
+                    let section = &obj.sections[section_index];
                     if section.name == b".idata$7"
                         && section.characteristics.contains(
                             SectionFlags::CntInitializedData
@@ -901,76 +971,50 @@ impl<'a> ObjectFile<'a> {
 
         None
     }
-
-    pub fn section(&self, index: SectionIndex) -> Option<&InputSection<'a>> {
-        self.sections
-            .get(index.0)
-            .and_then(|section| section.as_ref())
-    }
-
-    pub fn section_mut(&mut self, index: SectionIndex) -> Option<&mut InputSection<'a>> {
-        self.sections
-            .get_mut(index.0)
-            .and_then(|section| section.as_mut())
-    }
-
-    pub fn coff_symbol(&self, index: SymbolIndex) -> Option<CoffSymbolRef<'a>> {
-        self.coff_symbols.symbol(index).ok()
-    }
-
-    pub fn symbol(&self, index: SymbolIndex) -> Option<&InputSymbol<'a>> {
-        self.symbols.get(index.0).and_then(|symbol| symbol.as_ref())
-    }
-
-    pub fn symbol_mut(&mut self, index: SymbolIndex) -> Option<&mut InputSymbol<'a>> {
-        self.symbols
-            .get_mut(index.0)
-            .and_then(|symbol| symbol.as_mut())
-    }
-
-    pub fn local_symbol(&self, index: SymbolIndex) -> Option<&LocalSymbol<'a>> {
-        self.symbol(index).and_then(|symbol| symbol.local())
-    }
-
-    pub fn local_symbol_mut(&mut self, index: SymbolIndex) -> Option<&mut LocalSymbol<'a>> {
-        self.symbol_mut(index).and_then(|symbol| symbol.local_mut())
-    }
-
-    pub fn external_symbol(&self, index: SymbolIndex) -> Option<&ExternalSymbol> {
-        self.symbol(index).and_then(|symbol| symbol.external())
-    }
-
-    pub fn external_symbol_mut(&mut self, index: SymbolIndex) -> Option<&mut ExternalSymbol> {
-        self.symbol_mut(index)
-            .and_then(|symbol| symbol.external_mut())
-    }
-
-    pub fn external_symbol_ref<'ctx>(
-        &self,
-        ctx: &'ctx LinkContext<'a>,
-        index: SymbolIndex,
-    ) -> Option<(&ExternalSymbol, ExternalRef<'ctx, 'a>)> {
-        if let Some(symbol) = self.external_symbol(index) {
-            let id = symbol.id;
-            ctx.symbol_map.get(id).map(|external| (symbol, external))
-        } else {
-            None
-        }
-    }
 }
 
+/// An input section initialized from an object file.
 #[derive(Debug)]
 pub struct InputSection<'a> {
+    /// The name of the section
     pub name: &'a BStr,
+
+    /// The section data.
+    ///
+    /// This will be empty if the section has no data or is for uninitialized
+    /// data.
     pub data: &'a [u8],
-    pub checksum: u32,
+
+    /// The length of the section from the aux section definition symbol.
+    ///
+    /// This reflects the true length of the section without padding and for
+    /// holding uninitialized data.
     pub length: u32,
+
+    /// The section data checksum.
+    ///
+    /// Used for COMDAT deduplication
+    pub checksum: u32,
+
+    /// The section flags
     pub characteristics: SectionFlags,
-    pub index: SectionIndex,
+
+    /// The relocations contained in this section.
     pub coff_relocs: Cow<'a, [object::pe::ImageRelocation]>,
+
+    /// Adjacency list of associative COMDAT sections.
+    ///
+    /// This is a linked list of section indicies. The head is the COMDAT with
+    /// the leader and the followers are associated sections in the chain.
     pub followers: Vec<SectionIndex>,
+
+    /// If this section was discarded due to COMDAT deduplication.
     pub discarded: AtomicBool,
+
+    /// Visit status for GC sections
     pub gc_visited: AtomicBool,
+
+    /// ID of the output section this section is mapped to.
     pub output: OutputSectionId,
 }
 
@@ -982,7 +1026,6 @@ impl<'a> std::default::Default for InputSection<'a> {
             checksum: 0,
             length: 0,
             characteristics: SectionFlags::empty(),
-            index: SectionIndex(0),
             coff_relocs: Default::default(),
             followers: Vec::new(),
             discarded: AtomicBool::new(false),
@@ -1002,9 +1045,199 @@ impl<'a> InputSection<'a> {
     pub fn compute_checksum(&mut self) {
         self.checksum = section_checksum(self.data);
     }
+
+    /// Returns `true` if this is a DWARF debug section
+    pub fn is_dwarf_debug(&self) -> bool {
+        self.characteristics.contains(
+            SectionFlags::CntInitializedData | SectionFlags::MemRead | SectionFlags::MemDiscardable,
+        ) && !self.data.is_empty()
+            && self.name.starts_with(b".debug_")
+    }
+
+    /// Returns `true` if this is a debug section with codeview debug information.
+    pub fn is_codeview(&self) -> bool {
+        let names = [b".debug$F", b".debug$P", b".debug$S", b".debug$T"];
+
+        self.characteristics.contains(
+            SectionFlags::CntInitializedData | SectionFlags::MemRead | SectionFlags::MemDiscardable,
+        ) && !self.data.is_empty()
+            && names.iter().any(|&n| n == self.name)
+    }
+
+    /// Returns `true` if this is a codeview or DWARF debug section
+    pub fn is_debug(&self) -> bool {
+        self.is_codeview() || self.is_dwarf_debug()
+    }
+
+    /// Returns `true` if this is a metadata section with import information.
+    pub fn is_import_metadata(&self) -> bool {
+        let names = [
+            b".idata$2",
+            b".idata$3",
+            b".idata$4",
+            b".idata$5",
+            b".idata$6",
+            b".idata$7",
+        ];
+
+        self.characteristics
+            .contains(SectionFlags::CntInitializedData | SectionFlags::MemRead)
+            && !self.data.is_empty()
+            && names.iter().any(|&n| n == self.name)
+    }
+
+    /// Returns `true` if this section is an IAT entry for an imported symbol.
+    pub fn is_iat_entry(&self) -> bool {
+        self.characteristics
+            .contains(SectionFlags::CntInitializedData | SectionFlags::MemRead)
+            && !self.data.is_empty()
+            && self.name == ".idata$5"
+    }
+
+    /// Searches for the defined symbol that is within the given address.
+    ///
+    /// This will exclude compiler generated locals and section symbols.
+    pub fn find_symbol_definition(
+        &self,
+        this_index: SectionIndex,
+        address: u32,
+        symtab: &SymbolTable<'a>,
+    ) -> Option<(SymbolIndex, CoffSymbolRef<'a>)> {
+        let mut candidate: Option<(SymbolIndex, CoffSymbolRef<'a>)> = None;
+
+        for (i, symbol) in symtab.iter() {
+            if symbol
+                .section()
+                .is_none_or(|section_index| section_index != this_index)
+                || !symbol.is_relocatable()
+                || symbol.is_label()
+                || symbol.has_aux_function()
+            {
+                continue;
+            }
+
+            if symbol.value() > address {
+                continue;
+            }
+
+            let name = symbol.name_bytes(symtab.strings()).unwrap();
+            if !is_possible_user_identifier(name) {
+                continue;
+            }
+
+            if let Some(candidate) = candidate.as_mut() {
+                let candidate_symbol = candidate.1;
+                if candidate_symbol.value() < symbol.value() {
+                    *candidate = (i, symbol);
+                }
+            } else {
+                candidate = Some((i, symbol));
+            }
+        }
+
+        candidate
+    }
 }
 
-/// Input symbols for an object file.
+fn section_checksum(data: &[u8]) -> u32 {
+    let mut h = crc32fast::Hasher::new_with_initial(u32::MAX);
+    h.update(data);
+    !h.finalize()
+}
+
+#[derive(Debug, Default)]
+#[repr(transparent)]
+pub struct InputSectionTable<'a>(Vec<Option<InputSection<'a>>>);
+
+impl<'a> InputSectionTable<'a> {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn resize_with(&mut self, new_len: usize, f: impl FnMut() -> Option<InputSection<'a>>) {
+        self.0.resize_with(new_len, f);
+    }
+
+    pub fn push(&mut self, section: InputSection<'a>) -> SectionIndex {
+        let index = SectionIndex(self.0.len());
+        self.0.push(Some(section));
+        index
+    }
+
+    pub fn section_entry(&self, index: SectionIndex) -> Option<&Option<InputSection<'a>>> {
+        self.0.get(index.0)
+    }
+
+    pub fn section(&self, index: SectionIndex) -> Option<&InputSection<'a>> {
+        self.section_entry(index).and_then(|entry| entry.as_ref())
+    }
+
+    pub fn section_entry_mut(
+        &mut self,
+        index: SectionIndex,
+    ) -> Option<&mut Option<InputSection<'a>>> {
+        self.0.get_mut(index.0)
+    }
+
+    pub fn section_mut(&mut self, index: SectionIndex) -> Option<&mut InputSection<'a>> {
+        self.section_entry_mut(index)
+            .and_then(|entry| entry.as_mut())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &InputSection<'a>> {
+        self.0.iter().filter_map(|entry| entry.as_ref())
+    }
+
+    pub fn iter_entries(&self) -> impl Iterator<Item = &Option<InputSection<'a>>> {
+        self.0.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut InputSection<'a>> {
+        self.0.iter_mut().filter_map(|entry| entry.as_mut())
+    }
+
+    pub fn iter_entries_mut(&mut self) -> impl Iterator<Item = &mut Option<InputSection<'a>>> {
+        self.0.iter_mut()
+    }
+
+    pub fn enumerate(&self) -> impl Iterator<Item = (SectionIndex, &InputSection<'a>)> {
+        self.0
+            .iter()
+            .enumerate()
+            .filter_map(|(i, section)| section.as_ref().map(|section| (SectionIndex(i), section)))
+    }
+
+    pub fn enumerate_mut(&mut self) -> impl Iterator<Item = (SectionIndex, &mut InputSection<'a>)> {
+        self.0
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, section)| section.as_mut().map(|section| (SectionIndex(i), section)))
+    }
+}
+
+impl<'a> std::ops::Index<SectionIndex> for InputSectionTable<'a> {
+    type Output = InputSection<'a>;
+
+    fn index(&self, index: SectionIndex) -> &Self::Output {
+        self.section(index).unwrap()
+    }
+}
+
+impl<'a> std::ops::IndexMut<SectionIndex> for InputSectionTable<'a> {
+    fn index_mut(&mut self, index: SectionIndex) -> &mut Self::Output {
+        self.section_mut(index).unwrap()
+    }
+}
+
+/// Input symbols from an object file.
 ///
 /// An object file contains two types of input symbols. An external or a local.
 /// This is slightly different than the symbol storage class scope
@@ -1013,8 +1246,8 @@ impl<'a> InputSection<'a> {
 /// owned by an object file or by the global symbol map. A symbol owned by the
 /// symbol map has shared ownership between 1 or more object files. In most instances,
 /// this will follow the storage class scope.
-#[derive(Debug)]
-pub enum InputSymbol<'a> {
+#[derive(Debug, Clone)]
+pub enum ObjectFileSymbol<'a> {
     /// Symbol is owned by the object file.
     Local(LocalSymbol<'a>),
 
@@ -1023,7 +1256,7 @@ pub enum InputSymbol<'a> {
     External(ExternalSymbol),
 }
 
-impl<'a> InputSymbol<'a> {
+impl<'a> ObjectFileSymbol<'a> {
     pub fn local(&self) -> Option<&LocalSymbol<'a>> {
         if let Self::Local(symbol) = self {
             Some(symbol)
@@ -1058,7 +1291,7 @@ impl<'a> InputSymbol<'a> {
 }
 
 /// A symbol that is owned by an object file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LocalSymbol<'a> {
     pub name: &'a [u8],
     pub value: u32,
@@ -1133,8 +1366,133 @@ pub struct ExternalSymbol {
     pub hidden: bool,
 }
 
-fn section_checksum(data: &[u8]) -> u32 {
-    let mut h = crc32fast::Hasher::new_with_initial(u32::MAX);
-    h.update(data);
-    !h.finalize()
+#[derive(Debug, Default)]
+#[repr(transparent)]
+pub struct ObjectFileSymbolTable<'a>(Vec<Option<ObjectFileSymbol<'a>>>);
+
+impl<'a> ObjectFileSymbolTable<'a> {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn resize_with(&mut self, new_len: usize, f: impl FnMut() -> Option<ObjectFileSymbol<'a>>) {
+        self.0.resize_with(new_len, f);
+    }
+
+    pub fn symbol_entry(&self, index: SymbolIndex) -> Option<&Option<ObjectFileSymbol<'a>>> {
+        self.0.get(index.0)
+    }
+
+    pub fn symbol(&self, index: SymbolIndex) -> Option<&ObjectFileSymbol<'a>> {
+        self.symbol_entry(index).and_then(|entry| entry.as_ref())
+    }
+
+    pub fn symbol_entry_mut(
+        &mut self,
+        index: SymbolIndex,
+    ) -> Option<&mut Option<ObjectFileSymbol<'a>>> {
+        self.0.get_mut(index.0)
+    }
+
+    pub fn symbol_mut(&mut self, index: SymbolIndex) -> Option<&mut ObjectFileSymbol<'a>> {
+        self.symbol_entry_mut(index)
+            .and_then(|entry| entry.as_mut())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ObjectFileSymbol<'a>> {
+        self.0.iter().filter_map(|entry| entry.as_ref())
+    }
+
+    pub fn iter_entries(&self) -> impl Iterator<Item = &Option<ObjectFileSymbol<'a>>> {
+        self.0.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut ObjectFileSymbol<'a>> {
+        self.0.iter_mut().filter_map(|entry| entry.as_mut())
+    }
+
+    pub fn iter_entries_mut(&mut self) -> impl Iterator<Item = &mut Option<ObjectFileSymbol<'a>>> {
+        self.0.iter_mut()
+    }
+
+    pub fn enumerate(&self) -> impl Iterator<Item = (SymbolIndex, &ObjectFileSymbol<'a>)> {
+        self.0
+            .iter()
+            .enumerate()
+            .filter_map(|(i, symbol)| symbol.as_ref().map(|section| (SymbolIndex(i), section)))
+    }
+
+    pub fn enumerate_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (SymbolIndex, &mut ObjectFileSymbol<'a>)> {
+        self.0
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, symbol)| symbol.as_mut().map(|section| (SymbolIndex(i), section)))
+    }
+
+    pub fn local_symbol(&self, index: SymbolIndex) -> Option<&LocalSymbol<'a>> {
+        self.symbol(index).and_then(|symbol| symbol.local())
+    }
+
+    pub fn local_symbol_mut(&mut self, index: SymbolIndex) -> Option<&mut LocalSymbol<'a>> {
+        self.symbol_mut(index).and_then(|symbol| symbol.local_mut())
+    }
+
+    pub fn external_symbol(&self, index: SymbolIndex) -> Option<&ExternalSymbol> {
+        self.symbol(index).and_then(|symbol| symbol.external())
+    }
+
+    pub fn external_symbol_mut(&mut self, index: SymbolIndex) -> Option<&mut ExternalSymbol> {
+        self.symbol_mut(index)
+            .and_then(|symbol| symbol.external_mut())
+    }
+
+    pub fn external_symbol_ref<'ctx>(
+        &self,
+        ctx: &'ctx LinkContext<'a>,
+        index: SymbolIndex,
+    ) -> Option<ExternalRef<'ctx, 'a>> {
+        if let Some(symbol) = self.external_symbol(index) {
+            let id = symbol.id;
+            ctx.symbol_map.get(id)
+        } else {
+            None
+        }
+    }
+
+    pub fn external_symbol_ref2<'ctx>(
+        &self,
+        ctx: &'ctx LinkContext<'a>,
+        index: SymbolIndex,
+    ) -> Option<(&ExternalSymbol, ExternalRef<'ctx, 'a>)> {
+        if let Some(symbol) = self.external_symbol(index) {
+            let id = symbol.id;
+            ctx.symbol_map.get(id).map(|external| (symbol, external))
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a> std::ops::Index<SymbolIndex> for ObjectFileSymbolTable<'a> {
+    type Output = ObjectFileSymbol<'a>;
+
+    fn index(&self, index: SymbolIndex) -> &Self::Output {
+        self.symbol(index).unwrap()
+    }
+}
+
+impl<'a> std::ops::IndexMut<SymbolIndex> for ObjectFileSymbolTable<'a> {
+    fn index_mut(&mut self, index: SymbolIndex) -> &mut Self::Output {
+        self.symbol_mut(index).unwrap()
+    }
 }

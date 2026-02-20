@@ -1,21 +1,24 @@
 //! Symbol types and global symbol handling.
 //!
-//! The global symbol map is internally represented as a concurrent [`IndexMap`].
-//! The symbol map requires concurrent read/write access and can contain well over
-//! 12000 entries in a typical scenario.
+//! The global [`SymbolMap`] holds a [`GlobalSymbol`] entry which represents
+//! every globally scoped symbol from each input object file keyed by the symbol
+//! name. The symbol map requires low-overhead concurrent access for inserting
+//! and manipulating entries. In a typical scenario using GCC for linking, the
+//! symbol map will contain well over 12,000 entries.
 //!
-//! Since the symbol name strings can potentially be very long with C++/Rust name
-//! mangling, the goal here is to use
-//! [String interning](https://en.wikipedia.org/wiki/String_interning).
-//! A symbol name should only be added into the symbol map once at the beginning
-//! of the program and a unique [`SymbolId`] value returned is used for later
-//! referencing it. The advantage here is that this id value can be used as a
-//! more efficient reference to a symbol inside the map compared to using a
-//! hash table with symbol names. Doing a lookup by name in a hash table may
-//! cause hash collisions which requires a potentially expensive string comparison.
-//! Using an id value to get a symbol does not require handling collisions and
-//! is essentially the same has doing a constant-time array index.
+//! Since the names of symbols can potentially be very large due to Rust/C++
+//! name mangling, the symbol map will use [String interning](https://en.wikipedia.org/wiki/String_interning).
+//! The idea for this is that each object file will go through its list of globally
+//! visible symbols and do a regular map insertion using through the symbol
+//! name. The map insertion will return a [`SymbolId`] which is then used for
+//! referencing the symbol instead of using the symbol name. This symbol id is
+//! a unique 64 bit integer that is tied to the symbol name used for insertion.
+//! The advantage here is that accessing the symbol after it has been interned
+//! is a lot quicker on average since it used as an index into two vectors where
+//! as a general hash map lookup requires recomputing the hash value of the string
+//! and potentially doing string comparisons to resolve hash collisions.
 
+use bitflags::bitflags;
 use bstr::{BStr, ByteSlice};
 
 use object::{SectionIndex, SymbolIndex, pe};
@@ -143,19 +146,35 @@ pub trait Symbol {
     fn is_weak(&self) -> bool {
         self.storage_class() == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
     }
+
+    /// Returns `true` if this symbol is for a code label
+    fn is_label(&self) -> bool {
+        self.storage_class() == pe::IMAGE_SYM_CLASS_LABEL
+    }
 }
 
+/// A globally unique symbol in the symbol map.
+///
+/// This represents symbols defined and referenced by object files which are
+/// externally scoped. Each object file will contain a [`SymbolId`] that is
+/// used to reference the global version. The ID is an interned version of the
+/// symbol name used to create this symbol.
+/// Since symbol names may be rewritten in the output file, the `name` field
+/// should be used as the real symbol name for the output file.
+///
+/// The size of this structure should be kept small. There can be well over
+/// 12,000 symbols inside the symbol table at once in a normal linking scenario
+/// with GCC. Minimizing the size of this structure reduces the overhead needed
+/// when creating the initial symbol map.
 #[derive(Debug)]
 pub struct GlobalSymbol<'a> {
     pub name: &'a BStr,
+    pub index: SymbolIndex,
     pub value: u32,
     pub section_number: i32,
-    pub storage_class: u8,
     pub owner: ObjectFileId,
-    pub index: SymbolIndex,
-    pub traced: bool,
-    pub imported: bool,
-    pub dfr: bool,
+    pub storage_class: u8,
+    pub flags: GlobalSymbolFlags,
 }
 
 impl<'a> std::default::Default for GlobalSymbol<'a> {
@@ -167,11 +186,44 @@ impl<'a> std::default::Default for GlobalSymbol<'a> {
             storage_class: pe::IMAGE_SYM_CLASS_EXTERNAL,
             index: object::SymbolIndex(0),
             owner: ObjectFileId::new(0),
-            imported: false,
-            traced: false,
-            dfr: false,
+            flags: GlobalSymbolFlags::empty(),
         }
     }
+}
+
+impl<'a> GlobalSymbol<'a> {
+    pub fn is_traced(&self) -> bool {
+        self.flags.contains(GlobalSymbolFlags::Traced)
+    }
+
+    pub fn set_traced(&mut self, value: bool) {
+        self.flags.set(GlobalSymbolFlags::Traced, value);
+    }
+
+    pub fn is_imported(&self) -> bool {
+        self.flags.contains(GlobalSymbolFlags::Imported)
+    }
+
+    pub fn is_dfr_import(&self) -> bool {
+        self.flags
+            .contains(GlobalSymbolFlags::Imported | GlobalSymbolFlags::DFR)
+    }
+}
+
+bitflags! {
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+    #[repr(transparent)]
+    pub struct GlobalSymbolFlags: u8 {
+        /// This symbol is traced using `--trace-symbol`
+        const Traced = 1;
+
+        /// This symbol should use DFR
+        const DFR = 1 << 1;
+
+        /// This symbol is imported from a DLL
+        const Imported = 1 << 2;
+    }
+
 }
 
 impl<'a> GlobalSymbol<'a> {
@@ -276,15 +328,9 @@ impl SymbolPriority {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct SymbolId(Index);
-
-impl std::fmt::Debug for SymbolId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SymbolId").field(&self.0).finish()
-    }
-}
 
 pub type ExternalRef<'s, 'a> = concurrent_indexmap::Ref<'s, &'a BStr, RwLock<GlobalSymbol<'a>>>;
 
@@ -400,6 +446,19 @@ impl<'b, 'a> VacantMapEntry<'b, 'a> {
             })),
         }
     }
+}
+
+pub fn is_possible_user_identifier(name: impl AsRef<[u8]>) -> bool {
+    let name = name.as_ref();
+    if name.is_empty() {
+        return false;
+    }
+
+    if !(name[0] == b'_' || name[0] == b'?' || name[0].is_ascii_alphabetic()) {
+        return false;
+    }
+
+    true
 }
 
 /// Architecture specified mangling scheme for global symbol names.

@@ -232,17 +232,20 @@ bitflags! {
     }
 }
 
-const SECTION_FLAGS_ALIGN_SHIFT: usize = 0x14;
-const SECTION_FLAGS_ALIGN_MASK: u32 = 0xf;
+const SECTION_FLAGS_ALIGN_SHIFT: usize = 20;
 
 impl SectionFlags {
     /// Returns the alignment from the section alignment flags or 0 if unset
     pub const fn alignment(&self) -> usize {
-        let align = (self.bits() >> SECTION_FLAGS_ALIGN_SHIFT) & SECTION_FLAGS_ALIGN_MASK;
-        if align != 0 {
-            2usize.pow(align - 1)
+        if self.contains(SectionFlags::TypeNoPad) {
+            return 1;
+        }
+
+        let shift = (self.bits() >> SECTION_FLAGS_ALIGN_SHIFT) & 0xf;
+        if shift > 0 {
+            1usize << (shift - 1)
         } else {
-            align as usize
+            0usize
         }
     }
 
@@ -255,7 +258,7 @@ impl SectionFlags {
     /// Function will panic if an invalid alignment value is passed in.
     pub const fn set_alignment(&mut self, align: usize) {
         // Clear previous flags
-        self.0 &= !(SECTION_FLAGS_ALIGN_MASK << SECTION_FLAGS_ALIGN_SHIFT);
+        self.0 &= !pe::IMAGE_SCN_ALIGN_MASK;
 
         if align == 0 {
             return;

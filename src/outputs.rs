@@ -172,7 +172,7 @@ impl<'a> OutputSection<'a> {
             self.inputs.par_sort_unstable_by_key(|(objid, index)| {
                 let index = *index;
                 let obj = &objs[objid.index()];
-                let input_name = obj.section(index).unwrap().name;
+                let input_name = obj.sections.section(index).unwrap().name;
                 let ordering_name = input_name.strip_prefix(name).unwrap();
                 // $<name>, object order, section order
                 (ordering_name, objid.index(), index.0)
@@ -190,6 +190,7 @@ impl<'a> OutputSection<'a> {
             .par_iter()
             .map(|(objid, index)| {
                 objs[objid.index()]
+                    .sections
                     .section(*index)
                     .unwrap()
                     .characteristics
@@ -207,7 +208,7 @@ impl<'a> OutputSection<'a> {
     /// This is done sequentially
     pub fn compute_length(&mut self, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
         self.length = self.inputs.iter().fold(0, |length, (objid, index)| {
-            let section = objs[objid.index()].section(*index).unwrap();
+            let section = objs[objid.index()].sections.section(*index).unwrap();
             let align = section.characteristics.alignment().min(1);
             let address = length.next_multiple_of(align as u32);
             address + section.length
