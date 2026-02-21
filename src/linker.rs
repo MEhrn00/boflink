@@ -14,15 +14,15 @@ use rayon::iter::{
 use crate::{
     arena::{ArenaHandle, ArenaRef, TypedArena},
     cli::InputArg,
-    coff::{ImageFileMachine, SectionFlags},
+    coff::{ImageFileMachine, Section, Symbol},
     context::LinkContext,
     inputs::{InputsReader, InputsStore},
-    object::{InputSection, ObjectFile, ObjectFileId},
+    object::{ObjectFile, ObjectFileId},
     outputs::{
         OutputFile, OutputFileHeader, OutputSection, OutputSectionId, OutputSectionInputsMap,
         SectionKey, create_reserved_sections,
     },
-    symbols::{GlobalSymbol, GlobalSymbolFlags, Symbol, SymbolId},
+    symbols::{GlobalSymbol, GlobalSymbolFlags, SymbolId},
     timing::ScopedTimer,
 };
 
@@ -326,25 +326,24 @@ impl<'a> Linker<'a> {
                         }
                     }
 
-                    let mut characteristics = SectionFlags::CntUninitializedData
-                        | SectionFlags::MemRead
-                        | SectionFlags::MemWrite;
-
-                    characteristics
-                        .set_alignment(symbol.value().next_power_of_two().max(8192u32) as usize);
-
-                    let index = obj.sections.push(InputSection {
-                        name: BStr::new(b".bss"),
-                        characteristics,
-                        length: symbol.value(),
-                        ..Default::default()
-                    });
-
-                    // Only one symbol should acquire this lock so there should
-                    // not be any race condition due to double-locking
-                    let mut global = external_ref.write();
-                    global.value = 0;
-                    global.section_number = index.0 as i32;
+                    // let mut characteristics = SectionFlags::CntUninitializedData
+                    //     | SectionFlags::MemRead
+                    //     | SectionFlags::MemWrite;
+                    //
+                    // characteristics.set_alignment(symbol.value().next_power_of_two().min(8192u32));
+                    //
+                    // let index = obj.sections.push(InputSection {
+                    //     name: BStr::new(b".bss"),
+                    //     characteristics,
+                    //     length: symbol.value(),
+                    //     ..Default::default()
+                    // });
+                    //
+                    // // Only one symbol should acquire this lock so there should
+                    // // not be any race condition due to double-locking
+                    // let mut global = external_ref.write();
+                    // global.value = 0;
+                    // global.section_number = index.0 as i32;
                 }
             });
     }
@@ -388,7 +387,7 @@ impl<'a> Linker<'a> {
     /// get the general layout of where symbols will end up in the output file
     pub fn create_output_sections(&mut self, ctx: &mut LinkContext<'a>) {
         let _timer = ScopedTimer::msg("output section allocation");
-        self.output.sections = create_reserved_sections(ctx);
+        self.output.sections = create_reserved_sections();
         let reserved_sections_len = self.output.sections.len();
 
         // Partition object file input sections.
@@ -435,7 +434,6 @@ impl<'a> Linker<'a> {
 
         let ((mut new_outputs, join_mats), _) = rayon::join(
             || {
-                let arena = ctx.section_pool.get();
                 let mut section_map = HashMap::new();
                 let mut sections = Vec::new();
                 for (key, mut input_sections) in needed_outputs.into_iter().flatten() {
@@ -444,12 +442,7 @@ impl<'a> Linker<'a> {
                     let index = *section_map.entry(key).or_insert_with(|| {
                         let index = sections.len();
                         let id = OutputSectionId::new(reserved_sections_len + index);
-                        sections.push(arena.alloc_ref(OutputSection::new(
-                            id,
-                            BStr::new(name),
-                            flags,
-                            false,
-                        )));
+                        sections.push(OutputSection::new(id, BStr::new(name), flags, false));
                         index
                     });
                     sections[index].inputs.append(&mut input_sections);
@@ -528,9 +521,7 @@ impl<'a> Linker<'a> {
 
                     // Globals for IAT entries and code thunks get marked as
                     // imported
-                    if section.is_iat_entry()
-                        || section.characteristics.contains(SectionFlags::CntCode)
-                    {
+                    if section.contains_import_data() || section.contains_code() {
                         let external_ref = obj.symbols.external_symbol_ref(ctx, i).unwrap();
                         let mut global = external_ref.write();
                         if global.owner == obj.id {

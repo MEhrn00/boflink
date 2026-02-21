@@ -99,11 +99,10 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
     let timer = std::time::Instant::now();
 
     let string_pool = ArenaPool::new();
-    let section_pool = ArenaPool::new();
     let instore = InputsStore::default();
     let inputs = std::mem::take(&mut args.inputs);
     setup_options(&mut args.options);
-    let mut ctx = LinkContext::new(&args.options, &string_pool, &section_pool);
+    let mut ctx = LinkContext::new(&args.options, &string_pool);
 
     let mut linker = Linker::read_inputs(&ctx, &inputs, &instore)?;
     ctx.exclusive_check_errored();

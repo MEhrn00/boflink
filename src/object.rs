@@ -16,7 +16,7 @@ use std::{
 use bstr::BStr;
 use object::{
     ReadRef, SectionIndex, SymbolIndex, U16Bytes,
-    coff::{CoffFile, CoffHeader, SectionTable},
+    coff::{CoffFile, CoffHeader, ImageSymbol},
     pe,
 };
 use rayon::Scope;
@@ -26,16 +26,14 @@ use crate::{
     arena::ArenaRef,
     bit_set::FixedBitSet,
     coff::{
-        CoffFlags, CoffSymbolRef, Feat00Flags, ImageFileMachine, ImageRelocationRef, SectionFlags,
+        CoffFlags, Feat00Flags, ImageFileMachine, Relocation, Section, SectionTable, Symbol,
         SymbolTable,
     },
     context::LinkContext,
     inputs::{InputFile, InputFileSource},
     make_error,
     outputs::OutputSectionId,
-    symbols::{
-        ExternalRef, GlobalSymbol, Symbol, SymbolId, SymbolPriority, is_possible_user_identifier,
-    },
+    symbols::{ExternalRef, GlobalSymbol, SymbolId, SymbolPriority},
 };
 
 /// Id for an object file. This is a tagged index using a `u32`.
@@ -84,6 +82,14 @@ pub struct ObjectFile<'a> {
     /// - This object file was initialized from a short import file
     pub coff_sections: SectionTable<'a>,
 
+    /// Raw COFF symbol table.
+    ///
+    /// May be empty in a few scenarios:
+    /// - This is the internal object file for inserting linker-synthesized symbols
+    /// - There were no symbols inside the read object file
+    /// - This object file was initialized from a short import file
+    pub coff_symbols: SymbolTable<'a>,
+
     /// The initialized input sections from this object file that may contribute
     /// to output sections.
     ///
@@ -98,14 +104,6 @@ pub struct ObjectFile<'a> {
     /// number of the definition and auxiliary section symbols use 1-based indicies
     /// for associative sections.
     pub sections: InputSectionTable<'a>,
-
-    /// Raw COFF symbol table.
-    ///
-    /// May be empty in a few scenarios:
-    /// - This is the internal object file for inserting linker-synthesized symbols
-    /// - There were no symbols inside the read object file
-    /// - This object file was initialized from a short import file
-    pub coff_symbols: SymbolTable<'a>,
 
     /// Initialized input symbols.
     ///
@@ -261,7 +259,7 @@ impl<'a> ObjectFile<'a> {
             }
 
             let name = symbol
-                .name_bytes(strtab)
+                .name(strtab)
                 .with_context(|| format!("reading name for symbol {i}"))?;
 
             let mut weak_default = SymbolIndex(0);
@@ -311,14 +309,10 @@ impl<'a> ObjectFile<'a> {
 
         let mut comdats = 0;
         let strtab = self.coff_symbols.strings();
-        for (i, coff_section) in self.coff_sections.enumerate() {
-            let name = coff_section
+        for (i, section) in self.coff_sections.enumerate() {
+            let name = section
                 .name(strtab)
                 .with_context(|| format!("reading long name at section number {i}"))?;
-
-            let mut characteristics = SectionFlags::from_bits_retain(
-                coff_section.characteristics.get(object::LittleEndian),
-            );
 
             // addrsig section is not used yet but store it anyway
             if name == b".llvm_addrsig" {
@@ -334,58 +328,36 @@ impl<'a> ObjectFile<'a> {
             // Skip other metadata sections marked for removal during linking.
             // We keep sections marked as `IMAGE_SCN_MEM_DISCARDABLE`. Stripping
             // them is left for the COFF loader to do or the user to do manually
-            if characteristics.contains(SectionFlags::LnkRemove) {
+            if section.characteristics() & pe::IMAGE_SCN_LNK_REMOVE != 0 {
                 continue;
             }
 
-            // Debug sections are marked as mem discardable + readonly
-            let has_debug_flags = || {
-                characteristics.memory_flags()
-                    == SectionFlags::MemRead | SectionFlags::MemDiscardable
-            };
-
-            let is_dwarf = || name.starts_with(b".debug_") && has_debug_flags();
-
-            let is_codeview = || {
-                [b".debug$F", b".debug$S", b".debug$P", b".debug$T"]
-                    .iter()
-                    .any(|&n| n == name)
-                    && has_debug_flags()
+            let is_dwarf = || {
+                let flags = pe::IMAGE_SCN_MEM_READ | pe::IMAGE_SCN_MEM_DISCARDABLE;
+                name.starts_with(b".debug_") && section.characteristics() & flags == flags
             };
 
             // Skip debug sections if using `--strip-debug`
-            if ctx.options.strip_debug && (is_dwarf() || is_codeview()) {
+            if ctx.options.strip_debug && (is_dwarf() || section.is_codeview()) {
                 continue;
             }
 
-            let relocs = coff_section
+            let relocs = section
                 .coff_relocations(self.file.data)
                 .with_context(|| format!("reading relocations for section number {i}"))?;
 
-            let data = coff_section
+            let data = section
                 .coff_data(self.file.data)
                 .map_err(|_| make_error!("reading section data for section number {i}: PointerToRawData offset is not valid"))?;
-
-            // Symbol COFFs from legacy MinGW import libraries will inconsistently
-            // set the IMAGE_SCN_CNT_INITIALIZED_DATA flag for .idata sections.
-            // This flag needs to be set for these sections since it is used
-            // later
-            if name.starts_with(b".idata$")
-                && !data.is_empty()
-                && characteristics.contains(SectionFlags::MemRead | SectionFlags::MemWrite)
-            {
-                self.has_import_data = true;
-                characteristics |= SectionFlags::CntInitializedData;
-            }
 
             let mut length = data.len() as u32;
             // If the section contains uninitialized data, use the size_of_raw_data field
             // for the length
-            if characteristics.contains(SectionFlags::CntUninitializedData) {
-                length = coff_section.size_of_raw_data.get(object::LittleEndian);
+            if section.contains_uninitialized_data() {
+                length = section.size_of_raw_data();
             }
 
-            if characteristics.contains(SectionFlags::LnkComdat) {
+            if section.is_comdat() {
                 comdats += 1;
             }
 
@@ -394,14 +366,7 @@ impl<'a> ObjectFile<'a> {
                 entry.is_none(),
                 "ObjectFile::initialize_sections() found existing entry at {i}"
             );
-            let _ = entry.insert(InputSection {
-                name: BStr::new(name),
-                data,
-                length,
-                coff_relocs: relocs,
-                characteristics,
-                ..Default::default()
-            });
+            let _ = entry.insert(InputSection::new(name, data, length, section, relocs));
         }
 
         ctx.stats
@@ -432,7 +397,7 @@ impl<'a> ObjectFile<'a> {
             }
 
             let name = symbol
-                .name_bytes(strtab)
+                .name(strtab)
                 .with_context(|| format!("reading name for symbol {i}"))?;
 
             if symbol.is_absolute() {
@@ -451,7 +416,7 @@ impl<'a> ObjectFile<'a> {
                     "ObjectFile::initialize_locals() found existing local symbol entry at {i}"
                 );
                 let _ = entry.insert(ObjectFileSymbol::Local(LocalSymbol {
-                    name,
+                    name: BStr::new(name),
                     value: symbol.value(),
                     section_number: symbol.section_number(),
                     typ: symbol.typ(),
@@ -863,9 +828,8 @@ impl<'a> ObjectFile<'a> {
             return Ok(());
         }
 
-        for reloc in reloc_section.coff_relocs.iter() {
-            let reloc = ImageRelocationRef(reloc);
-            let coff_symbol = self.coff_symbols.symbol(reloc.symbol()).with_context(|| {
+        for reloc in reloc_section.relocs.iter() {
+            let symbol = self.coff_symbols.symbol(reloc.symbol()).with_context(|| {
                 format!(
                     "{}: relocation at '{}+{:#x}' references invalid symbol {}",
                     self.source(),
@@ -875,20 +839,29 @@ impl<'a> ObjectFile<'a> {
                 )
             })?;
 
-            let mut symbol_name =
-                BStr::new(coff_symbol.name_bytes(self.coff_symbols.strings()).unwrap());
+            let symbol_name = || {
+                if symbol.is_local() {
+                    self.symbols.local_symbol(reloc.symbol()).unwrap().name
+                } else {
+                    let external_ref = self
+                        .symbols
+                        .external_symbol_ref(ctx, reloc.symbol())
+                        .unwrap();
+                    external_ref.read().name
+                }
+            };
+
             let mut obj = self;
             let mut section_index = SectionIndex(0);
 
-            if coff_symbol.is_local() {
-                section_index = coff_symbol.section().unwrap();
+            if symbol.is_local() {
+                section_index = symbol.section().unwrap();
             } else {
                 let external_ref = self
                     .symbols
                     .external_symbol_ref(ctx, reloc.symbol())
                     .unwrap();
                 let global = external_ref.read();
-                symbol_name = global.name;
                 obj = &objs[global.owner.index()];
                 if let Some(index) = global.section() {
                     section_index = index;
@@ -958,13 +931,7 @@ impl<'a> ObjectFile<'a> {
                     stack.push(global.owner);
                 } else if let Some(section_index) = symbol.section() {
                     let section = &obj.sections[section_index];
-                    if section.name == b".idata$7"
-                        && section.characteristics.contains(
-                            SectionFlags::CntInitializedData
-                                | SectionFlags::MemRead
-                                | SectionFlags::MemWrite,
-                        )
-                    {
+                    if section.name == b".idata$7" && !section.data.is_empty() {
                         let mut name = section.data;
                         let nullbyte = section.data.iter().position(|&b| b == 0);
                         if let Some(nullbyte) = nullbyte {
@@ -1034,15 +1001,6 @@ pub struct InputSection<'a> {
     /// Used for COMDAT deduplication
     pub checksum: u32,
 
-    /// The section flags
-    pub characteristics: SectionFlags,
-
-    /// Virtual address of the section after rebasing
-    pub virtual_address: AtomicU32,
-
-    /// The relocations contained in this section.
-    pub coff_relocs: &'a [object::pe::ImageRelocation],
-
     /// Adjacency list of associative COMDAT sections.
     ///
     /// This is a linked list of section indicies. The head is the COMDAT with
@@ -1060,30 +1018,38 @@ pub struct InputSection<'a> {
 
     /// ID of the output section this section is mapped to.
     pub output: OutputSectionId,
-}
 
-impl<'a> std::default::Default for InputSection<'a> {
-    fn default() -> Self {
-        Self {
-            name: Default::default(),
-            data: Default::default(),
-            checksum: 0,
-            length: 0,
-            virtual_address: AtomicU32::new(0),
-            characteristics: SectionFlags::empty(),
-            coff_relocs: Default::default(),
-            followers: Vec::new(),
-            discarded: AtomicBool::new(false),
-            gc_visited: AtomicBool::new(false),
-            output: OutputSectionId::new(0),
-        }
-    }
+    /// Virtual address of the section after rebasing
+    pub virtual_address: AtomicU32,
+
+    /// The COFF section header where this section is from.
+    pub header: &'a pe::ImageSectionHeader,
+
+    /// The relocations contained in this section.
+    pub relocs: &'a [object::pe::ImageRelocation],
 }
 
 impl<'a> InputSection<'a> {
-    /// Returns `true` if this is a COMDAT section
-    pub fn is_comdat(&self) -> bool {
-        self.characteristics.contains(SectionFlags::LnkComdat)
+    pub fn new(
+        name: &'a [u8],
+        data: &'a [u8],
+        length: u32,
+        header: &'a pe::ImageSectionHeader,
+        relocs: &'a [object::pe::ImageRelocation],
+    ) -> Self {
+        Self {
+            name: BStr::new(name),
+            data,
+            length,
+            checksum: 0,
+            followers: Vec::new(),
+            discarded: AtomicBool::new(false),
+            gc_visited: AtomicBool::new(false),
+            output: OutputSectionId::Null,
+            virtual_address: AtomicU32::new(0),
+            header,
+            relocs,
+        }
     }
 
     /// Returns `true` if this section is discarded.
@@ -1116,105 +1082,22 @@ impl<'a> InputSection<'a> {
         !(!self.discarded.load(Ordering::Relaxed) || !self.discarded.swap(false, Ordering::Relaxed))
     }
 
-    /// Computes and updates the section data checksum field
     pub fn compute_checksum(&mut self) {
-        // Section checksum is JamCRC with an init value of -1
-        // https://github.com/llvm/llvm-project/commit/6ddc636862095a3d6f1b02ea034a353c19fff328
-        let mut h = crc32fast::Hasher::new_with_initial(u32::MAX);
-        h.update(self.data);
-        self.checksum = !h.finalize();
+        self.checksum = crate::coff::section::compute_checksum(self.data);
+    }
+}
+
+impl<'a> Section for InputSection<'a> {
+    fn name_bytes(&self) -> &[u8] {
+        &self.name
     }
 
-    /// Returns `true` if this is a DWARF debug section
-    pub fn is_dwarf_debug(&self) -> bool {
-        self.characteristics.contains(
-            SectionFlags::CntInitializedData | SectionFlags::MemRead | SectionFlags::MemDiscardable,
-        ) && !self.data.is_empty()
-            && self.name.starts_with(b".debug_")
+    fn size_of_raw_data(&self) -> u32 {
+        self.length
     }
 
-    /// Returns `true` if this is a debug section with codeview debug information.
-    pub fn is_codeview(&self) -> bool {
-        let names = [b".debug$F", b".debug$P", b".debug$S", b".debug$T"];
-
-        self.characteristics.contains(
-            SectionFlags::CntInitializedData | SectionFlags::MemRead | SectionFlags::MemDiscardable,
-        ) && !self.data.is_empty()
-            && names.iter().any(|&n| n == self.name)
-    }
-
-    /// Returns `true` if this is a codeview or DWARF debug section
-    pub fn is_debug(&self) -> bool {
-        self.is_codeview() || self.is_dwarf_debug()
-    }
-
-    /// Returns `true` if this is a metadata section with import information.
-    pub fn is_import_metadata(&self) -> bool {
-        let names = [
-            b".idata$2",
-            b".idata$3",
-            b".idata$4",
-            b".idata$5",
-            b".idata$6",
-            b".idata$7",
-        ];
-
-        self.characteristics
-            .contains(SectionFlags::CntInitializedData | SectionFlags::MemRead)
-            && !self.data.is_empty()
-            && names.iter().any(|&n| n == self.name)
-    }
-
-    /// Returns `true` if this section is an IAT entry for an imported symbol.
-    pub fn is_iat_entry(&self) -> bool {
-        self.characteristics
-            .contains(SectionFlags::CntInitializedData | SectionFlags::MemRead)
-            && !self.data.is_empty()
-            && self.name == ".idata$5"
-    }
-
-    /// Searches for the defined symbol that is within the given address.
-    ///
-    /// This will exclude compiler generated locals and section symbols.
-    pub fn find_symbol_definition(
-        &self,
-        this_index: SectionIndex,
-        address: u32,
-        symtab: &SymbolTable<'a>,
-    ) -> Option<(SymbolIndex, CoffSymbolRef<'a>)> {
-        let mut candidate: Option<(SymbolIndex, CoffSymbolRef<'a>)> = None;
-
-        for (i, symbol) in symtab.iter() {
-            if symbol
-                .section()
-                .is_none_or(|section_index| section_index != this_index)
-                || !symbol.is_relocatable()
-                || symbol.is_label()
-                || symbol.has_aux_function()
-            {
-                continue;
-            }
-
-            if symbol.value() > address {
-                continue;
-            }
-
-            let name = symbol.name_bytes(symtab.strings()).unwrap();
-            if !is_possible_user_identifier(name) {
-                continue;
-            }
-
-            if let Some(candidate) = candidate.as_mut() {
-                let candidate_symbol = candidate.1;
-                if candidate_symbol.value() < symbol.value() {
-                    *candidate = (i, symbol);
-                }
-            } else {
-                candidate = Some((i, symbol));
-            }
-        }
-
-        candidate
+    fn characteristics(&self) -> u32 {
+        self.header.characteristics()
     }
 }
 
@@ -1366,7 +1249,7 @@ impl<'a> ObjectFileSymbol<'a> {
 /// A symbol that is owned by an object file.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LocalSymbol<'a> {
-    pub name: &'a [u8],
+    pub name: &'a BStr,
     pub value: u32,
     pub section_number: i32,
     pub typ: u16,

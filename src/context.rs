@@ -6,7 +6,6 @@ use crate::{
     arena::ArenaPool,
     cli::CliOptions,
     coff::ImageFileMachine,
-    outputs::OutputSection,
     symbols::{ManglingScheme, SymbolDemangler, SymbolMap},
     timing::DurationExt,
 };
@@ -33,16 +32,11 @@ pub struct LinkContext<'a> {
     errored: AtomicBool,
 
     pub string_pool: &'a ArenaPool<u8>,
-    pub section_pool: &'a ArenaPool<OutputSection<'a>>,
     pub stats: LinkStats,
 }
 
 impl<'a> LinkContext<'a> {
-    pub fn new(
-        options: &'a CliOptions,
-        string_pool: &'a ArenaPool<u8>,
-        section_pool: &'a ArenaPool<OutputSection<'a>>,
-    ) -> Self {
+    pub fn new(options: &'a CliOptions, string_pool: &'a ArenaPool<u8>) -> Self {
         // This should already be set to reflect the active thread count but
         // fall back to 1 if it is not.
         let active_threads = options.threads.map(|num| num.get()).unwrap_or(1);
@@ -53,7 +47,6 @@ impl<'a> LinkContext<'a> {
         Self {
             options,
             string_pool,
-            section_pool,
             errored: AtomicBool::new(false),
             symbol_map: SymbolMap::with_slot_count(map_slots),
             stats: Default::default(),

@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use object::{SectionIndex, SymbolIndex};
+use object::{SectionIndex, SymbolIndex, pe};
 use rayon::{
     Scope,
     iter::{
@@ -11,11 +11,11 @@ use rayon::{
 
 use crate::{
     arena::ArenaRef,
+    coff::{Section, Symbol},
     context::LinkContext,
     fatal,
     linker::Linker,
     object::{InputSection, ObjectFile, ObjectFileId},
-    symbols::Symbol,
     timing::ScopedTimer,
 };
 
@@ -55,8 +55,7 @@ impl<'a> Linker<'a> {
                             if metadata_section(section)
                                 && section_is_live(section)
                                 && should_visit(section)
-                                && (!section.coff_relocs.is_empty()
-                                    || !section.followers.is_empty())
+                                && (!section.relocs.is_empty() || !section.followers.is_empty())
                             {
                                 Some((obj.id, i))
                             } else {
@@ -119,7 +118,7 @@ impl<'a> Linker<'a> {
                 if obj.has_import_data
                     && names.iter().any(|name| *name == section.name)
                     && section.length == 0
-                    && section.coff_relocs.is_empty()
+                    && section.relocs.is_empty()
                 {
                     return;
                 }
@@ -152,9 +151,9 @@ fn visit_section<'scope, 'a: 'scope>(
         .followers
         .iter()
         .map(|index| &obj.sections[*index])
-        .flat_map(|section| section.coff_relocs.iter());
+        .flat_map(|section| section.relocs.iter());
 
-    for reloc in section.coff_relocs.iter().chain(associative_relocs) {
+    for reloc in section.relocs.iter().chain(associative_relocs) {
         // Skip over relocations to invalid symbols
         let Ok(symbol) = obj.coff_symbols.symbol(reloc.symbol()) else {
             continue;
@@ -222,5 +221,7 @@ fn should_visit(section: &InputSection) -> bool {
 }
 
 fn metadata_section(section: &InputSection) -> bool {
-    section.is_debug()
+    section.is_codeview()
+        || (section.name.starts_with(b".debug_")
+            && section.characteristics() & pe::IMAGE_SCN_MEM_DISCARDABLE != 0)
 }

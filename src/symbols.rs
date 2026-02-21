@@ -21,137 +21,14 @@
 use bitflags::bitflags;
 use bstr::{BStr, ByteSlice};
 
-use object::{SectionIndex, SymbolIndex, pe};
+use object::{SymbolIndex, pe};
 use parking_lot::RwLock;
 
 use crate::{
-    coff::ImageFileMachine,
+    coff::{ImageFileMachine, Symbol},
     concurrent_indexmap::{self, ConcurrentIndexMap, Index},
     object::ObjectFileId,
 };
-
-/// This trait is used to abstract various routines when dealing with COFF symbols.
-///
-/// COFF symbols include 4 main metadata fields.
-/// - Value
-/// - SectionNumber
-/// - Type
-/// - StorageClass
-///
-/// Some of these fields are insignificant on their own without being paired with
-/// values from other fields.
-/// This trait requires implementors to add accessors for these metadata fields.
-///
-/// The rest of the trait methods allow querying for different attributes of
-/// symbols through the associated fields.
-pub trait Symbol {
-    /// Returns the raw `Value` from the symbol
-    fn value(&self) -> u32;
-
-    /// Returns the raw `SectionNumber` from the symbol
-    fn section_number(&self) -> i32;
-
-    /// Returns the raw `Type` from the symbol
-    fn typ(&self) -> u16;
-
-    /// Returns the raw `StorageClass` from the symbol
-    fn storage_class(&self) -> u8;
-
-    /// Returns the base type of the symbol
-    fn base_type(&self) -> u16 {
-        self.typ() & pe::N_BTMASK
-    }
-
-    /// Returns the complex type of the symbol
-    fn complex_type(&self) -> u16 {
-        (self.typ() & pe::N_TMASK) >> pe::N_BTSHFT
-    }
-
-    /// Returns the index of the section this symbol is defined in
-    fn section(&self) -> Option<SectionIndex> {
-        let section_number = self.section_number();
-        if section_number > pe::IMAGE_SYM_UNDEFINED {
-            Some(SectionIndex(section_number as usize))
-        } else {
-            None
-        }
-    }
-
-    /// Returns `true` if this is a symbol for a debug item
-    fn is_debug(&self) -> bool {
-        self.section_number() == pe::IMAGE_SYM_DEBUG
-    }
-
-    /// Returns `true` if this is an absolute symbol.
-    ///
-    /// The value is interpreted as the symbol value.
-    fn is_absolute(&self) -> bool {
-        self.section_number() == pe::IMAGE_SYM_ABSOLUTE
-    }
-
-    /// Returns `true` if this is a relocatable symbol.
-    ///
-    /// A relocatable symbol means that the value field refers to an RVA inside
-    /// the section referred to by the section number.
-    fn is_relocatable(&self) -> bool {
-        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
-            || self.storage_class() == pe::IMAGE_SYM_CLASS_STATIC
-            || self.storage_class() == pe::IMAGE_SYM_CLASS_LABEL
-    }
-
-    /// Returns `true` if this is a globally visible symbol.
-    ///
-    /// Globally visible symbols are symbols with `IMAGE_SYM_CLASS_EXTERNAL` or
-    /// `IMAGE_SYM_CLASS_WEAK_EXTERNAL` storage class
-    fn is_global(&self) -> bool {
-        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
-            || self.storage_class() == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
-    }
-
-    /// Returns `true` if this symbol is locally scoped.
-    ///
-    /// Local symbols are all other symbols that do not fall under the category of
-    /// [`Symbol::is_global()`]
-    fn is_local(&self) -> bool {
-        !self.is_global()
-    }
-
-    /// Returns `true` if this symbol is an undefined external symbol.
-    ///
-    /// An undefined external symbol is a symbol with `IMAGE_SYM_CLASS_EXTERNAL`
-    /// storage class, a section number of 0 (`IMAGE_SYM_UNDEFINED`) and a value
-    /// of 0.
-    ///
-    /// # Note
-    /// Common symbols [`Symbol::is_common()`] and weak externals [`Symbol::is_weak()`]
-    /// do not fall under this category
-    fn is_undefined(&self) -> bool {
-        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
-            && self.section_number() == pe::IMAGE_SYM_UNDEFINED
-            && self.value() == 0
-    }
-
-    /// Returns `true` if this is a common symbol.
-    ///
-    /// A common symbol has `IMAGE_SYM_CLASS_EXTERNAL` storage class, a section
-    /// number of 0 (`IMAGE_SYM_UNDEFINED`) and a value that is non-zero. The
-    /// value field is interpreted as the symbol size/alignment
-    fn is_common(&self) -> bool {
-        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
-            && self.section_number() == pe::IMAGE_SYM_UNDEFINED
-            && self.value() > 0
-    }
-
-    /// Returns `true` if this is a weak external symbol
-    fn is_weak(&self) -> bool {
-        self.storage_class() == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
-    }
-
-    /// Returns `true` if this symbol is for a code label
-    fn is_label(&self) -> bool {
-        self.storage_class() == pe::IMAGE_SYM_CLASS_LABEL
-    }
-}
 
 /// A globally unique symbol in the symbol map.
 ///

@@ -56,7 +56,7 @@ use rayon::{
 
 use crate::{
     arena::ArenaRef,
-    coff::{CoffFlags, ImageFileMachine, SectionFlags},
+    coff::{CoffFlags, ImageFileMachine, Section, SectionFlags},
     context::LinkContext,
     object::{InputSection, ObjectFile, ObjectFileId},
     sparse_set::{FixedSparseMap, SparseKeyBuilder},
@@ -118,7 +118,7 @@ impl OutputSectionId {
 #[derive(Debug, Default)]
 pub struct OutputFile<'a> {
     pub header: OutputFileHeader,
-    pub sections: Vec<ArenaRef<'a, OutputSection<'a>>>,
+    pub sections: Vec<OutputSection<'a>>,
     pub globals: Vec<SymbolId>,
 }
 
@@ -257,16 +257,18 @@ impl<'a> OutputSection<'a> {
         for (obj, section) in self.inputs.iter() {
             let obj = &objs[obj.index()];
             let section = &obj.sections[*section];
-            let align = section.characteristics.alignment();
+            let align = section.alignment();
             needed_alignment = needed_alignment.max(align);
             let address = self.length.next_multiple_of(align.min(1) as u32);
             section.virtual_address.store(address, Ordering::Relaxed);
             self.length = address + section.length;
         }
 
-        if needed_alignment > 0 {
-            self.characteristics.set_alignment(needed_alignment);
+        if needed_alignment == 0 {
+            needed_alignment = 16;
         }
+
+        self.characteristics.set_alignment(needed_alignment);
     }
 
     /// Creates a matrix used for joining object file input sections to this
@@ -296,18 +298,17 @@ impl<'a> OutputSection<'a> {
 }
 
 /// Creates the list of reserved output sections
-pub fn create_reserved_sections<'a>(ctx: &LinkContext<'a>) -> Vec<ArenaRef<'a, OutputSection<'a>>> {
-    let arena = ctx.section_pool.get();
+pub fn create_reserved_sections<'a>() -> Vec<OutputSection<'a>> {
     let mut sections = Vec::new();
 
     let mut push = |name: &'a str, flags, exclude: bool| {
         let id = OutputSectionId(sections.len() as u32);
-        sections.push(arena.alloc_ref(OutputSection::new(
+        sections.push(OutputSection::new(
             id,
             BStr::new(name.as_bytes()),
             flags,
             exclude,
-        )));
+        ));
     };
 
     let r = SectionFlags::MemRead;
@@ -366,7 +367,7 @@ impl<'a> SectionKey<'a> {
     pub fn new(ctx: &LinkContext, section: &InputSection<'a>) -> SectionKey<'a> {
         let mut key = SectionKey {
             name: section.name,
-            flags: section.characteristics.kind_flags(),
+            flags: section.section_flags().kind_flags(),
         };
 
         // Strips `name` up to the first '$' character
