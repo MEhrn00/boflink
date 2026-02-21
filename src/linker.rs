@@ -19,8 +19,8 @@ use crate::{
     inputs::{InputsReader, InputsStore},
     object::{InputSection, ObjectFile, ObjectFileId},
     outputs::{
-        OutputSection, OutputSectionId, OutputSectionInputsMap, SectionKey,
-        create_reserved_sections,
+        OutputFile, OutputFileHeader, OutputSection, OutputSectionId, OutputSectionInputsMap,
+        SectionKey, create_reserved_sections,
     },
     symbols::{GlobalSymbol, GlobalSymbolFlags, Symbol, SymbolId},
     timing::ScopedTimer,
@@ -32,14 +32,11 @@ use crate::{
 /// artifacts. It is treated more as a plain data container with some methods
 /// rather than having a defined API
 pub struct Linker<'a> {
-    /// Target architecture
-    pub architecture: ImageFileMachine,
-
     /// Input object files
     pub objs: Vec<ArenaRef<'a, ObjectFile<'a>>>,
 
-    /// Output sections
-    pub sections: Vec<ArenaRef<'a, OutputSection<'a>>>,
+    /// The output file
+    pub output: OutputFile<'a>,
 
     /// Symbols which require definitions at the end of the link
     required_symbol: Vec<SymbolId>,
@@ -78,9 +75,14 @@ impl<'a> Linker<'a> {
         });
 
         Ok(Self {
-            architecture: reader.architecture,
+            output: OutputFile {
+                header: OutputFileHeader {
+                    machine: reader.architecture,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             objs: input_objs.into_vec(),
-            sections: Vec::new(),
             required_symbol: Vec::new(),
             gc_roots: Vec::new(),
             strings,
@@ -90,7 +92,7 @@ impl<'a> Linker<'a> {
     /// Mangles the specified name using the mangling scheme from the linker
     /// architecture.
     pub fn arch_mangle(&self, name: &'a BStr) -> &'a BStr {
-        if self.architecture != ImageFileMachine::I386 {
+        if self.output.architecture() != ImageFileMachine::I386 {
             return name;
         }
 
@@ -106,6 +108,7 @@ impl<'a> Linker<'a> {
         let name = self.arch_mangle(name);
         let symbol = ctx.symbol_map.get_map_entry(name);
         let id = symbol.id();
+        symbol.or_default();
         if !self.gc_roots.contains(&id) {
             self.gc_roots.push(id);
         }
@@ -119,6 +122,7 @@ impl<'a> Linker<'a> {
         let name = self.arch_mangle(name);
         let symbol = ctx.symbol_map.get_map_entry(name);
         let id = symbol.id();
+        symbol.or_default();
         if !self.required_symbol.contains(&id) {
             self.required_symbol.push(id);
         }
@@ -156,7 +160,7 @@ impl<'a> Linker<'a> {
         for &symbol in live_symbols {
             let global = ctx.symbol_map.get_exclusive_symbol(symbol).unwrap();
             if !global.owner.is_internal() {
-                *self.objs[global.owner.index()].live.get_mut() = true;
+                self.objs[global.owner.index()].set_live(true);
             }
         }
 
@@ -167,10 +171,10 @@ impl<'a> Linker<'a> {
                 // Set command line input object files or `--whole-archive` members
                 // as live
                 if !obj.lazy {
-                    *obj.live.get_mut() = true;
+                    obj.set_live(true);
                 }
 
-                (*obj.live.get_mut()).then_some(obj.id)
+                if obj.is_live() { Some(obj.id) } else { None }
             })
             .collect::<Vec<_>>();
 
@@ -197,7 +201,7 @@ impl<'a> Linker<'a> {
             };
 
             if obj.lazy
-                && *obj.live.get_mut()
+                && obj.is_live()
                 && let Err(e) = initialize(obj)
             {
                 log::error!(logger: &*ctx, "cannot parse {}: {e}", obj.source());
@@ -236,7 +240,7 @@ impl<'a> Linker<'a> {
         // Remove unused objects to shrink the list before re-resolving symbols.
         self.objs = std::mem::take(&mut self.objs)
             .into_par_iter()
-            .filter_map(|mut obj| if *obj.live.get_mut() { Some(obj) } else { None })
+            .filter_map(|mut obj| if obj.is_live() { Some(obj) } else { None })
             .collect::<Vec<_>>();
 
         // Need to recompute ids since indicies have most likely changed
@@ -345,36 +349,6 @@ impl<'a> Linker<'a> {
             });
     }
 
-    pub fn mark_import_symbols(&mut self, ctx: &LinkContext<'a>) {
-        self.objs
-            .par_iter_mut()
-            .filter(|obj| obj.has_import_data)
-            .for_each(|obj| {
-                let obj = obj.as_mut();
-                for (i, symbol) in obj.coff_symbols.iter() {
-                    if symbol.is_local() {
-                        continue;
-                    }
-
-                    let Some(section_index) = symbol.section() else {
-                        continue;
-                    };
-
-                    let section = &mut obj.sections[section_index];
-                    *section.discarded.get_mut() = true;
-                    let mut flags = GlobalSymbolFlags::Imported;
-                    if section.is_iat_entry() {
-                        flags.insert(GlobalSymbolFlags::DFR);
-                    }
-                    let external_ref = obj.symbols.external_symbol_ref(ctx, i).unwrap();
-                    let mut global = external_ref.write();
-                    if global.owner == obj.id {
-                        global.flags.insert(flags);
-                    }
-                }
-            });
-    }
-
     /// Logs any symbol errors related to duplicate definitions.
     ///
     /// This will exit the program if any are found.
@@ -414,8 +388,8 @@ impl<'a> Linker<'a> {
     /// get the general layout of where symbols will end up in the output file
     pub fn create_output_sections(&mut self, ctx: &mut LinkContext<'a>) {
         let _timer = ScopedTimer::msg("output section allocation");
-        self.sections = create_reserved_sections(ctx);
-        let reserved_sections_len = self.sections.len();
+        self.output.sections = create_reserved_sections(ctx);
+        let reserved_sections_len = self.output.sections.len();
 
         // Partition object file input sections.
         //
@@ -432,7 +406,7 @@ impl<'a> Linker<'a> {
                 obj.sections
                     .enumerate_mut()
                     .filter_map(|(section_index, section)| {
-                        if *section.discarded.get_mut() {
+                        if section.is_discarded() {
                             None
                         } else {
                             Some((section_index, section))
@@ -470,7 +444,12 @@ impl<'a> Linker<'a> {
                     let index = *section_map.entry(key).or_insert_with(|| {
                         let index = sections.len();
                         let id = OutputSectionId::new(reserved_sections_len + index);
-                        sections.push(arena.alloc_ref(OutputSection::new(id, name, flags, false)));
+                        sections.push(arena.alloc_ref(OutputSection::new(
+                            id,
+                            BStr::new(name),
+                            flags,
+                            false,
+                        )));
                         index
                     });
                     sections[index].inputs.append(&mut input_sections);
@@ -487,7 +466,7 @@ impl<'a> Linker<'a> {
             },
             || {
                 // Join known outputs
-                self.sections.par_iter_mut().for_each(|section| {
+                self.output.sections.par_iter_mut().for_each(|section| {
                     let output_id = section.id;
                     section.inputs.par_extend(
                         known_outputs
@@ -499,7 +478,7 @@ impl<'a> Linker<'a> {
             },
         );
 
-        self.sections.append(&mut new_outputs);
+        self.output.sections.append(&mut new_outputs);
 
         // Join newly created outputs with the input sections
         self.objs.par_iter_mut().for_each(|obj| {
@@ -521,6 +500,45 @@ impl<'a> Linker<'a> {
                 obj.sections[index].output = output_id;
             }
         });
+    }
+
+    /// Discards sections defining symbols related to imports and marks those
+    /// symbols as being imported.
+    ///
+    /// These definitions will be marked live only if needed. This has to occur
+    /// after output sections are created or else needed thunk definitions will
+    /// not get allocated to an output section
+    pub fn mark_import_symbols(&mut self, ctx: &LinkContext<'a>) {
+        self.objs
+            .par_iter_mut()
+            .filter(|obj| obj.has_import_data)
+            .for_each(|obj| {
+                let obj = obj.as_mut();
+                for (i, symbol) in obj.coff_symbols.iter() {
+                    let Some(section_index) = symbol.section() else {
+                        continue;
+                    };
+
+                    let section = &mut obj.sections[section_index];
+                    section.set_discarded(true);
+
+                    if symbol.is_local() {
+                        continue;
+                    }
+
+                    // Globals for IAT entries and code thunks get marked as
+                    // imported
+                    if section.is_iat_entry()
+                        || section.characteristics.contains(SectionFlags::CntCode)
+                    {
+                        let external_ref = obj.symbols.external_symbol_ref(ctx, i).unwrap();
+                        let mut global = external_ref.write();
+                        if global.owner == obj.id {
+                            global.flags.insert(GlobalSymbolFlags::Imported);
+                        }
+                    }
+                }
+            });
     }
 
     /// Globals initialization will only create undefined symbols but does not
@@ -563,7 +581,9 @@ impl<'a> Linker<'a> {
         });
     }
 
-    pub fn scan_relocations(&self, ctx: &LinkContext<'a>) {
+    pub fn scan_relocations(&mut self, ctx: &LinkContext<'a>) {
+        let _timer = ScopedTimer::msg("scan relocations");
+
         let objs = &self.objs;
         self.objs.par_iter().for_each(|obj| {
             if let Err(e) = obj.scan_relocations(ctx, objs) {
@@ -595,7 +615,7 @@ impl<'a> Linker<'a> {
                         let external_ref = obj.symbols.external_symbol_ref(ctx, i).unwrap();
 
                         let global = external_ref.upgradable_read();
-                        if global.owner != obj.id || !global.is_dfr_import() {
+                        if global.owner != obj.id {
                             continue;
                         }
 
@@ -618,5 +638,19 @@ impl<'a> Linker<'a> {
                     }
                 },
             );
+    }
+
+    pub fn sort_output_inputs(&mut self, ctx: &LinkContext<'a>) {
+        self.output.sections.par_iter_mut().for_each(|section| {
+            section.sort_inputs(ctx, &self.objs);
+        });
+    }
+
+    pub fn compute_sections(&mut self) {
+        let _timer = ScopedTimer::msg("compute sections");
+        let objs = &self.objs;
+        self.output.sections.par_iter_mut().for_each(|section| {
+            section.compute_sections(objs);
+        });
     }
 }

@@ -9,9 +9,8 @@
 //! [import libraries](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#import-library-format)
 //! and, in the future, LTO COFFs.
 use std::{
-    borrow::Cow,
     collections::HashSet,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use bstr::BStr;
@@ -25,8 +24,11 @@ use rayon::Scope;
 use crate::{
     ErrorContext,
     arena::ArenaRef,
-    bit_set::FixedDenseBitSet,
-    coff::{CoffFlags, CoffSymbolRef, Feat00Flags, ImageFileMachine, SectionFlags, SymbolTable},
+    bit_set::FixedBitSet,
+    coff::{
+        CoffFlags, CoffSymbolRef, Feat00Flags, ImageFileMachine, ImageRelocationRef, SectionFlags,
+        SymbolTable,
+    },
     context::LinkContext,
     inputs::{InputFile, InputFileSource},
     make_error,
@@ -180,7 +182,7 @@ impl<'a> ObjectFile<'a> {
             id,
             file,
             lazy,
-            live: false.into(),
+            live: AtomicBool::new(false),
             machine: ImageFileMachine::Unknown,
             characteristics: CoffFlags::empty(),
             coff_sections: Default::default(),
@@ -303,7 +305,7 @@ impl<'a> ObjectFile<'a> {
     ///
     /// Sections should only be initialized on live or non-lazy object files.
     pub fn initialize_sections(&mut self, ctx: &LinkContext<'a>) -> crate::Result<()> {
-        debug_assert!(!self.lazy || *self.live.get_mut());
+        debug_assert!(!self.lazy || self.is_live());
         self.sections
             .resize_with(self.coff_sections.len() + 1, || None);
 
@@ -396,13 +398,9 @@ impl<'a> ObjectFile<'a> {
                 name: BStr::new(name),
                 data,
                 length,
-                checksum: 0,
+                coff_relocs: relocs,
                 characteristics,
-                coff_relocs: relocs.into(),
-                followers: Vec::new(),
-                discarded: AtomicBool::new(false),
-                gc_visited: AtomicBool::new(false),
-                output: OutputSectionId::Null,
+                ..Default::default()
             });
         }
 
@@ -421,7 +419,7 @@ impl<'a> ObjectFile<'a> {
 
     /// Initializes remaining symbols and COMDAT groups
     pub fn initialize_symbols(&mut self) -> crate::Result<()> {
-        debug_assert!(!self.lazy || *self.live.get_mut());
+        debug_assert!(!self.lazy || self.is_live());
         self.symbols.resize_with(self.coff_symbols.len(), || None);
 
         // Selections for COMDAT sections
@@ -631,11 +629,8 @@ impl<'a> ObjectFile<'a> {
             let owner = &objs[global.owner.index()];
 
             let symbol_is_needed = symbol.is_undefined() || symbol.is_common();
-            let should_visit = |obj: &ArenaRef<'a, ObjectFile>| {
-                !(obj.live.load(Ordering::Relaxed) || obj.live.swap(true, Ordering::Relaxed))
-            };
 
-            if symbol_is_needed && should_visit(owner) {
+            if symbol_is_needed && owner.atomic_set_live() {
                 if global.is_traced() {
                     log::info!(logger: ctx, "{}: needs {} from {}", self.source(), ctx.demangle(global.name, self.machine), owner.source());
                 }
@@ -698,20 +693,34 @@ impl<'a> ObjectFile<'a> {
         }
     }
 
+    /// Discards COMDATs and associative sections not claimed by eader symbols.
+    ///
+    /// COMDATs and associative sections are modeled as a directed graph with
+    /// nodes being sections and edges are links to associative sections. The
+    /// graph is a reversed version of how the associative sections are laid out
+    /// in auxiliary section symbols. An IMAGE_COMDAT_SELECT_ASSOCIATIVE section
+    /// in a COFF auxiliary record contains variable number of links to the
+    /// parent section which ends up at the COMDAT leader section.
+    /// These links are reversed where the COMDAT leader contains outgoing
+    /// associative sections to the follower sections. This makes traversal
+    /// easier since once the leader is handled, discarding/keeping associative
+    /// sections is a simple DFS traversal.
     pub fn discard_unclaimed_comdats(&mut self, ctx: &LinkContext<'a>) {
-        assert!(*self.live.get_mut());
+        assert!(self.is_live());
 
-        // Visit sections which have not been visited before. If a section has
-        // been visited, check its discard status that was set by the last COMDAT leader
-        // - If the visited COMDAT is discarded but this leader is kept, continue visiting followers and mark them live
-        // - If the visited COMDAT was kept and this leader is kept, stop traversing the follower chain
-        // - If the visited COMDAT was kept but this leader was discarded, be keep the followers
-        //   live for the other leader
+        let mut visited = FixedBitSet::new_empty(self.sections.len());
+
+        // It is possible (but unlikely) that an associative section is associative
+        // to multiple different COMDAT leaders.
+        // - If the section has not been visited before, its followers should
+        //   be visited.
+        // - If the section has been visited before, its followers should be
+        //   visited only if a previous visit discarded this section but the
+        //   chain needs to be kept
         let should_visit = |section: &mut InputSection, discard: bool| -> bool {
-            *section.discarded.get_mut() && !discard
+            section.is_discarded() && !discard
         };
 
-        let mut visited = FixedDenseBitSet::new_empty(self.sections.len());
         for &i in self.comdat_leaders.iter() {
             let Some(external_ref) = self.symbols.external_symbol_ref(ctx, i) else {
                 continue;
@@ -726,9 +735,8 @@ impl<'a> ObjectFile<'a> {
             let mut stack = vec![section_index];
             while let Some(section_index) = stack.pop() {
                 let section = &mut self.sections[section_index];
-                if !visited.contains(section_index.0) || should_visit(section, discard) {
-                    visited.insert(section_index.0);
-                    *section.discarded.get_mut() = discard;
+                if visited.insert(section_index.0) || should_visit(section, discard) {
+                    section.set_discarded(discard);
                     stack.extend(&section.followers);
                 }
             }
@@ -746,7 +754,11 @@ impl<'a> ObjectFile<'a> {
 
         let mut errors = Vec::new();
         for (i, symbol) in self.coff_symbols.iter() {
-            if symbol.is_local() || symbol.is_undefined() || symbol.is_common() || symbol.is_weak()
+            if symbol.is_local()
+                || symbol.is_undefined()
+                || symbol.is_common()
+                || symbol.is_weak()
+                || symbol.is_absolute()
             {
                 continue;
             }
@@ -844,55 +856,58 @@ impl<'a> ObjectFile<'a> {
         &self,
         ctx: &LinkContext<'a>,
         index: SectionIndex,
-        objs: &[ArenaRef<'a, ObjectFile<'a>>],
+        objs: &[ArenaRef<'a, ObjectFile>],
     ) -> crate::Result<()> {
-        let section = &self.sections[index];
-        if section.discarded.load(Ordering::Relaxed) {
+        let reloc_section = &self.sections[index];
+        if reloc_section.discarded.load(Ordering::Relaxed) {
             return Ok(());
         }
 
-        for reloc in section.coff_relocs.iter() {
-            let target_symbol = self.coff_symbols.symbol(reloc.symbol()).with_context(|| {
+        for reloc in reloc_section.coff_relocs.iter() {
+            let reloc = ImageRelocationRef(reloc);
+            let coff_symbol = self.coff_symbols.symbol(reloc.symbol()).with_context(|| {
                 format!(
-                    "{}: relocation at '{}+{:#x}' references invalid symbol",
+                    "{}: relocation at '{}+{:#x}' references invalid symbol {}",
                     self.source(),
-                    section.name,
-                    reloc.virtual_address.get(object::LittleEndian)
+                    reloc_section.name,
+                    reloc.virtual_address(),
+                    reloc.symbol(),
                 )
             })?;
 
-            if target_symbol.is_local() {
-                continue;
-            }
+            let mut symbol_name =
+                BStr::new(coff_symbol.name_bytes(self.coff_symbols.strings()).unwrap());
+            let mut obj = self;
+            let mut section_index = SectionIndex(0);
 
-            let external_ref = self
-                .symbols
-                .external_symbol_ref(ctx, reloc.symbol())
-                .unwrap();
-            let global = external_ref.read();
-            if global.is_imported() {
-                let owner = &objs[global.owner.index()];
-                let section_index = global.section().unwrap();
-                let section = &owner.sections[section_index];
-
-                let mark_live = |section: &InputSection| -> bool {
-                    section
-                        .discarded
-                        .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
-                        .unwrap_or(false)
-                };
-
-                // Mark the section containing the import definition as live.
-                // If it was newly marked as live, scan its relocations
-                if mark_live(section) {
-                    owner.scan_section_relocations(ctx, section_index, objs)?;
+            if coff_symbol.is_local() {
+                section_index = coff_symbol.section().unwrap();
+            } else {
+                let external_ref = self
+                    .symbols
+                    .external_symbol_ref(ctx, reloc.symbol())
+                    .unwrap();
+                let global = external_ref.read();
+                symbol_name = global.name;
+                obj = &objs[global.owner.index()];
+                if let Some(index) = global.section() {
+                    section_index = index;
+                    if global.is_imported() {
+                        // Import definitions are discarded before relocation scanning.
+                        // If an object file references an import, it needs to be marked
+                        // live and its relocations need to be scanned.
+                        if obj.sections[section_index].atomic_set_live() {
+                            obj.scan_section_relocations(ctx, section_index, objs)?;
+                        }
+                    }
                 }
-
-                continue;
             }
 
-            if global.is_undefined() {
-                // TODO: Report undefined symbols
+            if section_index == SectionIndex(0) {
+                // TODO: report undefined symbols
+                let _ = symbol_name;
+                let _ = obj;
+                continue;
             }
         }
 
@@ -971,6 +986,29 @@ impl<'a> ObjectFile<'a> {
 
         None
     }
+
+    /// Returns `true` if this object file is live.
+    ///
+    /// This is a convenience function over doing `*obj.live.get_mut()` if
+    /// `self` is mutable.
+    pub fn is_live(&mut self) -> bool {
+        *self.live.get_mut()
+    }
+
+    /// Sets the live status for this object file.
+    ///
+    /// This is a convenience function over doing `*obj.live.get_mut() = v` if
+    /// `self` is mutable.
+    pub fn set_live(&mut self, value: bool) {
+        *self.live.get_mut() = value;
+    }
+
+    /// Atomically sets this object file as live.
+    ///
+    /// Returns `true` if the object file was newly set to live.
+    pub fn atomic_set_live(&self) -> bool {
+        !(self.live.load(Ordering::Relaxed) || self.live.swap(true, Ordering::Relaxed))
+    }
 }
 
 /// An input section initialized from an object file.
@@ -999,8 +1037,11 @@ pub struct InputSection<'a> {
     /// The section flags
     pub characteristics: SectionFlags,
 
+    /// Virtual address of the section after rebasing
+    pub virtual_address: AtomicU32,
+
     /// The relocations contained in this section.
-    pub coff_relocs: Cow<'a, [object::pe::ImageRelocation]>,
+    pub coff_relocs: &'a [object::pe::ImageRelocation],
 
     /// Adjacency list of associative COMDAT sections.
     ///
@@ -1008,7 +1049,10 @@ pub struct InputSection<'a> {
     /// the leader and the followers are associated sections in the chain.
     pub followers: Vec<SectionIndex>,
 
-    /// If this section was discarded due to COMDAT deduplication.
+    /// If this section has been discarded.
+    ///
+    /// Sections will get discarded through COMDAT deduplication GC sections
+    /// or other means.
     pub discarded: AtomicBool,
 
     /// Visit status for GC sections
@@ -1025,6 +1069,7 @@ impl<'a> std::default::Default for InputSection<'a> {
             data: Default::default(),
             checksum: 0,
             length: 0,
+            virtual_address: AtomicU32::new(0),
             characteristics: SectionFlags::empty(),
             coff_relocs: Default::default(),
             followers: Vec::new(),
@@ -1041,9 +1086,43 @@ impl<'a> InputSection<'a> {
         self.characteristics.contains(SectionFlags::LnkComdat)
     }
 
+    /// Returns `true` if this section is discarded.
+    ///
+    /// This is a convenience function doing `*section.discarded.get_mut()` if
+    /// `self` is mutable.
+    pub fn is_discarded(&mut self) -> bool {
+        *self.discarded.get_mut()
+    }
+
+    /// Set the discard status for this section.
+    ///
+    /// This is a convenience function for doing
+    /// `*section.discarded.get_mut() = v` if `self` is mutable.
+    pub fn set_discarded(&mut self, value: bool) {
+        *self.discarded.get_mut() = value;
+    }
+
+    /// Atomically sets this section as discarded.
+    ///
+    /// Returns `true` if the section was newly set as discarded.
+    pub fn atomic_set_discarded(&self) -> bool {
+        !(self.discarded.load(Ordering::Relaxed) || self.discarded.swap(true, Ordering::Relaxed))
+    }
+
+    /// Atomically sets this section as live (!discarded).
+    ///
+    /// Returns `true` if the section was newly set to live.
+    pub fn atomic_set_live(&self) -> bool {
+        !(!self.discarded.load(Ordering::Relaxed) || !self.discarded.swap(false, Ordering::Relaxed))
+    }
+
     /// Computes and updates the section data checksum field
     pub fn compute_checksum(&mut self) {
-        self.checksum = section_checksum(self.data);
+        // Section checksum is JamCRC with an init value of -1
+        // https://github.com/llvm/llvm-project/commit/6ddc636862095a3d6f1b02ea034a353c19fff328
+        let mut h = crc32fast::Hasher::new_with_initial(u32::MAX);
+        h.update(self.data);
+        self.checksum = !h.finalize();
     }
 
     /// Returns `true` if this is a DWARF debug section
@@ -1137,12 +1216,6 @@ impl<'a> InputSection<'a> {
 
         candidate
     }
-}
-
-fn section_checksum(data: &[u8]) -> u32 {
-    let mut h = crc32fast::Hasher::new_with_initial(u32::MAX);
-    h.update(data);
-    !h.finalize()
 }
 
 #[derive(Debug, Default)]

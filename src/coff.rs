@@ -419,6 +419,34 @@ impl Symbol for CoffSymbolRef<'_> {
     }
 }
 
+#[derive(Debug)]
+pub struct ImageRelocationRef<'a>(pub &'a pe::ImageRelocation);
+
+impl<'a> ImageRelocationRef<'a> {
+    pub fn is_pcrel(&self, machine: ImageFileMachine) -> bool {
+        let typ = self.typ();
+        if machine == ImageFileMachine::Amd64 {
+            (pe::IMAGE_REL_AMD64_REL32..=pe::IMAGE_REL_AMD64_REL32_5).contains(&typ)
+        } else if machine == ImageFileMachine::I386 {
+            typ == pe::IMAGE_REL_I386_REL32
+        } else {
+            false
+        }
+    }
+
+    pub fn symbol(&self) -> SymbolIndex {
+        self.0.symbol()
+    }
+
+    pub fn virtual_address(&self) -> u32 {
+        self.0.virtual_address.get(object::LittleEndian)
+    }
+
+    pub fn typ(&self) -> u16 {
+        self.0.typ.get(object::LittleEndian)
+    }
+}
+
 /// @feat.00 symbol flags.
 ///
 /// Flags are from

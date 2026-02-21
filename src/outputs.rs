@@ -44,6 +44,10 @@
 //! 25. .common (used for temporarily defining common symbols, discarded)
 //!
 //! All other sections are ordered after the reserved sections on a "first-seen" basis.
+
+use std::sync::atomic::Ordering;
+
+use bstr::BStr;
 use object::SectionIndex;
 use rayon::{
     iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
@@ -52,10 +56,11 @@ use rayon::{
 
 use crate::{
     arena::ArenaRef,
-    coff::SectionFlags,
+    coff::{CoffFlags, ImageFileMachine, SectionFlags},
     context::LinkContext,
     object::{InputSection, ObjectFile, ObjectFileId},
     sparse_set::{FixedSparseMap, SparseKeyBuilder},
+    symbols::SymbolId,
 };
 
 /// ID for an output section.
@@ -110,6 +115,40 @@ impl OutputSectionId {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct OutputFile<'a> {
+    pub header: OutputFileHeader,
+    pub sections: Vec<ArenaRef<'a, OutputSection<'a>>>,
+    pub globals: Vec<SymbolId>,
+}
+
+impl<'a> OutputFile<'a> {
+    pub fn architecture(&self) -> ImageFileMachine {
+        self.header.machine
+    }
+}
+
+#[derive(Debug)]
+pub struct OutputFileHeader {
+    pub machine: ImageFileMachine,
+    pub number_of_sections: u16,
+    pub pointer_to_symbol_table: u32,
+    pub number_of_symbols: u32,
+    pub characteristics: CoffFlags,
+}
+
+impl std::default::Default for OutputFileHeader {
+    fn default() -> Self {
+        Self {
+            machine: ImageFileMachine::Unknown,
+            number_of_sections: 0,
+            pointer_to_symbol_table: 0u32,
+            number_of_symbols: 0u32,
+            characteristics: CoffFlags::LineNumsStripped,
+        }
+    }
+}
+
 /// Section for the output file.
 ///
 /// This contains the section metadata and list of indicies for input sections.
@@ -122,7 +161,7 @@ pub struct OutputSection<'a> {
     pub id: OutputSectionId,
 
     /// Name that will end up in the section header
-    pub name: &'a [u8],
+    pub name: &'a BStr,
 
     /// Flags
     pub characteristics: SectionFlags,
@@ -134,7 +173,9 @@ pub struct OutputSection<'a> {
     /// section table index in the output file.
     pub index: SectionIndex,
 
-    /// Total length of the output section.
+    /// Length of the output section.
+    ///
+    /// This is the aligned length.
     pub length: u32,
 
     /// True if this section should be excluded from the output file.
@@ -144,6 +185,17 @@ pub struct OutputSection<'a> {
     /// discarded.
     pub exclude: bool,
 
+    /// Number of local symbols that will end up defined in this section.
+    ///
+    /// This excludes the section symbol.
+    pub local_defs: u32,
+
+    /// File offset for writing the section data.
+    pub pointer_to_raw_data: u32,
+
+    /// File offset for writing relocations.
+    pub pointer_to_relocations: u32,
+
     /// Indicies of input sections.
     pub inputs: Vec<(ObjectFileId, SectionIndex)>,
 }
@@ -151,7 +203,7 @@ pub struct OutputSection<'a> {
 impl<'a> OutputSection<'a> {
     pub fn new(
         id: OutputSectionId,
-        name: &'a [u8],
+        name: &'a BStr,
         characteristics: SectionFlags,
         exclude: bool,
     ) -> Self {
@@ -162,6 +214,9 @@ impl<'a> OutputSection<'a> {
             index: SectionIndex(0),
             length: 0,
             exclude,
+            local_defs: 0,
+            pointer_to_raw_data: 0,
+            pointer_to_relocations: 0,
             inputs: Vec::new(),
         }
     }
@@ -173,7 +228,9 @@ impl<'a> OutputSection<'a> {
                 let index = *index;
                 let obj = &objs[objid.index()];
                 let input_name = obj.sections.section(index).unwrap().name;
-                let ordering_name = input_name.strip_prefix(name).unwrap();
+                let ordering_name = input_name
+                    .strip_prefix(AsRef::<[u8]>::as_ref(name))
+                    .unwrap();
                 // $<name>, object order, section order
                 (ordering_name, objid.index(), index.0)
             });
@@ -184,35 +241,32 @@ impl<'a> OutputSection<'a> {
         }
     }
 
-    pub fn compute_alignment(&mut self, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
-        let align = self
-            .inputs
-            .par_iter()
-            .map(|(objid, index)| {
-                objs[objid.index()]
-                    .sections
-                    .section(*index)
-                    .unwrap()
-                    .characteristics
-                    .alignment()
-            })
-            .max()
-            .unwrap_or_default();
-        if align > 0 {
-            self.characteristics.set_alignment(align.min(8192));
+    pub fn compute_sections(&mut self, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
+        // Exclude empty output section except for standard sections
+        if self.inputs.is_empty() {
+            if !(self.id == OutputSectionId::Text
+                || self.id == OutputSectionId::Data
+                || self.id == OutputSectionId::Bss)
+            {
+                self.exclude = true;
+            }
+            return;
         }
-    }
 
-    /// Computes the length for this output section.
-    ///
-    /// This is done sequentially
-    pub fn compute_length(&mut self, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
-        self.length = self.inputs.iter().fold(0, |length, (objid, index)| {
-            let section = objs[objid.index()].sections.section(*index).unwrap();
-            let align = section.characteristics.alignment().min(1);
-            let address = length.next_multiple_of(align as u32);
-            address + section.length
-        });
+        let mut needed_alignment = 0;
+        for (obj, section) in self.inputs.iter() {
+            let obj = &objs[obj.index()];
+            let section = &obj.sections[*section];
+            let align = section.characteristics.alignment();
+            needed_alignment = needed_alignment.max(align);
+            let address = self.length.next_multiple_of(align.min(1) as u32);
+            section.virtual_address.store(address, Ordering::Relaxed);
+            self.length = address + section.length;
+        }
+
+        if needed_alignment > 0 {
+            self.characteristics.set_alignment(needed_alignment);
+        }
     }
 
     /// Creates a matrix used for joining object file input sections to this
@@ -248,7 +302,12 @@ pub fn create_reserved_sections<'a>(ctx: &LinkContext<'a>) -> Vec<ArenaRef<'a, O
 
     let mut push = |name: &'a str, flags, exclude: bool| {
         let id = OutputSectionId(sections.len() as u32);
-        sections.push(arena.alloc_ref(OutputSection::new(id, name.as_bytes(), flags, exclude)));
+        sections.push(arena.alloc_ref(OutputSection::new(
+            id,
+            BStr::new(name.as_bytes()),
+            flags,
+            exclude,
+        )));
     };
 
     let r = SectionFlags::MemRead;
