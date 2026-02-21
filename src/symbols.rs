@@ -203,11 +203,6 @@ impl<'a> GlobalSymbol<'a> {
     pub fn is_imported(&self) -> bool {
         self.flags.contains(GlobalSymbolFlags::Imported)
     }
-
-    pub fn is_dfr_import(&self) -> bool {
-        self.flags
-            .contains(GlobalSymbolFlags::Imported | GlobalSymbolFlags::DFR)
-    }
 }
 
 bitflags! {
@@ -217,11 +212,8 @@ bitflags! {
         /// This symbol is traced using `--trace-symbol`
         const Traced = 1;
 
-        /// This symbol should use DFR
-        const DFR = 1 << 1;
-
         /// This symbol is imported from a DLL
-        const Imported = 1 << 2;
+        const Imported = 1 << 1;
     }
 
 }

@@ -1,23 +1,26 @@
+/// Bitset which has a fixed domain size specified on creation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FixedDenseBitSet {
+pub struct FixedBitSet {
     domain: usize,
-    entries: Box<[u64]>,
+    entries: Vec<u64>,
 }
 
-impl FixedDenseBitSet {
+impl FixedBitSet {
+    /// Creates a new [`FixedBitSet`] with the specified domain size.
+    ///
+    /// This is the number of bits that the bitset can hold.
     pub fn new_empty(domain: usize) -> Self {
         Self {
             domain,
-            entries: vec![0u64; domain.div_ceil(u64::BITS as usize)].into(),
+            entries: vec![0u64; domain.div_ceil(u64::BITS as usize)],
         }
     }
 
-    pub fn contains(&self, bit: usize) -> bool {
-        assert!(bit < self.domain);
-        let (i, mask) = location(bit);
-        self.entries[i] & mask != 0
-    }
-
+    /// Sets the bit at the specified index and returns `true` if the bit was
+    /// newly set.
+    ///
+    /// # Panics
+    /// Panics if the index of the bit exceeds the bitset domain.
     pub fn insert(&mut self, bit: usize) -> bool {
         assert!(bit < self.domain);
         let (i, mask) = location(bit);
@@ -26,28 +29,6 @@ impl FixedDenseBitSet {
         let new_value = value | mask;
         *entry = new_value;
         new_value != value
-    }
-
-    pub fn set(&mut self, bit: usize, enabled: bool) {
-        assert!(bit < self.domain);
-        let (i, mask) = location(bit);
-        let entry = &mut self.entries[i];
-        let mut value = *entry;
-        if enabled {
-            value |= mask;
-        } else {
-            value &= !mask;
-        }
-        *entry = value;
-    }
-
-    pub fn toggle(&mut self, bit: usize) {
-        assert!(bit < self.domain);
-        let (i, mask) = location(bit);
-        let entry = &mut self.entries[i];
-        let mut value = *entry;
-        value ^= mask;
-        *entry = value;
     }
 }
 

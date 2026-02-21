@@ -98,8 +98,8 @@ impl<'a> Linker<'a> {
                 obj.sections
                     .enumerate_mut()
                     .filter_map(|(i, section)| {
-                        if !*section.gc_visited.get_mut() && !*section.discarded.get_mut() {
-                            *section.discarded.get_mut() = true;
+                        if !*section.gc_visited.get_mut() && !section.is_discarded() {
+                            section.set_discarded(true);
                             Some((obj.id, i))
                         } else {
                             None

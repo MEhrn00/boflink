@@ -36,49 +36,12 @@ impl<K, V, B: SparseKeyBuilder<Key = K>, D: DenseIndex> FixedSparseMap<K, V, B, 
         }
     }
 
-    /// Inserts the specified `value` at the entry for `key`.
-    ///
-    /// Returns `Some(V)` with the old value if the value was replaced.
-    ///
-    /// # Panics
-    /// Panics if the derived key index exceeds the sparse domain or inserting the value
-    /// into the dense array overflows the maxium elements for `D`
-    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        let dense_idx = &mut self.sparse[B::sparse_index(key)];
-        // Existing item
-        if *dense_idx != D::tombstone() {
-            let item = std::mem::replace(&mut self.dense[dense_idx.dense_index()], value);
-            Some(item)
-        } else {
-            // New item
-            *dense_idx = D::new(self.dense.len());
-            self.dense.push(value);
-            None
-        }
-    }
-
-    pub fn contains(&self, key: K) -> bool {
-        self.sparse
-            .get(B::sparse_index(key))
-            .is_some_and(|dense| *dense != D::tombstone())
-    }
-
     /// Gets the value at `key` if it exists.
     pub fn get(&self, key: K) -> Option<&V> {
         if let Some(dense) = self.sparse.get(B::sparse_index(key))
             && *dense != D::tombstone()
         {
             Some(&self.dense[dense.dense_index()])
-        } else {
-            None
-        }
-    }
-
-    pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
-        if let Some(dense) = self.sparse.get(B::sparse_index(key))
-            && *dense != D::tombstone()
-        {
-            Some(&mut self.dense[dense.dense_index()])
         } else {
             None
         }
