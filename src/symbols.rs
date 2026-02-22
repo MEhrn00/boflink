@@ -46,11 +46,12 @@ use crate::{
 #[derive(Debug)]
 pub struct GlobalSymbol<'a> {
     pub name: &'a BStr,
-    pub index: SymbolIndex,
+    pub owner: ObjectFileId,
+    pub owner_index: SymbolIndex,
     pub value: u32,
     pub section_number: i32,
-    pub owner: ObjectFileId,
     pub storage_class: u8,
+    pub output_index: SymbolIndex,
     pub flags: GlobalSymbolFlags,
 }
 
@@ -61,8 +62,9 @@ impl<'a> std::default::Default for GlobalSymbol<'a> {
             value: 0,
             section_number: 0,
             storage_class: pe::IMAGE_SYM_CLASS_EXTERNAL,
-            index: object::SymbolIndex(0),
+            owner_index: object::SymbolIndex(0),
             owner: ObjectFileId::new(0),
+            output_index: object::SymbolIndex(0),
             flags: GlobalSymbolFlags::empty(),
         }
     }
@@ -80,6 +82,10 @@ impl<'a> GlobalSymbol<'a> {
     pub fn is_imported(&self) -> bool {
         self.flags.contains(GlobalSymbolFlags::Imported)
     }
+
+    pub fn allowed_undefined(&self) -> bool {
+        self.flags.contains(GlobalSymbolFlags::AllowUndefined)
+    }
 }
 
 bitflags! {
@@ -91,6 +97,9 @@ bitflags! {
 
         /// This symbol is imported from a DLL
         const Imported = 1 << 1;
+
+        /// Symbol is allowed to be undefined
+        const AllowUndefined = 1 << 2;
     }
 
 }
@@ -315,19 +324,6 @@ impl<'b, 'a> VacantMapEntry<'b, 'a> {
             })),
         }
     }
-}
-
-pub fn is_possible_user_identifier(name: impl AsRef<[u8]>) -> bool {
-    let name = name.as_ref();
-    if name.is_empty() {
-        return false;
-    }
-
-    if !(name[0] == b'_' || name[0] == b'?' || name[0].is_ascii_alphabetic()) {
-        return false;
-    }
-
-    true
 }
 
 /// Architecture specified mangling scheme for global symbol names.

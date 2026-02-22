@@ -474,7 +474,7 @@ impl std::default::Default for CliOptions {
             threads: None,
             trace_symbol: Vec::new(),
             undefined: Vec::new(),
-            warn_unresolved_symbols: true,
+            warn_unresolved_symbols: false,
             warn_common: false,
             verbose: 0,
             help: false,

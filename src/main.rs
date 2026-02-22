@@ -134,6 +134,11 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
         linker.add_traced_symbol(&mut ctx, BStr::new(symbol.as_bytes()));
     }
 
+    // Add ignored undefined symbols
+    for symbol in args.options.ignore_unresolved_symbol.iter() {
+        linker.add_ignored_undefined_symbol(&mut ctx, BStr::new(symbol.as_bytes()));
+    }
+
     linker.resolve_symbols(&mut ctx);
     log::debug!(
         "found {} live objects after symbol resolution",
@@ -155,10 +160,12 @@ fn run_boflink(mut args: CliArgs) -> Result<()> {
     linker.create_output_sections(&mut ctx);
     linker.mark_import_symbols(&ctx);
     linker.claim_undefined_symbols(&ctx);
-    linker.scan_relocations(&ctx);
+
+    linker.scan_relocations(&mut ctx);
+    linker.sort_section_mappings(&ctx);
+
     linker.rewrite_dfr_imports(&ctx);
-    linker.sort_output_inputs(&ctx);
-    linker.compute_sections();
+    linker.compute_sections(&ctx);
 
     let mut stats = std::mem::take(&mut ctx.stats);
     drop(linker);

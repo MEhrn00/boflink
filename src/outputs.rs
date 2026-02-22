@@ -48,20 +48,23 @@
 use std::sync::atomic::Ordering;
 
 use bstr::BStr;
-use object::SectionIndex;
+use object::{SectionIndex, pe};
 use rayon::{
-    iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
+    iter::{IntoParallelRefMutIterator, ParallelIterator},
     slice::ParallelSliceMut,
 };
 
 use crate::{
     arena::ArenaRef,
-    coff::{CoffFlags, ImageFileMachine, Section, SectionFlags},
+    coff::{CoffFlags, ImageFileMachine, Relocation, Section, SectionFlags, Symbol},
     context::LinkContext,
     object::{InputSection, ObjectFile, ObjectFileId},
     sparse_set::{FixedSparseMap, SparseKeyBuilder},
     symbols::SymbolId,
 };
+
+#[cfg(test)]
+mod tests;
 
 /// ID for an output section.
 ///
@@ -97,6 +100,12 @@ impl OutputSectionId {
     pub const DebugFrame: Self = Self(23);
     pub const Idata: Self = Self(24);
     pub const Common: Self = Self(25);
+}
+
+impl Default for OutputSectionId {
+    fn default() -> Self {
+        Self::Null
+    }
 }
 
 /// The last ID from the reserved output section ids
@@ -185,19 +194,19 @@ pub struct OutputSection<'a> {
     /// discarded.
     pub exclude: bool,
 
-    /// Number of local symbols that will end up defined in this section.
-    ///
-    /// This excludes the section symbol.
-    pub local_defs: u32,
-
     /// File offset for writing the section data.
     pub pointer_to_raw_data: u32,
 
     /// File offset for writing relocations.
     pub pointer_to_relocations: u32,
 
-    /// Indicies of input sections.
-    pub inputs: Vec<(ObjectFileId, SectionIndex)>,
+    /// Sorted indicies of input section mappings.
+    ///
+    /// Each item is an index into the mappings table.
+    pub sorted_mappings: Vec<u32>,
+
+    /// Input section mapping table
+    pub mappings: SectionMappingTable<'a>,
 }
 
 impl<'a> OutputSection<'a> {
@@ -214,87 +223,216 @@ impl<'a> OutputSection<'a> {
             index: SectionIndex(0),
             length: 0,
             exclude,
-            local_defs: 0,
             pointer_to_raw_data: 0,
             pointer_to_relocations: 0,
-            inputs: Vec::new(),
+            sorted_mappings: Vec::new(),
+            mappings: SectionMappingTable::new(),
         }
     }
 
-    pub fn sort_inputs(&mut self, ctx: &LinkContext, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
-        if ctx.options.merge_groups {
-            let name = self.name;
-            self.inputs.par_sort_unstable_by_key(|(objid, index)| {
-                let index = *index;
-                let obj = &objs[objid.index()];
-                let input_name = obj.sections.section(index).unwrap().name;
-                let ordering_name = input_name
-                    .strip_prefix(AsRef::<[u8]>::as_ref(name))
-                    .unwrap();
-                // $<name>, object order, section order
-                (ordering_name, objid.index(), index.0)
-            });
-        } else {
-            // Sort based on input file order
-            self.inputs
-                .par_sort_unstable_by_key(|(objid, index)| (objid.index(), index.0));
-        }
-    }
-
-    pub fn compute_sections(&mut self, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
-        // Exclude empty output section except for standard sections
-        if self.inputs.is_empty() {
-            if !(self.id == OutputSectionId::Text
-                || self.id == OutputSectionId::Data
-                || self.id == OutputSectionId::Bss)
-            {
-                self.exclude = true;
-            }
+    pub fn scan_relocations(
+        &mut self,
+        ctx: &LinkContext<'a>,
+        objs: &[ArenaRef<'a, ObjectFile<'a>>],
+    ) {
+        if self.exclude {
             return;
         }
 
-        let mut needed_alignment = 0;
-        for (obj, section) in self.inputs.iter() {
-            let obj = &objs[obj.index()];
-            let section = &obj.sections[*section];
-            let align = section.alignment();
-            needed_alignment = needed_alignment.max(align);
-            let address = self.length.next_multiple_of(align.min(1) as u32);
-            section.virtual_address.store(address, Ordering::Relaxed);
-            self.length = address + section.length;
-        }
-
-        if needed_alignment == 0 {
-            needed_alignment = 16;
-        }
-
-        self.characteristics.set_alignment(needed_alignment);
+        let id = self.id;
+        self.mappings.0.par_iter_mut().for_each(|mapping| {
+            mapping.scan_relocations(id, ctx, objs);
+        });
     }
 
-    /// Creates a matrix used for joining object file input sections to this
-    /// output section.
-    pub fn create_join_matrix(&self) -> InputJoinMatrix {
-        let mat = self
-            .inputs
-            .par_iter()
-            .by_uniform_blocks(1_000_000)
-            .fold(Vec::new, |mut mat, (objid, index)| {
-                if mat.len() <= objid.index() {
-                    mat.resize(objid.index() + 1, Vec::new());
-                }
-                mat[objid.index()].push(*index);
-                mat
-            })
-            .reduce(Vec::new, |mut v1, mut v2| {
-                v1.append(&mut v2);
-                v2
+    pub fn sort_mappings(&mut self, ctx: &LinkContext<'a>, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
+        debug_assert!(self.sorted_mappings.is_empty());
+
+        self.sorted_mappings = (0..self.mappings.0.len() as u32).collect();
+        if ctx.options.merge_groups {
+            self.sorted_mappings.par_sort_by_cached_key(|&index| {
+                let mapping = &self.mappings.0[index as usize];
+                let obj = &objs[mapping.obj.index()];
+                let section = &obj.sections[mapping.index];
+                (section.name, mapping.obj, mapping.index.0)
             });
-
-        InputJoinMatrix {
-            output_id: self.id,
-            mat,
         }
     }
+}
+
+/// An input section mapped to an output section.
+#[derive(Debug, Clone)]
+pub struct MappedSection<'a> {
+    /// Number of remaining sections for the object file mappings until the start
+    /// of the next object file mapping list.
+    pub remaining: u32,
+
+    /// The object file with the input section.
+    pub obj: ObjectFileId,
+
+    /// The index of the input section in the object file.
+    pub index: SectionIndex,
+
+    /// The input section relocations that will appear in the output file.
+    ///
+    /// These are the original relocations read from the input file. The symbol
+    /// table indicies need to be updated when the relocations get written to
+    /// the output file.
+    pub relocs: Vec<&'a pe::ImageRelocation>,
+
+    /// The virtual address of the input section relative to the output section
+    /// base
+    pub rva: u32,
+}
+
+impl<'a> MappedSection<'a> {
+    fn scan_relocations(
+        &mut self,
+        id: OutputSectionId,
+        ctx: &LinkContext<'a>,
+        objs: &[ArenaRef<'a, ObjectFile<'a>>],
+    ) {
+        let obj = &objs[self.obj.index()];
+        let obj = obj.as_ref();
+        let section = &obj.sections[self.index];
+
+        let mut relocs_sorted = true;
+        let mut last_address = 0u32;
+
+        for reloc in section.relocs {
+            let Ok(mut target) = obj.coff_symbols.symbol(reloc.symbol()) else {
+                continue;
+            };
+
+            let mut obj = obj;
+            if !target.is_local() {
+                let external = obj
+                    .symbols
+                    .external_symbol_ref(ctx, reloc.symbol())
+                    .unwrap();
+                let global = external.read();
+                obj = objs[global.owner.index()].as_ref();
+                target = obj.coff_symbols.symbol(global.owner_index).unwrap();
+            }
+
+            if let Some(section_index) = target.section() {
+                let section = &obj.sections[section_index];
+                if section.discarded.load(Ordering::Relaxed) {
+                    continue;
+                }
+
+                // Skip adding output relocations if the relocation can be
+                // applied in the output section
+                if section.output == id && reloc.is_pcrel(obj.machine) {
+                    continue;
+                }
+            }
+
+            self.relocs.push(reloc);
+            if last_address > reloc.virtual_address() {
+                relocs_sorted = false;
+            }
+            last_address = reloc.virtual_address();
+        }
+
+        if !relocs_sorted {
+            self.relocs
+                .par_sort_unstable_by_key(|reloc| reloc.virtual_address());
+        }
+    }
+}
+
+/// Table of input sections mapped to an output section.
+///
+/// The sections in this table are sorted by object file and section index.
+/// This allows for object files to search for input section mappings using a
+/// binary search.
+#[derive(Debug, Clone)]
+#[repr(transparent)]
+pub struct SectionMappingTable<'a>(pub Vec<MappedSection<'a>>);
+
+impl<'a> SectionMappingTable<'a> {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Searches for the section mappings for the specified object file.
+    ///
+    /// The object file mappings will be empty if none are found.
+    pub fn find_object_mappings(&self, obj: ObjectFileId) -> MappingSlice<'_, 'a> {
+        find_mapping_range(&self.0, obj)
+            .map(|range| MappingSlice(&self.0[range]))
+            .unwrap_or(MappingSlice(&[]))
+    }
+
+    /// Searches for the section mappings for the specified object file.
+    ///
+    /// The object file mappings will be empty if none are found.
+    pub fn find_object_mappings_mut(&mut self, obj: ObjectFileId) -> MappingSliceMut<'_, 'a> {
+        find_mapping_range(self.0.as_slice(), obj)
+            .map(|range| MappingSliceMut(&mut self.0[range]))
+            .unwrap_or(MappingSliceMut(&mut []))
+    }
+}
+
+fn find_mapping_range(
+    slice: &[MappedSection],
+    obj: ObjectFileId,
+) -> Option<std::ops::RangeInclusive<usize>> {
+    let start = slice.partition_point(|mapping| mapping.obj < obj);
+    let subslice = slice.get(start..)?;
+    let first = subslice.first()?;
+    if first.obj != obj {
+        return None;
+    }
+
+    let end = start + first.remaining as usize;
+    Some(start..=end)
+}
+
+/// Slice of [`MappedSection`]s for an object file.
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct MappingSlice<'b, 'a>(&'b [MappedSection<'a>]);
+
+impl<'b, 'a> MappingSlice<'b, 'a> {
+    /// Searches for the mapping that belongs to the specified section index.
+    ///
+    /// Returns `None` if the mapping could not be found.
+    pub fn find_section(&self, index: SectionIndex) -> Option<&MappedSection<'a>> {
+        let pos = binary_find_section_pos(self.0, index)?;
+        Some(&self.0[pos])
+    }
+}
+
+impl<'b, 'a> std::ops::Deref for MappingSlice<'b, 'a> {
+    type Target = &'b [MappedSection<'a>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct MappingSliceMut<'b, 'a>(&'b mut [MappedSection<'a>]);
+
+impl<'b, 'a> MappingSliceMut<'b, 'a> {
+    pub fn find_section(&self, index: SectionIndex) -> Option<&MappedSection<'a>> {
+        let pos = binary_find_section_pos(self.0, index)?;
+        Some(&self.0[pos])
+    }
+
+    pub fn find_section_mut(&mut self, index: SectionIndex) -> Option<&mut MappedSection<'a>> {
+        let pos = binary_find_section_pos(self.0, index)?;
+        Some(&mut self.0[pos])
+    }
+}
+
+fn binary_find_section_pos<'a>(slice: &[MappedSection<'a>], index: SectionIndex) -> Option<usize> {
+    slice
+        .binary_search_by_key(&index.0, |mapping| mapping.index.0)
+        .ok()
 }
 
 /// Creates the list of reserved output sections
@@ -344,8 +482,8 @@ pub fn create_reserved_sections<'a>() -> Vec<OutputSection<'a>> {
     push(".debug_str", data | r | discardable, false);
     push(".debug_line_str", data | r | discardable, false);
     push(".debug_frame", data | r | discardable, false);
-    push(".idata", data | r | w, false);
-    push(".common", uninit | r | w, false);
+    push(".idata", data | r | w, true);
+    push(".common", uninit | r | w, true);
 
     debug_assert!(sections.len() == RESERVED_SECTIONS_LEN);
 
@@ -380,25 +518,20 @@ impl<'a> SectionKey<'a> {
             }
         };
 
-        let r = SectionFlags::MemRead;
-        let w = SectionFlags::MemWrite;
-        let discardable = SectionFlags::MemDiscardable;
-        let data = SectionFlags::CntInitializedData;
+        // MinGW will unreliably set the `IMAGE_SCN_CNT_INITIALIZED_DATA` flag
+        // for .idata sections. Ensure it is always set and that the section
+        // is marked as writable for conformity.
+        if section.contains_import_data() {
+            key.flags |= SectionFlags::CntInitializedData | SectionFlags::MemWrite;
+        }
 
         if ctx.options.merge_groups {
             // Codeview sections are not merged since they are special linker
-            // sections
-            let ignore_merge: [(&[u8], SectionFlags); _] = [
-                (b".debug$S", data | r | discardable),
-                (b".debug$T", data | r | discardable),
-                (b".debug$P", data | r | discardable),
-                (b".debug$F", data | r | discardable),
-            ];
-
-            if !ignore_merge.contains(&(key.name, key.flags)) {
+            // sections. They may exist if the user passed `--no-strip-debug`.
+            if !section.is_codeview() {
                 key.name = strip_dollar(key.name);
             }
-        } else if key.name.starts_with(b".idata$") && key.flags == data | r | w {
+        } else if section.contains_import_data() {
             // Always merge import data sections
             key.name = strip_dollar(key.name);
         }
@@ -439,6 +572,8 @@ impl<'a> SectionKey<'a> {
             Some(OutputSectionId::Rdata)
         } else if name == b".xdata" && flags(data | r) {
             Some(OutputSectionId::Xdata)
+        } else if name == b".eh_frame" && flags(data | r) {
+            Some(OutputSectionId::EhFrame)
         } else if name == b".pdata" && flags(data | r) {
             Some(OutputSectionId::Pdata)
         } else if name == b".ctors" && flags(data | r | w) {
@@ -473,6 +608,8 @@ impl<'a> SectionKey<'a> {
             Some(OutputSectionId::Tls)
         } else if name == b".rsrc" && flags(data | r) {
             Some(OutputSectionId::Rsrc)
+        } else if name == b".idata" && flags(data | r | w) {
+            Some(OutputSectionId::Idata)
         } else {
             None
         }
@@ -489,18 +626,5 @@ impl SparseKeyBuilder for OutputSectionKeyBuilder {
     }
 }
 
-pub type OutputSectionInputsMap =
-    FixedSparseMap<OutputSectionId, Vec<(ObjectFileId, SectionIndex)>, OutputSectionKeyBuilder>;
-
-/// Matrix for joining input sections to output sections
-pub struct InputJoinMatrix {
-    pub output_id: OutputSectionId,
-    mat: Vec<Vec<SectionIndex>>,
-}
-
-impl InputJoinMatrix {
-    /// Gets the list of input sections for the specified object file.
-    pub fn get(&self, obj: ObjectFileId) -> Option<&[SectionIndex]> {
-        self.mat.get(obj.index()).map(|list| list.as_slice())
-    }
-}
+pub type OutputSectionPartials<'a> =
+    FixedSparseMap<OutputSectionId, Vec<SectionIndex>, OutputSectionKeyBuilder>;

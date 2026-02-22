@@ -7,7 +7,6 @@ use crate::{
     cli::CliOptions,
     coff::ImageFileMachine,
     symbols::{ManglingScheme, SymbolDemangler, SymbolMap},
-    timing::DurationExt,
 };
 
 /// Context structure which holds miscellaneous the program context used
@@ -139,18 +138,13 @@ impl LinkStats {
         let read_coffs = *self.read.coffs.get_mut();
         let read_archives = *self.read.archives.get_mut();
         let parse_coffs = *self.parse.coffs.get_mut();
+        let parse_sections = *self.parse.sections.get_mut();
+        let parse_symbols = *self.parse.symbols.get_mut();
         let parse_input_sections = *self.parse.input_sections.get_mut();
-        let parse_input_symbols = *self.parse.input_symbols.get_mut();
+        let parse_external_symbols = *self.parse.external_symbols.get_mut();
         let parse_local_symbols = *self.parse.local_symbols.get_mut();
         let parse_comdats = *self.parse.comdats.get_mut();
-        let parse_time = self.parse.time.display();
         let globals = *self.globals.get_mut();
-
-        let avg_input_sections = parse_input_sections / parse_coffs as usize;
-        let avg_input_symbols = parse_input_symbols / parse_coffs as usize;
-        let avg_local_symbols = parse_local_symbols / parse_coffs as usize;
-        let avg_comdats = parse_comdats / parse_coffs as usize;
-        let avg_time = (self.parse.time / parse_coffs).display().to_string();
 
         write!(
             w,
@@ -161,17 +155,12 @@ impl LinkStats {
     archives: {read_archives}
   parse:
     coffs: {parse_coffs}
+    sections: {parse_sections}
+    symbols: {parse_symbols}
     input_sections: {parse_input_sections}
-    input_symbols: {parse_input_symbols}
+    external_symbols: {parse_external_symbols}
     local_symbols: {parse_local_symbols}
     comdats: {parse_comdats}
-    time: {parse_time}
-  avg:
-    input_sections: {avg_input_sections}
-    input_symbols: {avg_input_symbols}
-    local_symbols: {avg_local_symbols}
-    comdats: {avg_comdats}
-    time: {avg_time}
   globals: {globals}
 "#
         )
@@ -188,9 +177,10 @@ pub struct ReadStats {
 #[derive(Debug, Default)]
 pub struct ParseStats {
     pub coffs: AtomicU32,
+    pub sections: AtomicUsize,
+    pub symbols: AtomicUsize,
+    pub external_symbols: AtomicUsize,
     pub input_sections: AtomicUsize,
-    pub input_symbols: AtomicUsize,
     pub local_symbols: AtomicUsize,
     pub comdats: AtomicUsize,
-    pub time: std::time::Duration,
 }

@@ -14,13 +14,13 @@ use rayon::iter::{
 use crate::{
     arena::{ArenaHandle, ArenaRef, TypedArena},
     cli::InputArg,
-    coff::{ImageFileMachine, Section, Symbol},
+    coff::{ImageFileMachine, Section, SectionFlags, Symbol},
     context::LinkContext,
     inputs::{InputsReader, InputsStore},
-    object::{ObjectFile, ObjectFileId},
+    object::{InputSection, ObjectFile, ObjectFileId},
     outputs::{
-        OutputFile, OutputFileHeader, OutputSection, OutputSectionId, OutputSectionInputsMap,
-        SectionKey, create_reserved_sections,
+        MappedSection, OutputFile, OutputFileHeader, OutputSection, OutputSectionId,
+        OutputSectionPartials, SectionKey, create_reserved_sections,
     },
     symbols::{GlobalSymbol, GlobalSymbolFlags, SymbolId},
     timing::ScopedTimer,
@@ -137,6 +137,14 @@ impl<'a> Linker<'a> {
         symbol.set_traced(true);
     }
 
+    pub fn add_ignored_undefined_symbol(&mut self, ctx: &mut LinkContext<'a>, name: &'a BStr) {
+        let symbol = ctx
+            .symbol_map
+            .get_map_entry(self.arch_mangle(name))
+            .or_default();
+        symbol.flags |= GlobalSymbolFlags::AllowUndefined;
+    }
+
     /// Handles resolving symbols from the currently held object files.
     ///
     /// This will go through and mark object files as live which should be included
@@ -196,7 +204,7 @@ impl<'a> Linker<'a> {
         self.objs.par_iter_mut().for_each(|obj| {
             let initialize = |obj: &mut ArenaRef<'a, ObjectFile<'a>>| -> crate::Result<()> {
                 obj.initialize_sections(ctx)?;
-                obj.initialize_symbols()?;
+                obj.initialize_symbols(ctx)?;
                 Ok(())
             };
 
@@ -299,7 +307,7 @@ impl<'a> Linker<'a> {
                         global.value = symbol.value();
                         global.section_number = symbol.section_number();
                         global.storage_class = symbol.storage_class();
-                        global.index = i;
+                        global.owner_index = i;
                     }
                 }
             });
@@ -307,7 +315,6 @@ impl<'a> Linker<'a> {
 
     /// Creates fragmented .bss sections in object files for common symbol definitions
     pub fn define_common_symbols(&mut self, ctx: &LinkContext<'a>) {
-        let _timer = ScopedTimer::msg("define common symbols");
         self.objs
             .par_iter_mut()
             .filter(|obj| obj.has_common_symbols)
@@ -326,24 +333,24 @@ impl<'a> Linker<'a> {
                         }
                     }
 
-                    // let mut characteristics = SectionFlags::CntUninitializedData
-                    //     | SectionFlags::MemRead
-                    //     | SectionFlags::MemWrite;
-                    //
-                    // characteristics.set_alignment(symbol.value().next_power_of_two().min(8192u32));
-                    //
-                    // let index = obj.sections.push(InputSection {
-                    //     name: BStr::new(b".bss"),
-                    //     characteristics,
-                    //     length: symbol.value(),
-                    //     ..Default::default()
-                    // });
-                    //
-                    // // Only one symbol should acquire this lock so there should
-                    // // not be any race condition due to double-locking
-                    // let mut global = external_ref.write();
-                    // global.value = 0;
-                    // global.section_number = index.0 as i32;
+                    let mut flags = SectionFlags::CntUninitializedData
+                        | SectionFlags::MemRead
+                        | SectionFlags::MemWrite;
+
+                    flags.set_alignment(symbol.value().next_power_of_two().min(8192u32));
+
+                    let index = obj.sections.push(InputSection {
+                        name: BStr::new(b".bss"),
+                        flags,
+                        length: symbol.value(),
+                        ..Default::default()
+                    });
+
+                    // Only one symbol should acquire this lock so there are
+                    // not any data races here due to double locking
+                    let mut global = external_ref.write();
+                    global.value = 0;
+                    global.section_number = index.0 as i32;
                 }
             });
     }
@@ -386,113 +393,128 @@ impl<'a> Linker<'a> {
     /// such as alignment, size, etc. is not calculated. The main purpose is to
     /// get the general layout of where symbols will end up in the output file
     pub fn create_output_sections(&mut self, ctx: &mut LinkContext<'a>) {
-        let _timer = ScopedTimer::msg("output section allocation");
+        let _timer = ScopedTimer::msg("create output sections");
         self.output.sections = create_reserved_sections();
         let reserved_sections_len = self.output.sections.len();
 
-        // Partition object file input sections.
-        //
-        // For each object file, accumulate a list of input sections which can
-        // be mapped to known output sections and a list of input sections which
-        // require new output section to be allocated.
-        let mut known_outputs = Vec::with_capacity(self.objs.len());
+        let mut partials = Vec::with_capacity(self.objs.len());
         let mut needed_outputs = Vec::with_capacity(self.objs.len());
 
         self.objs
             .par_iter_mut()
             .map(|obj| {
-                let objid = obj.id;
-                obj.sections
-                    .enumerate_mut()
-                    .filter_map(|(section_index, section)| {
-                        if section.is_discarded() {
-                            None
-                        } else {
-                            Some((section_index, section))
-                        }
-                    })
-                    .fold(
-                        (
-                            OutputSectionInputsMap::new(reserved_sections_len),
-                            IndexMap::new(),
-                        ),
-                        |(mut known, mut needed), (section_index, section)| {
-                            let key = SectionKey::new(ctx, section);
-                            if let Some(id) = key.known_id() {
-                                section.output = id;
-                                let entry = known.get_or_default(id);
-                                entry.push((objid, section_index));
-                            } else {
-                                let entry: &mut Vec<_> = needed.entry(key).or_default();
-                                entry.push((objid, section_index));
-                            }
-                            (known, needed)
-                        },
-                    )
-            })
-            .unzip_into_vecs(&mut known_outputs, &mut needed_outputs);
+                let mut partials = OutputSectionPartials::new(reserved_sections_len);
+                let mut needed_outputs = IndexMap::new();
 
-        let ((mut new_outputs, join_mats), _) = rayon::join(
-            || {
-                let mut section_map = HashMap::new();
-                let mut sections = Vec::new();
-                for (key, mut input_sections) in needed_outputs.into_iter().flatten() {
-                    let name = key.name();
-                    let flags = key.flags();
-                    let index = *section_map.entry(key).or_insert_with(|| {
-                        let index = sections.len();
-                        let id = OutputSectionId::new(reserved_sections_len + index);
-                        sections.push(OutputSection::new(id, BStr::new(name), flags, false));
-                        index
-                    });
-                    sections[index].inputs.append(&mut input_sections);
+                for (i, section) in obj.sections.enumerate_mut() {
+                    if section.is_discarded() {
+                        continue;
+                    }
+
+                    let key = SectionKey::new(ctx, section);
+                    if let Some(output_id) = key.known_id() {
+                        section.output = output_id;
+                        let output_partial = partials.get_or_default(output_id);
+                        output_partial.push(i);
+                    } else {
+                        let entry: &mut Vec<_> = needed_outputs.entry(key).or_default();
+                        entry.push(i);
+                    }
                 }
 
-                // Create matricies used for joining the input sections to the new
-                // output sections
-                let join_mats = sections
-                    .par_iter()
-                    .map(|section| section.create_join_matrix())
-                    .collect::<Vec<_>>();
+                (partials, needed_outputs)
+            })
+            .unzip_into_vecs(&mut partials, &mut needed_outputs);
 
-                (sections, join_mats)
+        let (mut new_sections, _) = rayon::join(
+            || {
+                let mut section_map = HashMap::new();
+                let mut new_sections = Vec::new();
+                for (objid, needs_map) in needed_outputs.into_iter().enumerate() {
+                    for (key, input_sections) in needs_map {
+                        let name = key.name();
+                        let flags = key.flags();
+                        let index = *section_map.entry(key).or_insert_with(|| {
+                            let index = new_sections.len();
+                            let id = OutputSectionId::new(reserved_sections_len + index);
+                            new_sections.push(OutputSection::new(
+                                id,
+                                BStr::new(name),
+                                flags,
+                                false,
+                            ));
+                            index
+                        });
+
+                        let objid = ObjectFileId::new(objid);
+                        let mut remaining = input_sections.len() as u32;
+                        let output_section = &mut new_sections[index];
+                        for input_section in input_sections {
+                            remaining -= 1;
+                            output_section.mappings.0.push(MappedSection {
+                                remaining,
+                                obj: objid,
+                                index: input_section,
+                                relocs: Vec::new(),
+                                rva: 0,
+                            });
+                        }
+                    }
+                }
+                new_sections
             },
             || {
-                // Join known outputs
                 self.output.sections.par_iter_mut().for_each(|section| {
                     let output_id = section.id;
-                    section.inputs.par_extend(
-                        known_outputs
+                    section.mappings.0.par_extend(
+                        partials
                             .par_iter()
-                            .filter_map(|input_map| input_map.get(output_id))
-                            .flat_map_iter(|inputs| inputs.iter().copied()),
+                            .enumerate()
+                            .filter_map(|(objid, partial)| {
+                                partial
+                                    .get(output_id)
+                                    .map(|list| (ObjectFileId::new(objid), list))
+                            })
+                            .flat_map_iter(|(obj, input_indicies)| {
+                                let mut remaining = input_indicies.len() as u32;
+                                input_indicies.iter().map(move |&index| {
+                                    remaining -= 1;
+                                    MappedSection {
+                                        remaining,
+                                        obj,
+                                        index,
+                                        relocs: Vec::new(),
+                                        rva: 0,
+                                    }
+                                })
+                            }),
                     );
                 });
             },
         );
 
-        self.output.sections.append(&mut new_outputs);
-
-        // Join newly created outputs with the input sections
-        self.objs.par_iter_mut().for_each(|obj| {
-            let outputs = join_mats
-                .par_iter()
-                .by_uniform_blocks(1_000_000)
-                .fold(Vec::new, |mut list, mat| {
-                    if let Some(indicies) = mat.get(obj.id) {
-                        list.extend(indicies.iter().map(|index| (mat.output_id, *index)));
+        self.output.sections.append(&mut new_sections);
+        self.objs
+            .par_iter_mut()
+            .filter(|obj| !obj.sections.is_empty())
+            .for_each(|obj| {
+                let obj = obj.as_mut();
+                for output_section in self.output.sections.iter() {
+                    let mappings = output_section.mappings.find_object_mappings(obj.id);
+                    if mappings.is_empty() {
+                        continue;
                     }
-                    list
-                })
-                .reduce(Vec::new, |mut v1, mut v2| {
-                    v1.append(&mut v2);
-                    v1
-                });
 
-            for (output_id, index) in outputs {
-                obj.sections[index].output = output_id;
-            }
-        });
+                    let mapping = mappings.first().unwrap();
+                    assert!(mapping.obj == obj.id);
+
+                    for mapping in mappings.iter() {
+                        let section = &mut obj.sections[mapping.index];
+                        section.output = output_section.id;
+                        obj.sections[mapping.index].output = output_section.id;
+                    }
+                }
+            });
     }
 
     /// Discards sections defining symbols related to imports and marks those
@@ -519,7 +541,7 @@ impl<'a> Linker<'a> {
                         continue;
                     }
 
-                    // Globals for IAT entries and code thunks get marked as
+                    // Globals for .idata entries and code thunks get marked as
                     // imported
                     if section.contains_import_data() || section.contains_code() {
                         let external_ref = obj.symbols.external_symbol_ref(ctx, i).unwrap();
@@ -551,13 +573,13 @@ impl<'a> Linker<'a> {
                         && (global.owner.is_internal() || obj.id < global.owner)
                     {
                         global.owner = obj.id;
-                        global.index = i;
+                        global.owner_index = i;
                     }
                 } else if symbol.is_weak() {
                     let (external, external_ref) =
                         obj.symbols.external_symbol_ref2(ctx, i).unwrap();
                     let mut global = external_ref.write();
-                    if global.owner == obj.id && global.index == i {
+                    if global.owner == obj.id && global.owner_index == i {
                         // TODO: check recursive weak definitions and handle cycles.
                         // Should not be a thing but it is technically possible...
                         let default_symbol =
@@ -565,21 +587,60 @@ impl<'a> Linker<'a> {
                         global.value = default_symbol.value();
                         global.section_number = default_symbol.section_number();
                         global.storage_class = default_symbol.storage_class();
-                        global.index = external.weak_default;
+                        global.owner_index = external.weak_default;
                     }
                 }
             }
         });
     }
 
-    pub fn scan_relocations(&mut self, ctx: &LinkContext<'a>) {
+    pub fn scan_relocations(&mut self, ctx: &mut LinkContext<'a>) {
         let _timer = ScopedTimer::msg("scan relocations");
 
         let objs = &self.objs;
-        self.objs.par_iter().for_each(|obj| {
-            if let Err(e) = obj.scan_relocations(ctx, objs) {
-                log::error!(logger: ctx, "{e}");
+        // Scan relocations against input sections
+        let undefined_symbols = self
+            .objs
+            .par_iter()
+            .filter_map(|obj| {
+                obj.scan_relocations(ctx, objs)
+                    .inspect_err(|e| log::error!(logger: &*ctx, "{e}"))
+                    .ok()
+            })
+            .reduce(IndexMap::new, |mut a1, a2| {
+                a1.extend(a2);
+                a1
+            });
+
+        ctx.exclusive_check_errored();
+
+        if !undefined_symbols.is_empty() {
+            for (id, mut references) in undefined_symbols {
+                let name = ctx.symbol_map.get_exclusive_symbol(id).unwrap().name;
+                let remaining = references.len().saturating_sub(5);
+                if remaining > 0 {
+                    references.truncate(5);
+                    references.push(format!("referenced {remaining} more times"));
+                }
+
+                let msg = format_args!(
+                    "undefined symbol: {}\n{}",
+                    ctx.demangle(name, self.output.architecture()),
+                    references.join("\n")
+                );
+
+                if ctx.options.warn_unresolved_symbols {
+                    log::warn!("{msg}");
+                } else {
+                    log::error!(logger: &*ctx, "{msg}");
+                    std::process::exit(1);
+                }
             }
+        }
+
+        // Scan relocations against output sections
+        self.output.sections.par_iter_mut().for_each(|section| {
+            section.scan_relocations(ctx, objs);
         });
     }
 
@@ -631,17 +692,16 @@ impl<'a> Linker<'a> {
             );
     }
 
-    pub fn sort_output_inputs(&mut self, ctx: &LinkContext<'a>) {
-        self.output.sections.par_iter_mut().for_each(|section| {
-            section.sort_inputs(ctx, &self.objs);
-        });
+    pub fn sort_section_mappings(&mut self, ctx: &LinkContext<'a>) {
+        let _timer = ScopedTimer::msg("sort grouped sections");
+        self.output
+            .sections
+            .par_iter_mut()
+            .filter(|section| !section.exclude)
+            .for_each(|section| {
+                section.sort_mappings(ctx, &self.objs);
+            });
     }
 
-    pub fn compute_sections(&mut self) {
-        let _timer = ScopedTimer::msg("compute sections");
-        let objs = &self.objs;
-        self.output.sections.par_iter_mut().for_each(|section| {
-            section.compute_sections(objs);
-        });
-    }
+    pub fn compute_sections(&mut self, ctx: &LinkContext<'a>) {}
 }

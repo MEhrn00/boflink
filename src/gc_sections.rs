@@ -165,7 +165,7 @@ fn visit_section<'scope, 'a: 'scope>(
                 .external_symbol_ref(ctx, reloc.symbol())
                 .unwrap();
             let global = external_ref.read();
-            visit_symbol(ctx, objs, global.owner, global.index, scope);
+            visit_symbol(ctx, objs, global.owner, global.owner_index, scope);
         } else {
             visit_definition(ctx, objs, obj.id, symbol.section(), scope);
         }
