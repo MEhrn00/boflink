@@ -1,0 +1,10 @@
+[package]
+name = "boflink_index"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rayon = { workspace = true, optional = true }
+
+[features]
+rayon = ["dep:rayon"]
