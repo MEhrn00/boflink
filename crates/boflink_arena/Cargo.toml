@@ -1,0 +1,12 @@
+[package]
+name = "boflink_arena"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bumpalo = "3"
+typed-arena = "2"
+parking_lot = { workspace = true, optional = true}
+
+[features]
+parking_lot = ["dep:parking_lot"]
