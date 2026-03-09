@@ -17,9 +17,14 @@ impl PathExt for std::path::Path {
     fn normalize_lexically_cpp(&self) -> PathBuf {
         let mut iter = self.components().peekable();
 
+        let mut rooted = false;
         let root = match iter.peek() {
             None => return PathBuf::new(),
-            Some(p @ Component::RootDir) | Some(p @ Component::Prefix(_)) => Some(*p),
+            Some(p @ Component::RootDir) | Some(p @ Component::Prefix(_)) => {
+                rooted = true;
+                Some(*p)
+            }
+            Some(p @ Component::ParentDir) => Some(*p),
             _ => None,
         };
 
@@ -32,7 +37,9 @@ impl PathExt for std::path::Path {
                     continue;
                 }
                 Component::ParentDir => {
-                    if !normalized.pop() {
+                    if !rooted {
+                        normalized.push(Component::ParentDir);
+                    } else if !normalized.pop() {
                         if let Some(root) = root {
                             normalized.push(root);
                         } else {
@@ -41,6 +48,7 @@ impl PathExt for std::path::Path {
                     }
                 }
                 o => {
+                    rooted = true;
                     normalized.push(o);
                 }
             }
@@ -74,6 +82,7 @@ mod tests {
             ("foo/./bar/..", "foo/"),
             // Allow traversing up the filesystem
             ("../foo", "../foo"),
+            ("../../foo/bar", "../../foo/bar"),
             ("foo/./bar/../../../baz", "../baz"),
             // Check root normalization
             ("/root/not/in/path/../../../foo/bar", "/root/foo/bar"),

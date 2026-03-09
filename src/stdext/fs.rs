@@ -18,6 +18,7 @@ impl FileExt for std::fs::File {
     ///
     /// This identifier can be used for checking if two handles refer to the
     /// same file on the file system.
+    #[inline]
     fn unique_id(&self) -> Result<UniqueFileId, std::io::Error> {
         Ok(UniqueFileId(platform::UniqueFileId::compute_id(self)?))
     }
