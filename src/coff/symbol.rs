@@ -1,152 +1,115 @@
 use bitflags::bitflags;
-use object::{SectionIndex, pe};
+use object::{StringTable, pe, read::coff};
+
+use crate::symbols::Symbol;
 
 /// A COFF symbol table.
-pub type SymbolTable<'a> = object::coff::SymbolTable<'a>;
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct SymbolIndex(pub u32);
 
-/// This trait is used to abstract various routines when dealing with COFF symbols.
-///
-/// COFF symbols include 4 main metadata fields.
-/// - Value
-/// - SectionNumber
-/// - Type
-/// - StorageClass
-///
-/// Some of these fields are insignificant on their own without being paired with
-/// values from other fields.
-/// This trait requires implementors to add accessors for these metadata fields.
-///
-/// The rest of the trait methods allow querying for different attributes of
-/// symbols through the associated fields.
-pub trait Symbol {
-    /// Returns the raw `Value` from the symbol
-    fn value(&self) -> u32;
-
-    /// Returns the raw `SectionNumber` from the symbol
-    fn section_number(&self) -> i32;
-
-    /// Returns the raw `Type` from the symbol
-    fn typ(&self) -> u16;
-
-    /// Returns the raw `StorageClass` from the symbol
-    fn storage_class(&self) -> u8;
-
-    /// Returns the base type of the symbol
-    fn base_type(&self) -> u16 {
-        self.typ() & pe::N_BTMASK
+impl boflink_index::Idx for SymbolIndex {
+    #[inline]
+    fn from_usize(idx: usize) -> Self {
+        assert!(idx <= u32::MAX as usize);
+        Self(idx as u32)
     }
 
-    /// Returns the complex type of the symbol
-    fn complex_type(&self) -> u16 {
-        (self.typ() & pe::N_TMASK) >> pe::N_BTSHFT
-    }
-
-    /// Returns the index of the section this symbol is defined in
-    fn section(&self) -> Option<SectionIndex> {
-        let section_number = self.section_number();
-        if section_number > pe::IMAGE_SYM_UNDEFINED {
-            Some(object::SectionIndex(section_number as usize))
-        } else {
-            None
-        }
-    }
-
-    /// Returns `true` if this is a symbol for a debug item
-    fn is_debug(&self) -> bool {
-        self.section_number() == pe::IMAGE_SYM_DEBUG
-    }
-
-    /// Returns `true` if this is an absolute symbol.
-    ///
-    /// The value is interpreted as the symbol value.
-    fn is_absolute(&self) -> bool {
-        self.section_number() == pe::IMAGE_SYM_ABSOLUTE
-    }
-
-    /// Returns `true` if this is a relocatable symbol.
-    ///
-    /// A relocatable symbol means that the value field refers to an RVA inside
-    /// the section referred to by the section number.
-    fn is_relocatable(&self) -> bool {
-        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
-            || self.storage_class() == pe::IMAGE_SYM_CLASS_STATIC
-            || self.storage_class() == pe::IMAGE_SYM_CLASS_LABEL
-    }
-
-    /// Returns `true` if this is a globally visible symbol.
-    ///
-    /// Globally visible symbols are symbols with `IMAGE_SYM_CLASS_EXTERNAL` or
-    /// `IMAGE_SYM_CLASS_WEAK_EXTERNAL` storage class
-    fn is_global(&self) -> bool {
-        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
-            || self.storage_class() == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
-    }
-
-    /// Returns `true` if this symbol is locally scoped.
-    ///
-    /// Local symbols are all other symbols that do not fall under the category of
-    /// [`Symbol::is_global()`]
-    fn is_local(&self) -> bool {
-        !self.is_global()
-    }
-
-    /// Returns `true` if this symbol is an undefined external symbol.
-    ///
-    /// An undefined external symbol is a symbol with `IMAGE_SYM_CLASS_EXTERNAL`
-    /// storage class, a section number of 0 (`IMAGE_SYM_UNDEFINED`) and a value
-    /// of 0.
-    ///
-    /// # Note
-    /// Common symbols [`Symbol::is_common()`] and weak externals [`Symbol::is_weak()`]
-    /// do not fall under this category
-    fn is_undefined(&self) -> bool {
-        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
-            && self.section_number() == pe::IMAGE_SYM_UNDEFINED
-            && self.value() == 0
-    }
-
-    /// Returns `true` if this is a common symbol.
-    ///
-    /// A common symbol has `IMAGE_SYM_CLASS_EXTERNAL` storage class, a section
-    /// number of 0 (`IMAGE_SYM_UNDEFINED`) and a value that is non-zero. The
-    /// value field is interpreted as the symbol size/alignment
-    fn is_common(&self) -> bool {
-        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
-            && self.section_number() == pe::IMAGE_SYM_UNDEFINED
-            && self.value() > 0
-    }
-
-    /// Returns `true` if this is a weak external symbol
-    fn is_weak(&self) -> bool {
-        self.storage_class() == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
-    }
-
-    /// Returns `true` if this symbol is for a code label
-    fn is_label(&self) -> bool {
-        self.storage_class() == pe::IMAGE_SYM_CLASS_LABEL
+    #[inline]
+    fn index(self) -> usize {
+        self.0 as usize
     }
 }
 
-impl Symbol for &pe::ImageSymbol {
+impl std::fmt::Display for SymbolIndex {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct SymbolTable<'a, H: coff::CoffHeader = pe::ImageFileHeader>(
+    coff::SymbolTable<'a, &'a [u8], H>,
+);
+
+impl<'a, H: coff::CoffHeader> Default for SymbolTable<'a, H> {
+    fn default() -> Self {
+        Self(coff::SymbolTable::default())
+    }
+}
+
+impl<'a, H: coff::CoffHeader> SymbolTable<'a, H> {
+    #[inline]
+    pub fn parse(header: &H, data: &'a [u8]) -> crate::Result<Self> {
+        Ok(Self(coff::SymbolTable::parse(header, data)?))
+    }
+
+    #[inline]
+    pub fn strings(&self) -> StringTable<'a> {
+        self.0.strings()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = (SymbolIndex, &'a <H as coff::CoffHeader>::ImageSymbol)> {
+        self.0
+            .iter()
+            .map(|(i, symbol)| (SymbolIndex(i.0 as u32), symbol))
+    }
+
+    #[inline]
+    pub fn symbol(&self, index: SymbolIndex) -> crate::Result<&'a H::ImageSymbol> {
+        Ok(self.0.symbol(object::SymbolIndex(index.0 as usize))?)
+    }
+
+    #[inline]
+    pub fn aux_section(&self, index: SymbolIndex) -> crate::Result<&'a pe::ImageAuxSymbolSection> {
+        Ok(self.0.aux_section(object::SymbolIndex(index.0 as usize))?)
+    }
+
+    #[inline]
+    pub fn aux_weak_external(
+        &self,
+        index: SymbolIndex,
+    ) -> crate::Result<&'a pe::ImageAuxSymbolWeak> {
+        Ok(self
+            .0
+            .aux_weak_external(object::SymbolIndex(index.0 as usize))?)
+    }
+}
+
+impl<T: coff::ImageSymbol> Symbol for T {
+    #[inline]
     fn value(&self) -> u32 {
-        self.value.get(object::LittleEndian)
+        coff::ImageSymbol::value(self)
     }
 
-    fn section_number(&self) -> i32 {
-        let number = self.section_number.get(object::LittleEndian);
-        if number >= pe::IMAGE_SYM_SECTION_MAX {
-            (number.cast_signed()) as i32
-        } else {
-            number as i32
-        }
-    }
-
-    fn typ(&self) -> u16 {
-        self.typ.get(object::LittleEndian)
-    }
-
+    #[inline]
     fn storage_class(&self) -> u8 {
-        self.storage_class
+        coff::ImageSymbol::storage_class(self)
+    }
+
+    #[inline]
+    fn section_number(&self) -> i32 {
+        coff::ImageSymbol::section_number(self)
+    }
+
+    #[inline]
+    fn is_function(&self) -> bool {
+        self.derived_type() == pe::IMAGE_SYM_DTYPE_FUNCTION
     }
 }
 

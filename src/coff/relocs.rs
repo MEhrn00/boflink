@@ -14,12 +14,14 @@ pub trait Relocation {
     fn typ(&self) -> u16;
 
     /// Returns the index of the target symbol for this relocation.
+    #[inline]
     fn symbol(&self) -> SymbolIndex {
         SymbolIndex(self.symbol_table_index() as usize)
     }
 
     /// Returns `true` if this is a PC-relative relocation variant for the
     /// specified machine
+    #[inline]
     fn is_pcrel(&self, machine: ImageFileMachine) -> bool {
         match machine {
             ImageFileMachine::Amd64 => Amd64RelType(self.typ()).is_pcrel(),
@@ -30,6 +32,7 @@ pub trait Relocation {
 
     /// Returns `true` if this is an `ADDR` relocation variant for the specified
     /// machine
+    #[inline]
     fn is_addr(&self, machine: ImageFileMachine) -> bool {
         match machine {
             ImageFileMachine::Amd64 => Amd64RelType(self.typ()).is_addr(),
@@ -40,14 +43,17 @@ pub trait Relocation {
 }
 
 impl Relocation for &pe::ImageRelocation {
+    #[inline]
     fn virtual_address(&self) -> u32 {
         self.virtual_address.get(object::LittleEndian)
     }
 
+    #[inline]
     fn symbol_table_index(&self) -> u32 {
         self.symbol_table_index.get(object::LittleEndian)
     }
 
+    #[inline]
     fn typ(&self) -> u16 {
         self.typ.get(object::LittleEndian)
     }
@@ -57,6 +63,7 @@ trait RelType {
     fn is_addr(&self) -> bool;
     fn is_rel32(&self) -> bool;
 
+    #[inline]
     fn is_pcrel(&self) -> bool {
         self.is_rel32()
     }
@@ -67,10 +74,12 @@ trait RelType {
 struct Amd64RelType(u16);
 
 impl RelType for Amd64RelType {
+    #[inline]
     fn is_addr(&self) -> bool {
         self.0 >= pe::IMAGE_REL_AMD64_ADDR64 && self.0 <= pe::IMAGE_REL_AMD64_ADDR32NB
     }
 
+    #[inline]
     fn is_rel32(&self) -> bool {
         self.0 >= pe::IMAGE_REL_AMD64_REL32 && self.0 <= pe::IMAGE_REL_AMD64_REL32_5
     }
@@ -81,10 +90,12 @@ impl RelType for Amd64RelType {
 struct I386RelType(u16);
 
 impl RelType for I386RelType {
+    #[inline]
     fn is_addr(&self) -> bool {
         self.0 == pe::IMAGE_REL_I386_DIR32 || self.0 == pe::IMAGE_REL_I386_DIR32NB
     }
 
+    #[inline]
     fn is_rel32(&self) -> bool {
         self.0 == pe::IMAGE_REL_I386_REL32
     }

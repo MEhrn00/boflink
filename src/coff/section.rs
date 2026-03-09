@@ -1,116 +1,108 @@
 use bitflags::bitflags;
-use object::pe;
+use boflink_index::Idx;
+use object::{ReadRef, pe, read::coff};
 
-/// A COFF section header table
-pub type SectionTable<'a> = object::coff::SectionTable<'a>;
+use crate::{
+    chunks::{P2Align, SectionChunk},
+    make_error,
+};
 
 /// Shift value for extracting the alignment from section flags
 pub const SECTION_FLAGS_ALIGN_SHIFT: usize = 20;
 
-/// Trait for abstracting various routines when dealing with sections.
-///
-/// This allows querying information about a section without needing to use the
-/// underlying const values.
-pub trait Section {
-    /// Returns the name of the section.
-    ///
-    /// This could either be the full section name or the short form of it
-    /// depending on if the concrete section type stores that information.
-    fn name_bytes(&self) -> &[u8];
+/// 1-based section index
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct SectionIndex(pub u32);
 
-    /// Returns the `SizeOfRawData` field used for the section.
-    ///
-    /// This is either the size of the file-backed data or the size of an
-    /// uninitialized section.
-    fn size_of_raw_data(&self) -> u32;
-
-    /// Returns the `Characteristics` flags from the section.
-    fn characteristics(&self) -> u32;
-
-    /// Returns [`SectionFlags`] representation of the characteristics for
-    /// extracting specific section information.
-    fn section_flags(&self) -> SectionFlags {
-        SectionFlags(self.characteristics())
+impl boflink_index::Idx for SectionIndex {
+    #[inline]
+    fn from_usize(idx: usize) -> Self {
+        assert!(idx <= u32::MAX as usize);
+        Self(idx as u32)
     }
 
-    /// Returns `true` if this is a COMDAT section.
-    fn is_comdat(&self) -> bool {
-        self.characteristics() & pe::IMAGE_SCN_LNK_COMDAT != 0
-    }
-
-    /// Returns the section alignment
-    fn alignment(&self) -> u32 {
-        self.section_flags().alignment()
-    }
-
-    /// Returns `true` if this section contains uninitialized data.
-    fn contains_uninitialized_data(&self) -> bool {
-        self.characteristics() & pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0
-    }
-
-    /// Returns `true` if this section contains executable code
-    fn contains_code(&self) -> bool {
-        let flags = pe::IMAGE_SCN_CNT_CODE | pe::IMAGE_SCN_MEM_EXECUTE;
-        self.characteristics() & flags == flags
-    }
-
-    /// Returns `true` if this is a debug section with codeview debug information.
-    fn is_codeview(&self) -> bool {
-        let names = [b".debug$F", b".debug$P", b".debug$S", b".debug$T"];
-
-        let debug_flags =
-            pe::IMAGE_SCN_CNT_CODE | pe::IMAGE_SCN_MEM_READ | pe::IMAGE_SCN_MEM_DISCARDABLE;
-        let scn_flags = self.characteristics();
-        let name = self.name_bytes();
-        scn_flags & debug_flags == debug_flags
-            && scn_flags & pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA == 0
-            && self.size_of_raw_data() > 0
-            && names.iter().any(|&n| n == name)
-    }
-
-    /// Returns `true` if the `IMAGE_SCN_MEM_DISCARDABLE` flag is set
-    fn is_mem_discardable(&self) -> bool {
-        self.characteristics() & pe::IMAGE_SCN_MEM_DISCARDABLE != 0
-    }
-
-    /// Returns `true` if this section contains import metadata.
-    fn contains_import_data(&self) -> bool {
-        let names = [
-            b".idata$2",
-            b".idata$3",
-            b".idata$4",
-            b".idata$5",
-            b".idata$6",
-            b".idata$7",
-        ];
-
-        // MinGW will not set the `IMAGE_SCN_CNT_INITIALIZED_DATA` flag properly
-        // in import libraries. Just test if the section is readable and
-        // !(executable or code or uninitialized data)
-
-        let scn_flags = self.characteristics();
-        let name = self.name_bytes();
-        scn_flags & pe::IMAGE_SCN_MEM_READ != 0
-            && scn_flags
-                & (pe::IMAGE_SCN_MEM_EXECUTE
-                    | pe::IMAGE_SCN_CNT_CODE
-                    | pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA)
-                == 0
-            && names.iter().any(|&n| n == name)
+    #[inline]
+    fn index(self) -> usize {
+        self.0 as usize
     }
 }
 
-impl Section for &pe::ImageSectionHeader {
-    fn name_bytes(&self) -> &[u8] {
+impl std::fmt::Display for SectionIndex {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+#[repr(transparent)]
+pub struct SectionTable<'a>(&'a [pe::ImageSectionHeader]);
+
+impl<'a> SectionTable<'a> {
+    #[inline]
+    pub fn parse<H: coff::CoffHeader>(
+        header: &H,
+        data: &'a [u8],
+        offset: u64,
+    ) -> crate::Result<Self> {
+        Ok(Self(
+            data.read_slice_at(offset, header.number_of_sections() as usize)
+                .map_err(|_| make_error!("invalid COFF/PE section headers"))?,
+        ))
+    }
+
+    #[inline]
+    pub fn iter(&self) -> std::slice::Iter<'a, pe::ImageSectionHeader> {
+        self.0.iter()
+    }
+
+    #[inline]
+    pub fn enumerate(&self) -> impl Iterator<Item = (SectionIndex, &'a pe::ImageSectionHeader)> {
+        let _ = SectionIndex::from_usize(self.0.len() + 1);
+        self.0
+            .iter()
+            .enumerate()
+            .map(|(i, section)| (SectionIndex::from_usize(i + 1), section))
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn section(&self, index: SectionIndex) -> crate::Result<&'a pe::ImageSectionHeader> {
+        self.0
+            .get(index.0.wrapping_sub(1) as usize)
+            .ok_or_else(|| make_error!("invalid COFF/PE section index"))
+    }
+}
+
+impl<'a> SectionChunk<'a> for &'a pe::ImageSectionHeader {
+    #[inline]
+    fn name_bytes(&self) -> &'a [u8] {
         self.raw_name()
     }
 
-    fn size_of_raw_data(&self) -> u32 {
-        self.size_of_raw_data.get(object::LittleEndian)
+    #[inline]
+    fn contents_flags(&self) -> u32 {
+        self.characteristics.get(object::LittleEndian) & 0xe0
     }
 
-    fn characteristics(&self) -> u32 {
-        self.characteristics.get(object::LittleEndian)
+    #[inline]
+    fn memory_flags(&self) -> u32 {
+        self.characteristics.get(object::LittleEndian) & 0xfe000000
+    }
+
+    #[inline]
+    fn p2align(&self) -> P2Align {
+        P2Align::from_scn_flags(self.characteristics.get(object::LittleEndian))
     }
 }
 
@@ -192,27 +184,21 @@ impl SectionFlags {
     }
 
     /// Returns a new set of flags with only the `IMAGE_SCN_MEM_*` flags set.
+    #[inline]
     pub const fn memory_flags(self) -> Self {
         Self(self.0 & 0xfe000000)
     }
 
     /// Returns a new set of flags with only the `IMAGE_SCN_CNT_*` flags set.
+    #[inline]
     pub const fn contents_flags(self) -> Self {
         Self(self.0 & 0xe0)
     }
 
     /// Returns the union of
     /// [`SectionFlags::memory_flags()`] `|` [`SectionFlags::contents_flags()`]
+    #[inline]
     pub const fn kind_flags(self) -> Self {
         Self(self.memory_flags().0 | self.contents_flags().0)
     }
-}
-
-/// Computes a section checksum from the specified data.
-///
-/// This is the JamCRC checksum with an init value of -1
-pub fn compute_checksum(data: &[u8]) -> u32 {
-    let mut h = crc32fast::Hasher::new_with_initial(u32::MAX);
-    h.update(data);
-    !h.finalize()
 }
