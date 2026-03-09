@@ -1,4 +1,7 @@
-use std::marker::PhantomData;
+use std::{
+    marker::PhantomData,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::Idx;
 
@@ -52,6 +55,7 @@ impl<T: Idx> DenseBitSet<T> {
     /// # Panics
     /// This panics if [`Idx::index()`] is exceeds the bitset domain.
     #[inline]
+    #[must_use]
     pub fn contains(&self, item: T) -> bool {
         assert!(item.index() < self.domain);
         let (i, mask) = entry_location(item);
@@ -92,15 +96,161 @@ impl<T: Idx> DenseBitSet<T> {
     }
 }
 
+impl<T> From<AtomicDenseBitSet<T>> for DenseBitSet<T> {
+    #[inline]
+    fn from(value: AtomicDenseBitSet<T>) -> Self {
+        Self {
+            domain: value.domain,
+            entries: value
+                .entries
+                .into_iter()
+                .map(|entry| entry.into_inner())
+                .collect(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AtomicDenseBitSet<T> {
+    domain: usize,
+    entries: Vec<AtomicU64>,
+    _marker: PhantomData<T>,
+}
+
+impl<T> AtomicDenseBitSet<T> {
+    #[inline]
+    pub fn domain_size(&self) -> usize {
+        self.domain
+    }
+}
+
+impl<T: Idx> AtomicDenseBitSet<T> {
+    #[inline]
+    pub fn new_empty(domain: usize) -> Self {
+        DenseBitSet::new_empty(domain).into()
+    }
+
+    #[inline]
+    pub fn new_filled(domain: usize) -> Self {
+        DenseBitSet::new_filled(domain).into()
+    }
+
+    #[inline]
+    pub fn insert(&self, item: T, order: Ordering) -> bool {
+        assert!(item.index() < self.domain);
+        let (i, mask) = entry_location(item);
+        let entry = &self.entries[i];
+        entry.fetch_or(mask, order) & mask == 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn contains(&self, item: T, order: Ordering) -> bool {
+        assert!(item.index() < self.domain);
+        let (i, mask) = entry_location(item);
+        self.entries[i].load(order) & mask != 0
+    }
+}
+
+impl<T> From<DenseBitSet<T>> for AtomicDenseBitSet<T> {
+    #[inline]
+    fn from(value: DenseBitSet<T>) -> Self {
+        Self {
+            domain: value.domain,
+            entries: value.entries.into_iter().map(AtomicU64::new).collect(),
+            _marker: PhantomData,
+        }
+    }
+}
+
 #[inline]
 fn entry_location<T: Idx>(item: T) -> (usize, u64) {
     let index = item.index();
     let entry = index / u64::BITS as usize;
-    let mask = 1u64 << (entry % u64::BITS as usize);
+    let mask = 1u64 << (index % u64::BITS as usize);
     (entry, mask)
 }
 
 #[inline]
 const fn num_entries(domain: usize) -> usize {
     domain.div_ceil(u64::BITS as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::AtomicDenseBitSet;
+
+    #[test]
+    fn atomic_insert_contains() {
+        let id = 0;
+
+        let bset = AtomicDenseBitSet::<u32>::new_empty(1);
+        bset.insert(id, Ordering::Relaxed);
+        let ret = bset.contains(id, Ordering::Relaxed);
+        assert!(ret);
+    }
+
+    #[test]
+    fn atomic_new_insert() {
+        let id = 0;
+
+        let bset = AtomicDenseBitSet::<u32>::new_empty(1);
+        let ret = bset.insert(id, Ordering::Relaxed);
+        assert!(ret);
+    }
+
+    #[test]
+    fn atomic_double_insert() {
+        let id = 0;
+
+        let bset = AtomicDenseBitSet::<u32>::new_empty(1);
+        let ret = bset.insert(id, Ordering::Relaxed);
+        assert!(ret);
+        let ret = bset.insert(id, Ordering::Relaxed);
+        assert!(!ret);
+    }
+
+    #[test]
+    fn atomic_adjacent_insert() {
+        let id1 = 0;
+        let id2 = 4;
+
+        let bset = AtomicDenseBitSet::<u32>::new_empty(5);
+        bset.insert(id1, Ordering::Relaxed);
+        assert!(bset.contains(id1, Ordering::Relaxed));
+        assert!(!bset.contains(id2, Ordering::Relaxed));
+    }
+
+    #[test]
+    fn atomic_adjacent_new_insert() {
+        let id1 = 0;
+        let id2 = 4;
+
+        let bset = AtomicDenseBitSet::<u32>::new_empty(5);
+        let ret = bset.insert(id1, Ordering::Relaxed);
+        assert!(ret);
+        let ret = bset.insert(id2, Ordering::Relaxed);
+        assert!(ret);
+    }
+
+    #[test]
+    fn atomic_adjacent_double_insert() {
+        let id1 = 0;
+        let id2 = 4;
+
+        let bset = AtomicDenseBitSet::<u32>::new_empty(5);
+        let ret = bset.insert(id1, Ordering::Relaxed);
+        assert!(ret);
+        let ret = bset.insert(id2, Ordering::Relaxed);
+        assert!(ret);
+
+        let ret = bset.insert(id1, Ordering::Relaxed);
+        assert!(!ret);
+
+        let ret = bset.insert(id2, Ordering::Relaxed);
+        assert!(!ret);
+    }
 }

@@ -36,6 +36,16 @@ impl<I: Idx, T> IndexVec<I, T> {
     }
 
     #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        self.raw.reserve(additional);
+    }
+
+    #[inline]
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.raw.reserve_exact(additional);
+    }
+
+    #[inline]
     pub fn from_elem<S>(elem: T, universe: &IndexSlice<I, S>) -> Self
     where
         T: Clone,
