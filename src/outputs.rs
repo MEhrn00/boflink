@@ -45,32 +45,35 @@
 //!
 //! All other sections are ordered after the reserved sections on a "first-seen" basis.
 
-use std::sync::atomic::Ordering;
-
+use boflink_index::IndexVec;
 use bstr::BStr;
 use object::{SectionIndex, pe};
-use rayon::{
-    iter::{IntoParallelRefMutIterator, ParallelIterator},
-    slice::ParallelSliceMut,
-};
 
 use crate::{
-    arena::ArenaRef,
-    coff::{CoffFlags, ImageFileMachine, Relocation, Section, SectionFlags, Symbol},
+    chunks::SectionChunk,
+    coff::SectionFlags,
     context::LinkContext,
-    object::{InputSection, ObjectFile, ObjectFileId},
-    sparse_set::{FixedSparseMap, SparseKeyBuilder},
-    symbols::SymbolId,
+    object::{InputSection, ObjectFileId},
 };
-
-#[cfg(test)]
-mod tests;
 
 /// ID for an output section.
 ///
 /// Section 0 is treated as the `SHT_NULL` section and is unused
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OutputSectionId(u32);
+
+impl boflink_index::Idx for OutputSectionId {
+    #[inline]
+    fn from_usize(idx: usize) -> Self {
+        assert!(idx <= u32::MAX as usize);
+        Self(idx as u32)
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
 
 #[allow(non_upper_case_globals)]
 impl OutputSectionId {
@@ -125,37 +128,8 @@ impl OutputSectionId {
 }
 
 #[derive(Debug, Default)]
-pub struct OutputFile<'a> {
-    pub header: OutputFileHeader,
-    pub sections: Vec<OutputSection<'a>>,
-    pub globals: Vec<SymbolId>,
-}
-
-impl<'a> OutputFile<'a> {
-    pub fn architecture(&self) -> ImageFileMachine {
-        self.header.machine
-    }
-}
-
-#[derive(Debug)]
-pub struct OutputFileHeader {
-    pub machine: ImageFileMachine,
-    pub number_of_sections: u16,
-    pub pointer_to_symbol_table: u32,
-    pub number_of_symbols: u32,
-    pub characteristics: CoffFlags,
-}
-
-impl std::default::Default for OutputFileHeader {
-    fn default() -> Self {
-        Self {
-            machine: ImageFileMachine::Unknown,
-            number_of_sections: 0,
-            pointer_to_symbol_table: 0u32,
-            number_of_symbols: 0u32,
-            characteristics: CoffFlags::LineNumsStripped,
-        }
-    }
+pub struct LinkOutputs<'a> {
+    pub sections: IndexVec<OutputSectionId, OutputSection<'a>>,
 }
 
 /// Section for the output file.
@@ -163,12 +137,6 @@ impl std::default::Default for OutputFileHeader {
 /// This contains the section metadata and list of indicies for input sections.
 #[derive(Debug, Clone)]
 pub struct OutputSection<'a> {
-    /// Id of this output section.
-    ///
-    /// The output section list is designed to stay fixed so this id should be
-    /// stable.
-    pub id: OutputSectionId,
-
     /// Name that will end up in the section header
     pub name: &'a BStr,
 
@@ -194,68 +162,19 @@ pub struct OutputSection<'a> {
     /// discarded.
     pub exclude: bool,
 
-    /// File offset for writing the section data.
-    pub pointer_to_raw_data: u32,
-
-    /// File offset for writing relocations.
-    pub pointer_to_relocations: u32,
-
-    /// Sorted indicies of input section mappings.
-    ///
-    /// Each item is an index into the mappings table.
-    pub sorted_mappings: Vec<u32>,
-
     /// Input section mapping table
-    pub mappings: SectionMappingTable<'a>,
+    pub mappings: Vec<MappedSection<'a>>,
 }
 
 impl<'a> OutputSection<'a> {
-    pub fn new(
-        id: OutputSectionId,
-        name: &'a BStr,
-        characteristics: SectionFlags,
-        exclude: bool,
-    ) -> Self {
+    pub fn new(name: &'a BStr, characteristics: SectionFlags, exclude: bool) -> Self {
         Self {
-            id,
             name,
             characteristics,
             index: SectionIndex(0),
             length: 0,
             exclude,
-            pointer_to_raw_data: 0,
-            pointer_to_relocations: 0,
-            sorted_mappings: Vec::new(),
-            mappings: SectionMappingTable::new(),
-        }
-    }
-
-    pub fn scan_relocations(
-        &mut self,
-        ctx: &LinkContext<'a>,
-        objs: &[ArenaRef<'a, ObjectFile<'a>>],
-    ) {
-        if self.exclude {
-            return;
-        }
-
-        let id = self.id;
-        self.mappings.0.par_iter_mut().for_each(|mapping| {
-            mapping.scan_relocations(id, ctx, objs);
-        });
-    }
-
-    pub fn sort_mappings(&mut self, ctx: &LinkContext<'a>, objs: &[ArenaRef<'a, ObjectFile<'a>>]) {
-        debug_assert!(self.sorted_mappings.is_empty());
-
-        self.sorted_mappings = (0..self.mappings.0.len() as u32).collect();
-        if ctx.options.merge_groups {
-            self.sorted_mappings.par_sort_by_cached_key(|&index| {
-                let mapping = &self.mappings.0[index as usize];
-                let obj = &objs[mapping.obj.index()];
-                let section = &obj.sections[mapping.index];
-                (section.name, mapping.obj, mapping.index.0)
-            });
+            mappings: Vec::new(),
         }
     }
 }
@@ -263,10 +182,6 @@ impl<'a> OutputSection<'a> {
 /// An input section mapped to an output section.
 #[derive(Debug, Clone)]
 pub struct MappedSection<'a> {
-    /// Number of remaining sections for the object file mappings until the start
-    /// of the next object file mapping list.
-    pub remaining: u32,
-
     /// The object file with the input section.
     pub obj: ObjectFileId,
 
@@ -279,170 +194,14 @@ pub struct MappedSection<'a> {
     /// table indicies need to be updated when the relocations get written to
     /// the output file.
     pub relocs: Vec<&'a pe::ImageRelocation>,
-
-    /// The virtual address of the input section relative to the output section
-    /// base
-    pub rva: u32,
-}
-
-impl<'a> MappedSection<'a> {
-    fn scan_relocations(
-        &mut self,
-        id: OutputSectionId,
-        ctx: &LinkContext<'a>,
-        objs: &[ArenaRef<'a, ObjectFile<'a>>],
-    ) {
-        let obj = &objs[self.obj.index()];
-        let obj = obj.as_ref();
-        let section = &obj.sections[self.index];
-
-        let mut relocs_sorted = true;
-        let mut last_address = 0u32;
-
-        for reloc in section.relocs {
-            let Ok(mut target) = obj.coff_symbols.symbol(reloc.symbol()) else {
-                continue;
-            };
-
-            let mut obj = obj;
-            if !target.is_local() {
-                let external = obj
-                    .symbols
-                    .external_symbol_ref(ctx, reloc.symbol())
-                    .unwrap();
-                let global = external.read();
-                obj = objs[global.owner.index()].as_ref();
-                target = obj.coff_symbols.symbol(global.owner_index).unwrap();
-            }
-
-            if let Some(section_index) = target.section() {
-                let section = &obj.sections[section_index];
-                if section.discarded.load(Ordering::Relaxed) {
-                    continue;
-                }
-
-                // Skip adding output relocations if the relocation can be
-                // applied in the output section
-                if section.output == id && reloc.is_pcrel(obj.machine) {
-                    continue;
-                }
-            }
-
-            self.relocs.push(reloc);
-            if last_address > reloc.virtual_address() {
-                relocs_sorted = false;
-            }
-            last_address = reloc.virtual_address();
-        }
-
-        if !relocs_sorted {
-            self.relocs
-                .par_sort_unstable_by_key(|reloc| reloc.virtual_address());
-        }
-    }
-}
-
-/// Table of input sections mapped to an output section.
-///
-/// The sections in this table are sorted by object file and section index.
-/// This allows for object files to search for input section mappings using a
-/// binary search.
-#[derive(Debug, Clone)]
-#[repr(transparent)]
-pub struct SectionMappingTable<'a>(pub Vec<MappedSection<'a>>);
-
-impl<'a> SectionMappingTable<'a> {
-    pub fn new() -> Self {
-        Self(Vec::new())
-    }
-
-    /// Searches for the section mappings for the specified object file.
-    ///
-    /// The object file mappings will be empty if none are found.
-    pub fn find_object_mappings(&self, obj: ObjectFileId) -> MappingSlice<'_, 'a> {
-        find_mapping_range(&self.0, obj)
-            .map(|range| MappingSlice(&self.0[range]))
-            .unwrap_or(MappingSlice(&[]))
-    }
-
-    /// Searches for the section mappings for the specified object file.
-    ///
-    /// The object file mappings will be empty if none are found.
-    pub fn find_object_mappings_mut(&mut self, obj: ObjectFileId) -> MappingSliceMut<'_, 'a> {
-        find_mapping_range(self.0.as_slice(), obj)
-            .map(|range| MappingSliceMut(&mut self.0[range]))
-            .unwrap_or(MappingSliceMut(&mut []))
-    }
-}
-
-fn find_mapping_range(
-    slice: &[MappedSection],
-    obj: ObjectFileId,
-) -> Option<std::ops::RangeInclusive<usize>> {
-    let start = slice.partition_point(|mapping| mapping.obj < obj);
-    let subslice = slice.get(start..)?;
-    let first = subslice.first()?;
-    if first.obj != obj {
-        return None;
-    }
-
-    let end = start + first.remaining as usize;
-    Some(start..=end)
-}
-
-/// Slice of [`MappedSection`]s for an object file.
-#[derive(Debug)]
-#[repr(transparent)]
-pub struct MappingSlice<'b, 'a>(&'b [MappedSection<'a>]);
-
-impl<'b, 'a> MappingSlice<'b, 'a> {
-    /// Searches for the mapping that belongs to the specified section index.
-    ///
-    /// Returns `None` if the mapping could not be found.
-    pub fn find_section(&self, index: SectionIndex) -> Option<&MappedSection<'a>> {
-        let pos = binary_find_section_pos(self.0, index)?;
-        Some(&self.0[pos])
-    }
-}
-
-impl<'b, 'a> std::ops::Deref for MappingSlice<'b, 'a> {
-    type Target = &'b [MappedSection<'a>];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-#[derive(Debug)]
-#[repr(transparent)]
-pub struct MappingSliceMut<'b, 'a>(&'b mut [MappedSection<'a>]);
-
-impl<'b, 'a> MappingSliceMut<'b, 'a> {
-    pub fn find_section(&self, index: SectionIndex) -> Option<&MappedSection<'a>> {
-        let pos = binary_find_section_pos(self.0, index)?;
-        Some(&self.0[pos])
-    }
-
-    pub fn find_section_mut(&mut self, index: SectionIndex) -> Option<&mut MappedSection<'a>> {
-        let pos = binary_find_section_pos(self.0, index)?;
-        Some(&mut self.0[pos])
-    }
-}
-
-fn binary_find_section_pos<'a>(slice: &[MappedSection<'a>], index: SectionIndex) -> Option<usize> {
-    slice
-        .binary_search_by_key(&index.0, |mapping| mapping.index.0)
-        .ok()
 }
 
 /// Creates the list of reserved output sections
-pub fn create_reserved_sections<'a>() -> Vec<OutputSection<'a>> {
-    let mut sections = Vec::new();
+pub fn create_reserved_sections<'a>() -> IndexVec<OutputSectionId, OutputSection<'a>> {
+    let mut sections = IndexVec::new();
 
     let mut push = |name: &'a str, flags, exclude: bool| {
-        let id = OutputSectionId(sections.len() as u32);
         sections.push(OutputSection::new(
-            id,
             BStr::new(name.as_bytes()),
             flags,
             exclude,
@@ -498,14 +257,14 @@ pub struct SectionKey<'a> {
     name: &'a [u8],
 
     /// Output section flags
-    flags: SectionFlags,
+    flags: u32,
 }
 
 impl<'a> SectionKey<'a> {
     pub fn new(ctx: &LinkContext, section: &InputSection<'a>) -> SectionKey<'a> {
         let mut key = SectionKey {
             name: section.name,
-            flags: section.section_flags().kind_flags(),
+            flags: section.contents_flags() | section.memory_flags(),
         };
 
         // Strips `name` up to the first '$' character
@@ -521,8 +280,8 @@ impl<'a> SectionKey<'a> {
         // MinGW will unreliably set the `IMAGE_SCN_CNT_INITIALIZED_DATA` flag
         // for .idata sections. Ensure it is always set and that the section
         // is marked as writable for conformity.
-        if section.contains_import_data() {
-            key.flags |= SectionFlags::CntInitializedData | SectionFlags::MemWrite;
+        if section.is_idata() {
+            key.flags |= pe::IMAGE_SCN_CNT_INITIALIZED_DATA | pe::IMAGE_SCN_MEM_WRITE;
         }
 
         if ctx.options.merge_groups {
@@ -531,7 +290,7 @@ impl<'a> SectionKey<'a> {
             if !section.is_codeview() {
                 key.name = strip_dollar(key.name);
             }
-        } else if section.contains_import_data() {
+        } else if section.is_idata() {
             // Always merge import data sections
             key.name = strip_dollar(key.name);
         }
@@ -543,20 +302,20 @@ impl<'a> SectionKey<'a> {
         self.name
     }
 
-    pub fn flags(&self) -> SectionFlags {
+    pub fn flags(&self) -> u32 {
         self.flags
     }
 
     /// Id for preallocated sections if known
     pub fn known_id(&self) -> Option<OutputSectionId> {
-        let r = SectionFlags::MemRead;
-        let w = SectionFlags::MemWrite;
-        let x = SectionFlags::MemExecute;
-        let discardable = SectionFlags::MemDiscardable;
+        let r = pe::IMAGE_SCN_MEM_READ;
+        let w = pe::IMAGE_SCN_MEM_WRITE;
+        let x = pe::IMAGE_SCN_MEM_EXECUTE;
+        let discardable = pe::IMAGE_SCN_MEM_DISCARDABLE;
 
-        let code = SectionFlags::CntCode;
-        let data = SectionFlags::CntInitializedData;
-        let uninit = SectionFlags::CntUninitializedData;
+        let code = pe::IMAGE_SCN_CNT_CODE;
+        let data = pe::IMAGE_SCN_CNT_INITIALIZED_DATA;
+        let uninit = pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA;
 
         let flags = |v| self.flags == v;
 
@@ -615,16 +374,3 @@ impl<'a> SectionKey<'a> {
         }
     }
 }
-
-pub struct OutputSectionKeyBuilder;
-
-impl SparseKeyBuilder for OutputSectionKeyBuilder {
-    type Key = OutputSectionId;
-
-    fn sparse_index(key: Self::Key) -> usize {
-        key.index()
-    }
-}
-
-pub type OutputSectionPartials<'a> =
-    FixedSparseMap<OutputSectionId, Vec<SectionIndex>, OutputSectionKeyBuilder>;

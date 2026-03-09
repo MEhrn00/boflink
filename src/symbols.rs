@@ -18,150 +18,255 @@
 //! as a general hash map lookup requires recomputing the hash value of the string
 //! and potentially doing string comparisons to resolve hash collisions.
 
+use std::{
+    hash::{DefaultHasher, Hasher},
+    num::NonZeroU32,
+    sync::atomic::AtomicBool,
+};
+
 use bitflags::bitflags;
+use boflink_index::{Idx, IndexVec};
 use bstr::{BStr, ByteSlice};
 
-use object::{SymbolIndex, pe};
+use crossbeam_utils::CachePadded;
+use indexmap::IndexMap;
+use object::pe;
 use parking_lot::RwLock;
+use rayon::iter::ParallelIterator;
 
 use crate::{
-    coff::{ImageFileMachine, Symbol},
-    concurrent_indexmap::{self, ConcurrentIndexMap, Index},
+    coff::{ImageFileMachine, SectionIndex, SymbolIndex},
     object::ObjectFileId,
 };
 
-/// A globally unique symbol in the symbol map.
-///
-/// This represents symbols defined and referenced by object files which are
-/// externally scoped. Each object file will contain a [`SymbolId`] that is
-/// used to reference the global version. The ID is an interned version of the
-/// symbol name used to create this symbol.
-/// Since symbol names may be rewritten in the output file, the `name` field
-/// should be used as the real symbol name for the output file.
-///
-/// The size of this structure should be kept small. There can be well over
-/// 12,000 symbols inside the symbol table at once in a normal linking scenario
-/// with GCC. Minimizing the size of this structure reduces the overhead needed
-/// when creating the initial symbol map.
-#[derive(Debug)]
-pub struct GlobalSymbol<'a> {
-    pub name: &'a BStr,
-    pub owner: ObjectFileId,
-    pub owner_index: SymbolIndex,
-    pub value: u32,
-    pub section_number: i32,
-    pub storage_class: u8,
-    pub output_index: SymbolIndex,
-    pub flags: GlobalSymbolFlags,
-}
+pub trait Symbol {
+    fn value(&self) -> u32;
+    fn storage_class(&self) -> u8;
+    fn section_number(&self) -> i32;
+    fn is_function(&self) -> bool;
 
-impl<'a> std::default::Default for GlobalSymbol<'a> {
-    fn default() -> Self {
-        Self {
-            name: BStr::new(b""),
-            value: 0,
-            section_number: 0,
-            storage_class: pe::IMAGE_SYM_CLASS_EXTERNAL,
-            owner_index: object::SymbolIndex(0),
-            owner: ObjectFileId::new(0),
-            output_index: object::SymbolIndex(0),
-            flags: GlobalSymbolFlags::empty(),
+    #[inline]
+    fn is_undefined(&self) -> bool {
+        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
+            && self.section_number() == pe::IMAGE_SYM_UNDEFINED
+            && self.value() == 0
+    }
+
+    #[inline]
+    fn is_definition(&self) -> bool {
+        self.section_number() > 0
+    }
+
+    #[inline]
+    fn is_common(&self) -> bool {
+        self.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
+            && self.section_number() == pe::IMAGE_SYM_UNDEFINED
+            && self.value() > 0
+    }
+
+    #[inline]
+    fn is_weak(&self) -> bool {
+        self.storage_class() == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
+    }
+
+    #[inline]
+    fn is_global(&self) -> bool {
+        let sc = self.storage_class();
+        sc == pe::IMAGE_SYM_CLASS_EXTERNAL || sc == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
+    }
+
+    #[inline]
+    fn is_local(&self) -> bool {
+        !self.is_global()
+    }
+
+    #[inline]
+    fn is_absolute(&self) -> bool {
+        self.section_number() == pe::IMAGE_SYM_ABSOLUTE
+    }
+
+    #[inline]
+    fn is_debug(&self) -> bool {
+        self.section_number() == pe::IMAGE_SYM_DEBUG
+    }
+
+    #[inline]
+    fn section_index(&self) -> Option<SectionIndex> {
+        let n = self.section_number();
+        (n > 0).then(|| SectionIndex(n.cast_unsigned()))
+    }
+
+    #[inline]
+    fn section(&self) -> SymbolSection {
+        match self.section_number() {
+            pe::IMAGE_SYM_UNDEFINED => {
+                if self.value() > 0 {
+                    SymbolSection::Common
+                } else {
+                    SymbolSection::Undefined
+                }
+            }
+            pe::IMAGE_SYM_ABSOLUTE => SymbolSection::Absolute,
+            pe::IMAGE_SYM_DEBUG => SymbolSection::Debug,
+            o if o > 0 => SymbolSection::Section(SectionIndex(o.cast_unsigned())),
+            _ => SymbolSection::Undefined,
+        }
+    }
+
+    #[inline]
+    fn priority(&self) -> SymbolPriority {
+        if self.is_common() {
+            SymbolPriority::Common
+        } else if self.is_weak() {
+            SymbolPriority::Weak
+        } else if self.is_definition() {
+            SymbolPriority::Defined
+        } else {
+            SymbolPriority::Unknown
         }
     }
 }
 
+/// The section for a symbol
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SymbolSection {
+    /// Symbol is not defined
+    #[default]
+    Undefined,
+
+    /// Symbol is absolute
+    Absolute,
+
+    /// Symbol is common
+    Common,
+
+    /// Symbol is a debug symbol
+    Debug,
+
+    /// Section the symbol is defined in
+    Section(SectionIndex),
+}
+
+impl SymbolSection {
+    #[inline]
+    pub fn index(&self) -> Option<SectionIndex> {
+        if let Self::Section(v) = self {
+            Some(*v)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct GlobalSymbol<'a> {
+    pub name: &'a BStr,
+    pub value: u32,
+    pub owner: ObjectFileId,
+    pub index: SymbolIndex,
+    pub flags: GlobalSymbolFlags,
+    pub import_needed: AtomicBool,
+    pub section_number: i32,
+}
+
 impl<'a> GlobalSymbol<'a> {
+    #[inline]
+    pub fn new(name: &'a BStr) -> Self {
+        Self {
+            name,
+            value: 0,
+            owner: ObjectFileId::from(u32::MAX),
+            index: SymbolIndex(0),
+            flags: GlobalSymbolFlags::empty(),
+            import_needed: AtomicBool::new(false),
+            section_number: 0,
+        }
+    }
+
+    #[inline]
+    pub fn replace_with(&mut self, owner: ObjectFileId, index: SymbolIndex, symbol: &impl Symbol) {
+        self.owner = owner;
+        self.index = index;
+        self.value = symbol.value();
+        self.flags
+            .set(GlobalSymbolFlags::Function, symbol.is_function());
+        self.section_number = symbol.section_number();
+    }
+
+    #[inline]
     pub fn is_traced(&self) -> bool {
         self.flags.contains(GlobalSymbolFlags::Traced)
     }
 
-    pub fn set_traced(&mut self, value: bool) {
-        self.flags.set(GlobalSymbolFlags::Traced, value);
+    #[inline]
+    pub fn allowed_undefined(&self) -> bool {
+        self.flags.contains(GlobalSymbolFlags::AllowUndefined)
     }
 
+    #[inline]
     pub fn is_imported(&self) -> bool {
         self.flags.contains(GlobalSymbolFlags::Imported)
     }
 
-    pub fn allowed_undefined(&self) -> bool {
-        self.flags.contains(GlobalSymbolFlags::AllowUndefined)
+    #[inline]
+    pub fn is_import_thunk(&self) -> bool {
+        self.flags.is_import_thunk()
     }
 }
+
+/// Flags for global symbols
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GlobalSymbolFlags(u8);
 
 bitflags! {
-    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-    #[repr(transparent)]
-    pub struct GlobalSymbolFlags: u8 {
-        /// This symbol is traced using `--trace-symbol`
-        const Traced = 1;
+    impl GlobalSymbolFlags: u8 {
+        /// Symbol is weak
+        const Weak = 1;
 
-        /// This symbol is imported from a DLL
-        const Imported = 1 << 1;
+        /// Symbol is for a function or defined in a code section
+        const Function = 1 << 1;
+
+        /// Symbol is imported
+        const Imported = 1 << 2;
+
+        /// This symbol is traced using `--trace-symbol`
+        const Traced = 1 << 3;
 
         /// Symbol is allowed to be undefined
-        const AllowUndefined = 1 << 2;
-    }
-
-}
-
-impl<'a> GlobalSymbol<'a> {
-    pub fn priority(&self, live: bool) -> SymbolPriority {
-        SymbolPriority::new(self, live)
+        const AllowUndefined = 1 << 4;
     }
 }
 
-impl<'a> Symbol for GlobalSymbol<'a> {
+impl GlobalSymbolFlags {
+    #[inline]
+    pub fn is_import_thunk(&self) -> bool {
+        self.contains(GlobalSymbolFlags::Function | GlobalSymbolFlags::Imported)
+    }
+}
+
+impl Symbol for GlobalSymbol<'_> {
+    #[inline]
     fn value(&self) -> u32 {
         self.value
     }
 
+    #[inline]
+    fn is_function(&self) -> bool {
+        self.flags.contains(GlobalSymbolFlags::Function)
+    }
+
+    #[inline]
     fn section_number(&self) -> i32 {
         self.section_number
     }
 
-    fn typ(&self) -> u16 {
-        // Symbol type is mostly useless for globals
-        0
-    }
-
+    #[inline]
     fn storage_class(&self) -> u8 {
-        self.storage_class
-    }
-}
-
-impl<'a> Symbol for &GlobalSymbol<'a> {
-    fn value(&self) -> u32 {
-        self.value
-    }
-
-    fn section_number(&self) -> i32 {
-        self.section_number
-    }
-
-    fn typ(&self) -> u16 {
-        0
-    }
-
-    fn storage_class(&self) -> u8 {
-        self.storage_class
-    }
-}
-
-impl<'a> Symbol for &mut GlobalSymbol<'a> {
-    fn value(&self) -> u32 {
-        self.value
-    }
-
-    fn section_number(&self) -> i32 {
-        self.section_number
-    }
-
-    fn typ(&self) -> u16 {
-        0
-    }
-
-    fn storage_class(&self) -> u8 {
-        self.storage_class
+        if self.flags.contains(GlobalSymbolFlags::Weak) {
+            pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
+        } else {
+            pe::IMAGE_SYM_CLASS_EXTERNAL
+        }
     }
 }
 
@@ -172,103 +277,173 @@ impl<'a> Symbol for &mut GlobalSymbol<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SymbolPriority {
     Unknown,
-    LazyCommon,
     Common,
-    LazyWeak,
-    LazyDefined,
     Weak,
     Defined,
 }
 
-impl SymbolPriority {
-    pub fn new<S: Symbol>(symbol: S, live: bool) -> SymbolPriority {
-        if symbol.is_common() {
-            if live {
-                SymbolPriority::Common
-            } else {
-                SymbolPriority::LazyCommon
-            }
-        } else if symbol.is_weak() {
-            if live {
-                SymbolPriority::Weak
-            } else {
-                SymbolPriority::LazyWeak
-            }
-        } else if !symbol.is_undefined() {
-            if live {
-                SymbolPriority::Defined
-            } else {
-                SymbolPriority::LazyDefined
-            }
-        } else {
-            SymbolPriority::Unknown
-        }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+struct MapId(NonZeroU32);
+
+impl boflink_index::Idx for MapId {
+    #[inline]
+    fn from_usize(idx: usize) -> Self {
+        Self(NonZeroU32::new((idx + 1) as u32).unwrap())
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        (self.0.get() - 1) as usize
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct SymbolId(Index);
+struct SlotId(u32);
 
-pub type ExternalRef<'s, 'a> = concurrent_indexmap::Ref<'s, &'a BStr, RwLock<GlobalSymbol<'a>>>;
+impl boflink_index::Idx for SlotId {
+    #[inline]
+    fn from_usize(idx: usize) -> Self {
+        assert!(idx <= u32::MAX as usize);
+        Self(idx as u32)
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SymbolId {
+    map: MapId,
+    slot: SlotId,
+}
+
+type SyncMap<'a> = CachePadded<RwLock<IndexMap<&'a BStr, RwLock<GlobalSymbol<'a>>>>>;
 
 #[derive(Debug)]
+pub struct SyncSymbolMap<'a> {
+    maps: IndexVec<MapId, SyncMap<'a>>,
+}
+
+impl<'a> SyncSymbolMap<'a> {
+    #[inline]
+    pub fn with_map_count(count: usize) -> Self {
+        let count = count.clamp(1, u32::MAX as usize);
+        Self {
+            maps: (0..count)
+                .map(|_| CachePadded::new(RwLock::new(IndexMap::new())))
+                .collect(),
+        }
+    }
+
+    pub fn get_or_create_default(&self, name: &'a BStr) -> SymbolId {
+        let map_index = compute_map_index(name.as_ref(), self.maps.len());
+        let map = &self.maps[map_index];
+        let mut guard = map.write();
+        let entry = guard.entry(name);
+        let slot = SlotId::from_usize(entry.index());
+        entry.or_insert_with(|| RwLock::new(GlobalSymbol::new(name)));
+
+        SymbolId {
+            map: map_index,
+            slot,
+        }
+    }
+
+    #[inline]
+    pub fn into_unsync(self) -> SymbolMap<'a> {
+        SymbolMap {
+            maps: self
+                .maps
+                .into_iter()
+                .map(|map| CachePadded::new(map.into_inner().into_inner()))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct SymbolMap<'a> {
-    map: ConcurrentIndexMap<&'a BStr, RwLock<GlobalSymbol<'a>>>,
+    maps: IndexVec<MapId, CachePadded<IndexMap<&'a BStr, RwLock<GlobalSymbol<'a>>>>>,
 }
 
 impl<'a> SymbolMap<'a> {
-    pub fn with_slot_count(count: usize) -> Self {
+    #[inline]
+    pub fn with_map_count(count: usize) -> Self {
+        let count = count.clamp(1, u32::MAX as usize);
         Self {
-            map: ConcurrentIndexMap::with_slot_count(count),
+            maps: (0..count)
+                .map(|_| CachePadded::new(IndexMap::new()))
+                .collect(),
         }
     }
 
+    pub fn get_or_create_default(&mut self, name: &'a BStr) -> SymbolId {
+        let map_index = compute_map_index(name.as_ref(), self.maps.len());
+        let map = &mut self.maps[map_index];
+        let entry = map.entry(name);
+        let slot = SlotId::from_usize(entry.index());
+        entry.or_insert_with(|| RwLock::new(GlobalSymbol::new(name)));
+
+        SymbolId {
+            map: map_index,
+            slot,
+        }
+    }
+
+    #[inline]
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.maps.iter().fold(0, |acc, map| acc + map.len())
     }
 
-    /// Gets the symbol id for `name` or inserts a new default symbol if not
-    /// already present.
-    pub fn get_or_create_default(&self, name: &'a BStr) -> SymbolId {
-        let entry = self.map.entry(name);
-        let index = entry.index();
-        entry.or_insert_with(|| {
-            RwLock::new(GlobalSymbol {
-                name,
-                ..Default::default()
-            })
-        });
-        SymbolId(index)
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
+    #[inline]
     pub fn get_exclusive_symbol(&mut self, symbol: SymbolId) -> Option<&mut GlobalSymbol<'a>> {
-        self.map
-            .get_exclusive_value(symbol.0)
-            .map(|symbol| symbol.get_mut())
+        let map = &mut self.maps[symbol.map];
+        map.get_index_mut(symbol.slot.index())
+            .map(|(_, v)| v.get_mut())
     }
 
+    #[inline]
     pub fn get_map_entry(&mut self, name: &'a BStr) -> MapEntry<'_, 'a> {
-        match self.map.exclusive_entry(name) {
-            concurrent_indexmap::ExclusiveEntry::Vacant(entry) => {
-                MapEntry::Vacant(VacantMapEntry { entry })
+        let map_id = compute_map_index(name.as_ref(), self.maps.len());
+        let map = &mut self.maps[map_id];
+        match map.entry(name) {
+            indexmap::map::Entry::Occupied(entry) => {
+                MapEntry::Occupied(OccupiedMapEntry { map_id, entry })
             }
-            concurrent_indexmap::ExclusiveEntry::Occupied(entry) => {
-                MapEntry::Occupied(OccupiedMapEntry { entry })
+            indexmap::map::Entry::Vacant(entry) => {
+                MapEntry::Vacant(VacantMapEntry { map_id, entry })
             }
         }
     }
 
-    pub fn get(&self, symbol: SymbolId) -> Option<ExternalRef<'_, 'a>> {
-        self.map.get(symbol.0)
+    #[inline]
+    pub fn get(&self, symbol: SymbolId) -> Option<&RwLock<GlobalSymbol<'a>>> {
+        let map = &self.maps[symbol.map];
+        map.get_index(symbol.slot.index()).map(|(_, v)| v)
     }
 
+    #[inline]
     pub fn par_for_each_symbol(&mut self, f: impl Fn(&mut GlobalSymbol<'a>) + Send + Sync) {
-        self.map.par_for_each_value_mut(|symbol| {
-            let symbol = symbol.get_mut();
-            f(symbol);
+        self.maps.par_iter_enumerated_mut().for_each(|(_, map)| {
+            map.par_values_mut().for_each(|symbol| f(symbol.get_mut()));
         });
     }
+}
+
+fn compute_map_index(name: &[u8], count: usize) -> MapId {
+    let mut h = DefaultHasher::new();
+    h.write(name);
+    let index = h.finish() as usize % count;
+    MapId::from_usize(index)
 }
 
 pub enum MapEntry<'b, 'a> {
@@ -277,6 +452,7 @@ pub enum MapEntry<'b, 'a> {
 }
 
 impl<'b, 'a> MapEntry<'b, 'a> {
+    #[inline]
     pub fn id(&self) -> SymbolId {
         match self {
             Self::Occupied(entry) => entry.id(),
@@ -284,6 +460,7 @@ impl<'b, 'a> MapEntry<'b, 'a> {
         }
     }
 
+    #[inline]
     pub fn or_default(self) -> &'b mut GlobalSymbol<'a> {
         match self {
             Self::Occupied(entry) => entry.into_mut_symbol(),
@@ -293,35 +470,45 @@ impl<'b, 'a> MapEntry<'b, 'a> {
 }
 
 pub struct OccupiedMapEntry<'b, 'a> {
-    entry: concurrent_indexmap::ExclusiveOccupiedEntry<'b, &'a BStr, RwLock<GlobalSymbol<'a>>>,
+    map_id: MapId,
+    entry: indexmap::map::OccupiedEntry<'b, &'a BStr, RwLock<GlobalSymbol<'a>>>,
 }
 
 impl<'b, 'a> OccupiedMapEntry<'b, 'a> {
+    #[inline]
     pub fn id(&self) -> SymbolId {
-        SymbolId(self.entry.index())
+        SymbolId {
+            map: self.map_id,
+            slot: SlotId::from_usize(self.entry.index()),
+        }
     }
 
+    #[inline]
     pub fn into_mut_symbol(self) -> &'b mut GlobalSymbol<'a> {
         self.entry.into_mut().get_mut()
     }
 }
 
 pub struct VacantMapEntry<'b, 'a> {
-    entry: concurrent_indexmap::ExclusiveVacantEntry<'b, &'a BStr, RwLock<GlobalSymbol<'a>>>,
+    map_id: MapId,
+    entry: indexmap::map::VacantEntry<'b, &'a BStr, RwLock<GlobalSymbol<'a>>>,
 }
 
 impl<'b, 'a> VacantMapEntry<'b, 'a> {
     pub fn id(&self) -> SymbolId {
-        SymbolId(self.entry.index())
+        SymbolId {
+            map: self.map_id,
+            slot: SlotId::from_usize(self.entry.index()),
+        }
     }
 
     pub fn insert_default(self) -> OccupiedMapEntry<'b, 'a> {
         let name = *self.entry.key();
         OccupiedMapEntry {
-            entry: self.entry.insert_entry(RwLock::new(GlobalSymbol {
-                name,
-                ..Default::default()
-            })),
+            map_id: self.map_id,
+            entry: self
+                .entry
+                .insert_entry(RwLock::new(GlobalSymbol::new(name))),
         }
     }
 }
@@ -337,6 +524,7 @@ pub enum ManglingScheme {
 
 impl ManglingScheme {
     /// Returns the mangling scheme matching the specified machine value
+    #[inline]
     pub fn machine(machine: ImageFileMachine) -> Self {
         if machine == ImageFileMachine::I386 {
             Self::I386
@@ -346,11 +534,13 @@ impl ManglingScheme {
     }
 
     /// Returns the global prefix as a char for the mangling scheme.
+    #[inline]
     pub fn global_prefix_char(self) -> Option<char> {
         if self == Self::I386 { Some('_') } else { None }
     }
 
     /// Returns the global prefix for the mangling scheme.
+    #[inline]
     pub fn global_prefix(self) -> Option<u8> {
         self.global_prefix_char().map(|ch| ch as u8)
     }
@@ -358,6 +548,7 @@ impl ManglingScheme {
     /// Returns the prefix used for DLL imports for the mangling scheme.
     ///
     /// This will add the leading global prefix if I386
+    #[inline]
     pub fn dllimport_prefix(self) -> &'static BStr {
         if self == Self::I386 {
             BStr::new(b"__imp__")
@@ -369,6 +560,7 @@ impl ManglingScheme {
     /// Returns the global prefix for the mangling scheme as a byte slice.
     ///
     /// The byte slice will be empty if there is no prefix.
+    #[inline]
     pub fn global_prefix_bytes(self) -> &'static BStr {
         if self == Self::I386 {
             BStr::new(b"_")
@@ -386,6 +578,7 @@ pub struct SymbolDemangler<'a> {
 }
 
 impl<'a> SymbolDemangler<'a> {
+    #[inline]
     pub fn new(name: &'a BStr, scheme: ManglingScheme) -> Self {
         Self { name, scheme }
     }

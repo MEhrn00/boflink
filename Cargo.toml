@@ -1,6 +1,10 @@
 [workspace]
 members = ["crates/*", "xtask"]
 
+[workspace.dependencies]
+parking_lot = "0.12.5"
+rayon = "1.11.0"
+
 [package]
 name = "boflink"
 version = "0.6.2"
@@ -21,6 +25,8 @@ publish = false
 argfile = "0.2.1"
 bitflags = "2.9.0"
 bstr = "1.12.1"
+boflink_index = { path = "crates/boflink_index", features = ["rayon"] }
+boflink_arena = { path = "crates/boflink_arena", features = ["parking_lot"] }
 cpp_demangle = "0.5.0"
 crc32fast = "1.5.0"
 crossbeam-utils = "0.8.21"
@@ -28,10 +34,12 @@ indexmap = { version = "2.7.1", features = ["rayon"] }
 log = { version = "0.4.26", features = ["std"] }
 memmap2 = "0.9.9"
 os_str_bytes = "7.1.1"
-parking_lot = "0.12.5"
-rayon = "1.11.0"
+parking_lot.workspace = true
+rayon.workspace = true
 rustc-demangle = "0.1.26"
-typed-arena = "2.0.2"
+dashmap = { version = "6.1.0", features = ["rayon"] }
+crossbeam-channel = "0.5.15"
+smallvec = "1.15.1"
 
 [dependencies.object]
 version = "0.38.0"

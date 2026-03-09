@@ -1,7 +1,6 @@
 use std::{
     collections::{HashSet, VecDeque},
     ffi::{OsStr, OsString},
-    io::IsTerminal,
     num::NonZeroUsize,
     path::{Path, PathBuf},
 };
@@ -12,13 +11,13 @@ use crate::{
     ErrorContext, bail, coff::ImageFileMachine, logging::ColorOption, stdext::path::PathExt,
 };
 
-const CARGO_PKG_NAME: &str = env!("CARGO_PKG_NAME");
+pub const CARGO_PKG_NAME: &str = env!("CARGO_PKG_NAME");
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CARGO_PKG_DESCRIPTION: &str = env!("CARGO_PKG_DESCRIPTION");
 const CARGO_PKG_REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const GIT_SHORT_HASH: Option<&str> = option_env!("GIT_SHORT_HASH");
 
-fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
+fn render_help(include_ignored: bool) -> String {
     const HELP_USAGE: &str = "[options] files...";
     const HELP_ARGUMENTS: &str = r#"
   files...                   Files to link
@@ -102,6 +101,11 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
   -plugin-opt=<arg>          Ignored for GCC plugin compatibility
 "#;
 
+    let mut buf = String::new();
+    let mut render = |fmt: std::fmt::Arguments| {
+        std::fmt::write(&mut buf, fmt).unwrap();
+    };
+
     let argv0 = std::env::args_os().next();
 
     let prog = argv0
@@ -109,7 +113,7 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
         .map(|arg| arg.to_string_lossy())
         .unwrap_or_else(|| CARGO_PKG_NAME.into());
 
-    let help_pre = format_args!(
+    render(format_args!(
         "{CARGO_PKG_DESCRIPTION}\n\
         Usage: {prog} {HELP_USAGE}\n\n\
         Arguments:\n\
@@ -118,176 +122,88 @@ fn fmt_help(out: impl FnOnce(std::fmt::Arguments), print_ignored: bool) {
         {options}",
         arguments = HELP_ARGUMENTS.trim_matches('\n'),
         options = HELP_OPTIONS.trim_matches('\n'),
-    );
+    ));
 
-    let footer = format_args!("Issues can be reported on Github: {CARGO_PKG_REPOSITORY}/issues");
-
-    if print_ignored {
-        out(format_args!(
-            "{help_pre}\n\n\
-            Ignored Options:\n\
-            {ignored}\n\n\
-            {footer}",
+    if include_ignored {
+        render(format_args!(
+            "Ignored Options:\n\
+            {ignored}\n\n",
             ignored = HELP_IGNORED_OPTIONS.trim_matches('\n'),
         ));
-    } else {
-        out(format_args!("{help_pre}\n\n{footer}"));
     }
-}
 
-fn short_opt(name: char) -> impl for<'a> FnOnce(&'a OsStr) -> bool {
-    move |arg| {
-        arg.strip_prefix("-").is_some_and(|arg| {
-            arg.len() == 1
-                && *arg
-                    .as_encoded_bytes()
-                    .first()
-                    .unwrap_or_else(|| unreachable!())
-                    == name as u8
-        })
-    }
-}
+    render(format_args!(
+        "Issues can be reported on Github: {CARGO_PKG_REPOSITORY}/issues"
+    ));
 
-fn short_val<P>(name: char) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<crate::Result<OsString>>
-where
-    P: Iterator,
-    <P as Iterator>::Item: Into<OsString>,
-{
-    move |arg, mut it| {
-        if short_opt(name)(arg) {
-            Some(
-                it.next()
-                    .map(Into::into)
-                    .with_context(|| report_missing_value(arg)),
-            )
-        } else {
-            None
-        }
-    }
-}
-
-fn long_opt(name: &str) -> impl for<'a> FnOnce(&'a OsStr) -> bool {
-    move |arg| arg.strip_prefix("--").is_some_and(|arg| arg == name)
-}
-
-fn long_bool(name: &str) -> impl for<'a> FnOnce(&'a OsStr) -> Option<bool> {
-    move |arg| {
-        arg.strip_prefix("--").and_then(|arg| {
-            if arg == name {
-                Some(true)
-            } else if arg.strip_prefix("no-").is_some_and(|arg| arg == name) {
-                Some(false)
-            } else {
-                None
-            }
-        })
-    }
-}
-
-fn long_val<P>(name: &str) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<crate::Result<OsString>>
-where
-    P: Iterator,
-    <P as Iterator>::Item: Into<OsString>,
-{
-    move |arg, mut it| {
-        if long_opt(name)(arg) {
-            return Some(
-                it.next()
-                    .map(Into::into)
-                    .with_context(|| report_missing_value(arg)),
-            );
-        } else if let Some((flag, val)) = arg.strip_prefix("--").and_then(|arg| arg.split_once("="))
-            && name == flag
-        {
-            return Some(Ok(val.to_owned()));
-        }
-
-        None
-    }
-}
-
-fn legacy_opt(name: &str) -> impl for<'a> FnOnce(&'a OsStr) -> bool {
-    move |arg| arg.strip_prefix("-").is_some_and(|arg| arg == name)
-}
-
-fn legacy_val<P>(name: &str) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<crate::Result<OsString>>
-where
-    P: Iterator,
-    <P as Iterator>::Item: Into<OsString>,
-{
-    move |arg, mut it| {
-        if legacy_opt(name)(arg) {
-            return Some(
-                it.next()
-                    .map(Into::into)
-                    .with_context(|| report_missing_value(arg)),
-            );
-        } else if let Some((flag, val)) = arg.strip_prefix('-').and_then(|arg| arg.split_once("="))
-            && name == flag
-        {
-            return Some(Ok(val.to_owned()));
-        }
-
-        None
-    }
-}
-
-fn anyval<P>(
-    s1: &str,
-    s2: &str,
-) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<crate::Result<OsString>>
-where
-    P: Iterator,
-    <P as Iterator>::Item: Into<OsString>,
-{
-    move |arg, mut it| {
-        let mut argval = |s: &str| {
-            if s.len() == 1
-                && let Some(v) = short_val(s.chars().next().unwrap())(arg, it.by_ref())
-            {
-                return Some(v);
-            } else if let Some(v) = long_val(s)(arg, it.by_ref()) {
-                return Some(v);
-            } else if let Some(legacy_arg) = s.strip_prefix('-')
-                && !legacy_arg.starts_with('-')
-                && let Some(v) = legacy_val(legacy_arg)(arg, it.by_ref())
-            {
-                return Some(v);
-            }
-            None
-        };
-
-        if !s1.is_empty()
-            && let Some(v) = argval(s1)
-        {
-            Some(v)
-        } else if !s2.is_empty()
-            && let Some(v) = argval(s2)
-        {
-            Some(v)
-        } else {
-            None
-        }
-    }
-}
-
-fn anyopt(short_: char, long_: &str) -> impl for<'a> FnOnce(&'a OsStr) -> bool {
-    move |arg| short_opt(short_)(arg) || long_opt(long_)(arg)
-}
-
-fn report_missing_value(arg: &OsStr) -> String {
-    format!("missing argument value for '{}'", arg.display())
+    buf
 }
 
 #[derive(Debug, Default)]
-pub struct CliArgs {
+pub struct Cli {
     pub inputs: Vec<InputArg>,
     pub options: CliOptions,
     state: InputArgContext,
     stack: Vec<InputArgContext>,
 }
 
-impl CliArgs {
+impl Cli {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn render_version(&self) -> String {
+        if let Some(githash) = GIT_SHORT_HASH {
+            format!("{CARGO_PKG_NAME} version {CARGO_PKG_VERSION} ({githash})")
+        } else {
+            format!("{CARGO_PKG_NAME} version {CARGO_PKG_VERSION}")
+        }
+    }
+
+    pub fn render_help(&self, include_ignored: bool) -> String {
+        render_help(include_ignored)
+    }
+
+    pub fn expand_response_files(cmdline: impl Iterator<Item = OsString>) -> Vec<OsString> {
+        let mut expanded = Vec::new();
+
+        let mut args =
+            VecDeque::from_iter(cmdline.map(|arg| argfile::Argument::parse(arg, argfile::PREFIX)));
+
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        let mut stack = Vec::new();
+        while !args.is_empty() || !stack.is_empty() {
+            let Some(arg) = args.pop_front() else {
+                args = stack.pop().unwrap_or_else(|| unreachable!());
+                continue;
+            };
+
+            match arg {
+                argfile::Argument::PassThrough(arg) => {
+                    expanded.push(arg);
+                }
+                argfile::Argument::Path(path) => {
+                    if visited.contains(&path) {
+                        continue;
+                    }
+
+                    visited.insert(path.clone());
+                    let Ok(content) = std::fs::read_to_string(&path) else {
+                        let mut resp_arg = OsString::from("@");
+                        resp_arg.push(path.as_os_str());
+                        args.push_front(argfile::Argument::PassThrough(resp_arg));
+                        continue;
+                    };
+
+                    stack.push(std::mem::take(&mut args));
+                    args.extend(argfile::parse_fromfile(&content, argfile::PREFIX).into_iter());
+                }
+            }
+        }
+
+        expanded
+    }
+
     pub fn try_update_from<I, T>(&mut self, mut arg_iter: I) -> crate::Result<()>
     where
         I: Iterator<Item = T>,
@@ -323,7 +239,7 @@ impl CliArgs {
 
         if !arg.starts_with("-") {
             self.inputs.push(InputArg {
-                variant: InputArgVariant::File(arg.into()),
+                variant: InputArgVariant::File(Path::new(arg).normalize_lexically_cpp()),
                 context: self.state,
             });
         } else if let Some(name) = arg.strip_prefix("-l")
@@ -675,97 +591,146 @@ impl Emulation {
     }
 }
 
-pub fn print_help(print_ignored: bool) {
-    fmt_help(
-        |fmt| {
-            println!("{fmt}");
-        },
-        print_ignored,
-    );
-}
-
-fn fmt_version(out: impl FnOnce(std::fmt::Arguments)) {
-    if let Some(githash) = GIT_SHORT_HASH {
-        out(format_args!(
-            "{CARGO_PKG_NAME} version {CARGO_PKG_VERSION} ({githash})"
-        ));
-    } else {
-        out(format_args!("{CARGO_PKG_NAME} version {CARGO_PKG_VERSION}"));
+fn short_opt(name: char) -> impl for<'a> FnOnce(&'a OsStr) -> bool {
+    move |arg| {
+        arg.strip_prefix("-").is_some_and(|arg| {
+            arg.len() == 1
+                && *arg
+                    .as_encoded_bytes()
+                    .first()
+                    .unwrap_or_else(|| unreachable!())
+                    == name as u8
+        })
     }
 }
 
-pub fn print_version() {
-    fmt_version(|fmt| {
-        println!("{fmt}");
-    });
-}
-
-pub fn log_cmdline(args: &[OsString]) {
-    fmt_version(|fmt| {
-        log::info!("{fmt}");
-    });
-
-    let args = args.iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>();
-    log::info!("command line: {}", args.join(" "));
-}
-
-pub fn print_gcc_specs() {
-    // Print out a header with instructions only if printing to a terminal.
-    // Just print out the raw spec file content if the output is potentially being redirected to a
-    // file.
-    if std::io::stdout().is_terminal() {
-        println!(
-            "# Copy the text below '---' to a file named \"boflink.specs\" and run \"x86_64-w64-mingw32-gcc -specs=boflink.specs ...\"\n---"
-        );
-    }
-
-    let current_exe = std::env::current_exe()
-        .map(|exe| exe.into_os_string())
-        .unwrap_or_else(|_| OsString::from(CARGO_PKG_NAME));
-
-    println!(
-        "*linker:\n\
-        {current_exe}",
-        current_exe = current_exe.display()
-    );
-}
-
-pub fn expand_response_files(cmdline: impl Iterator<Item = OsString>) -> Vec<OsString> {
-    let mut expanded = Vec::new();
-
-    let mut args =
-        VecDeque::from_iter(cmdline.map(|arg| argfile::Argument::parse(arg, argfile::PREFIX)));
-
-    let mut visited: HashSet<PathBuf> = HashSet::new();
-    let mut stack = Vec::new();
-    while !args.is_empty() || !stack.is_empty() {
-        let Some(arg) = args.pop_front() else {
-            args = stack.pop().unwrap_or_else(|| unreachable!());
-            continue;
-        };
-
-        match arg {
-            argfile::Argument::PassThrough(arg) => {
-                expanded.push(arg);
-            }
-            argfile::Argument::Path(path) => {
-                if visited.contains(&path) {
-                    continue;
-                }
-
-                visited.insert(path.clone());
-                let Ok(content) = std::fs::read_to_string(&path) else {
-                    let mut resp_arg = OsString::from("@");
-                    resp_arg.push(path.as_os_str());
-                    args.push_front(argfile::Argument::PassThrough(resp_arg));
-                    continue;
-                };
-
-                stack.push(std::mem::take(&mut args));
-                args.extend(argfile::parse_fromfile(&content, argfile::PREFIX).into_iter());
-            }
+fn short_val<P>(name: char) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<crate::Result<OsString>>
+where
+    P: Iterator,
+    <P as Iterator>::Item: Into<OsString>,
+{
+    move |arg, mut it| {
+        if short_opt(name)(arg) {
+            Some(
+                it.next()
+                    .map(Into::into)
+                    .with_context(|| report_missing_value(arg)),
+            )
+        } else {
+            None
         }
     }
+}
 
-    expanded
+fn long_opt(name: &str) -> impl for<'a> FnOnce(&'a OsStr) -> bool {
+    move |arg| arg.strip_prefix("--").is_some_and(|arg| arg == name)
+}
+
+fn long_bool(name: &str) -> impl for<'a> FnOnce(&'a OsStr) -> Option<bool> {
+    move |arg| {
+        arg.strip_prefix("--").and_then(|arg| {
+            if arg == name {
+                Some(true)
+            } else if arg.strip_prefix("no-").is_some_and(|arg| arg == name) {
+                Some(false)
+            } else {
+                None
+            }
+        })
+    }
+}
+
+fn long_val<P>(name: &str) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<crate::Result<OsString>>
+where
+    P: Iterator,
+    <P as Iterator>::Item: Into<OsString>,
+{
+    move |arg, mut it| {
+        if long_opt(name)(arg) {
+            return Some(
+                it.next()
+                    .map(Into::into)
+                    .with_context(|| report_missing_value(arg)),
+            );
+        } else if let Some((flag, val)) = arg.strip_prefix("--").and_then(|arg| arg.split_once("="))
+            && name == flag
+        {
+            return Some(Ok(val.to_owned()));
+        }
+
+        None
+    }
+}
+
+fn legacy_opt(name: &str) -> impl for<'a> FnOnce(&'a OsStr) -> bool {
+    move |arg| arg.strip_prefix("-").is_some_and(|arg| arg == name)
+}
+
+fn legacy_val<P>(name: &str) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<crate::Result<OsString>>
+where
+    P: Iterator,
+    <P as Iterator>::Item: Into<OsString>,
+{
+    move |arg, mut it| {
+        if legacy_opt(name)(arg) {
+            return Some(
+                it.next()
+                    .map(Into::into)
+                    .with_context(|| report_missing_value(arg)),
+            );
+        } else if let Some((flag, val)) = arg.strip_prefix('-').and_then(|arg| arg.split_once("="))
+            && name == flag
+        {
+            return Some(Ok(val.to_owned()));
+        }
+
+        None
+    }
+}
+
+fn anyval<P>(
+    s1: &str,
+    s2: &str,
+) -> impl for<'a> FnOnce(&'a OsStr, P) -> Option<crate::Result<OsString>>
+where
+    P: Iterator,
+    <P as Iterator>::Item: Into<OsString>,
+{
+    move |arg, mut it| {
+        let mut argval = |s: &str| {
+            if s.len() == 1
+                && let Some(v) = short_val(s.chars().next().unwrap())(arg, it.by_ref())
+            {
+                return Some(v);
+            } else if let Some(v) = long_val(s)(arg, it.by_ref()) {
+                return Some(v);
+            } else if let Some(legacy_arg) = s.strip_prefix('-')
+                && !legacy_arg.starts_with('-')
+                && let Some(v) = legacy_val(legacy_arg)(arg, it.by_ref())
+            {
+                return Some(v);
+            }
+            None
+        };
+
+        if !s1.is_empty()
+            && let Some(v) = argval(s1)
+        {
+            Some(v)
+        } else if !s2.is_empty()
+            && let Some(v) = argval(s2)
+        {
+            Some(v)
+        } else {
+            None
+        }
+    }
+}
+
+fn anyopt(short_: char, long_: &str) -> impl for<'a> FnOnce(&'a OsStr) -> bool {
+    move |arg| short_opt(short_)(arg) || long_opt(long_)(arg)
+}
+
+fn report_missing_value(arg: &OsStr) -> String {
+    format!("missing argument value for '{}'", arg.display())
 }

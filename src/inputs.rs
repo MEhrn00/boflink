@@ -5,16 +5,16 @@ use std::{
     sync::atomic::Ordering,
 };
 
+use boflink_arena::{BumpHandle, TypedArena, TypedArenaHandle, TypedArenaRef};
+use boflink_index::Idx;
 use memmap2::Mmap;
 use object::read::archive::ArchiveFile;
 use os_str_bytes::OsStrBytesExt;
 use rayon::Scope;
 
 use crate::{
-    ErrorContext,
-    arena::{ArenaHandle, ArenaRef, TypedArena},
-    bail,
-    cli::{InputArg, InputArgContext, InputArgVariant},
+    ErrorContext, bail,
+    cli::{Emulation, InputArg, InputArgContext, InputArgVariant},
     coff::ImageFileMachine,
     context::LinkContext,
     make_error,
@@ -23,130 +23,70 @@ use crate::{
         fs::{FileExt, UniqueFileId},
         path::PathExt,
     },
+    symbols::SyncSymbolMap,
 };
 
-#[derive(Default)]
-pub struct InputsStore<'a> {
-    pub files: TypedArena<InputFile<'a>>,
-    pub mappings: TypedArena<Mmap>,
-    pub objs: TypedArena<ObjectFile<'a>>,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InputFilePath<'a> {
+    pub disk: &'a Path,
+    pub member: Option<&'a Path>,
 }
 
-#[derive(Debug)]
+impl<'a> InputFilePath<'a> {
+    #[inline]
+    pub fn is_internal(&self) -> bool {
+        self.member.is_none() && self.disk.as_os_str().is_empty()
+    }
+
+    #[inline]
+    pub fn is_archive_member(&self) -> bool {
+        self.member.is_some()
+    }
+}
+
+impl Default for InputFilePath<'_> {
+    fn default() -> Self {
+        Self {
+            disk: Path::new(""),
+            member: None,
+        }
+    }
+}
+
+impl<'a> std::fmt::Display for InputFilePath<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(member) = self.member {
+            write!(f, "{}({})", self.disk.display(), member.display(),)
+        } else if self.disk.as_os_str().is_empty() {
+            f.write_str("<internal>")
+        } else {
+            write!(f, "{}", self.disk.display())
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct InputFile<'a> {
+    pub path: InputFilePath<'a>,
     pub data: &'a [u8],
-    pub path: &'a Path,
-    pub parent: Option<&'a InputFile<'a>>,
 }
 
 impl<'a> InputFile<'a> {
-    /// Makes a new internal input file
-    pub fn internal() -> InputFile<'a> {
-        InputFile {
-            data: &[],
-            path: Path::new(""),
-            parent: None,
-        }
-    }
-
+    #[inline]
     pub fn is_internal(&self) -> bool {
-        self.path.as_os_str().is_empty()
+        self.path.is_internal()
     }
 
-    pub fn source(&self) -> InputFileSource<'a> {
-        self.parent
-            .map(|parent| InputFileSource::Member {
-                archive: parent.path,
-                path: self.path,
-            })
-            .unwrap_or_else(|| {
-                if self.is_internal() {
-                    InputFileSource::Internal
-                } else {
-                    InputFileSource::Disk(self.path)
-                }
-            })
+    #[inline]
+    pub fn is_archive_member(&self) -> bool {
+        self.path.is_archive_member()
     }
 }
 
-/// Full source of an input file.
-///
-/// Used for diagnostic messages.
-///
-/// The [`std::fmt::Display`] implementation will display the file path if the
-/// file was read directly from disk or it will display `path(member)` if
-/// the file is a member of an archive.
-///
-/// [`InputFileSource::to_short()`] can be used for only displaying the file name
-/// parts instead of the full paths.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum InputFileSource<'a> {
-    /// Internal file that is created for misc usage
-    Internal,
-
-    /// An input file read directly from disk.
-    Disk(&'a Path),
-
-    /// An archive member.
-    Member { archive: &'a Path, path: &'a Path },
-}
-
-impl<'a> InputFileSource<'a> {
-    /// Returns the [`ShortInputFileSource`] from of this input source
-    pub fn to_short(&self) -> ShortInputFileSource<'a> {
-        let fname_or_path =
-            |path: &'a Path| -> &'a OsStr { path.file_name().unwrap_or(path.as_os_str()) };
-
-        match self {
-            Self::Internal => ShortInputFileSource::Internal,
-            Self::Disk(path) => ShortInputFileSource::Disk(fname_or_path(path)),
-            Self::Member { archive, path } => ShortInputFileSource::Member {
-                archive: fname_or_path(archive),
-                filename: fname_or_path(path),
-            },
-        }
-    }
-}
-
-impl std::fmt::Display for InputFileSource<'_> {
+impl<'a> std::fmt::Display for InputFile<'a> {
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Internal => write!(f, "<internal>"),
-            Self::Disk(path) => write!(f, "{}", path.display()),
-            Self::Member {
-                archive: parent,
-                path,
-            } => {
-                write!(f, "{}({})", parent.display(), path.display())
-            }
-        }
-    }
-}
-
-/// A short form version of an input source with only the filename components.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ShortInputFileSource<'a> {
-    Internal,
-
-    /// The name of the file read from disk.
-    Disk(&'a OsStr),
-
-    /// An archive member
-    Member {
-        archive: &'a OsStr,
-        filename: &'a OsStr,
-    },
-}
-
-impl std::fmt::Display for ShortInputFileSource<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Internal => write!(f, "<internal>"),
-            Self::Disk(file) => write!(f, "{}", file.display()),
-            Self::Member { archive, filename } => {
-                write!(f, "{}({})", archive.display(), filename.display())
-            }
-        }
+        std::fmt::Display::fmt(&self.path, f)
     }
 }
 
@@ -229,9 +169,11 @@ impl std::error::Error for UnknownFileError {}
 
 pub struct InputsReader<'r, 'a: 'r> {
     pub architecture: ImageFileMachine,
-    strings: &'r ArenaHandle<'a, u8>,
-    store: &'a InputsStore<'a>,
-    input_objs: &'r TypedArena<ArenaRef<'a, ObjectFile<'a>>>,
+    bump: BumpHandle<'a>,
+    mappings: TypedArenaHandle<'a, Mmap>,
+    objs: &'r TypedArena<TypedArenaRef<'a, ObjectFile<'a>>>,
+    obj_arena: TypedArenaHandle<'a, ObjectFile<'a>>,
+    pub live_objs: Vec<ObjectFileId>,
     unique_paths: HashSet<(&'a Path, InputArgContext)>,
     unique_mappings: HashSet<(UniqueFileId, InputArgContext)>,
     unique_libraries: HashSet<(&'a OsStr, InputArgContext)>,
@@ -239,33 +181,27 @@ pub struct InputsReader<'r, 'a: 'r> {
 
 impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     pub fn new(
-        architecture: ImageFileMachine,
-        strings: &'r ArenaHandle<'a, u8>,
-        store: &'a InputsStore<'a>,
-        objs: &'r TypedArena<ArenaRef<'a, ObjectFile<'a>>>,
+        ctx: &LinkContext<'a>,
+        objs: &'r TypedArena<TypedArenaRef<'a, ObjectFile<'a>>>,
     ) -> Self {
-        let this = Self {
-            architecture,
-            strings,
-            store,
-            input_objs: objs,
+        Self {
+            architecture: ctx
+                .options
+                .machine
+                .map(|machine| match machine {
+                    Emulation::I386Pep => ImageFileMachine::Amd64,
+                    Emulation::I386Pe => ImageFileMachine::I386,
+                })
+                .unwrap_or(ImageFileMachine::Unknown),
+            bump: ctx.bump_pool.get(),
+            mappings: ctx.mapping_pool.get(),
+            obj_arena: ctx.obj_pool.get(),
+            live_objs: Vec::new(),
             unique_paths: HashSet::new(),
             unique_mappings: HashSet::new(),
             unique_libraries: HashSet::new(),
-        };
-
-        this.create_internal_file();
-        this
-    }
-
-    fn create_internal_file(&self) {
-        assert!(
-            self.input_objs.len() == 0,
-            "InputsReader::create_internal_file() must be called before inputs are added"
-        );
-
-        let obj = ArenaRef::new_in(ObjectFile::internal_obj(), &self.store.objs);
-        self.input_objs.alloc(obj);
+            objs,
+        }
     }
 
     pub fn read_cli_inputs<'scope>(
@@ -273,23 +209,22 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
         ctx: &'scope LinkContext<'a>,
         scope: &Scope<'scope>,
         inputs: &'a [InputArg],
+        symbols: &'r SyncSymbolMap<'a>,
     ) where
         'r: 'scope,
     {
+        let mut handle_input = |input: &'a InputArg| match input.variant {
+            InputArgVariant::File(ref path) => {
+                self.read_path(ctx, symbols, scope, input.context, path.as_path())
+            }
+            InputArgVariant::Library(ref library) => {
+                self.read_library(ctx, symbols, scope, input.context, library.as_os_str())
+            }
+        };
+
         for input in inputs {
-            match input.variant {
-                InputArgVariant::File(ref path) => {
-                    if let Err(e) = self.read_path(ctx, scope, input.context, path.as_path()) {
-                        log::error!(logger: ctx, "{e}");
-                    }
-                }
-                InputArgVariant::Library(ref library) => {
-                    if let Err(e) =
-                        self.read_library(ctx, scope, input.context, library.as_os_str())
-                    {
-                        log::error!(logger: ctx, "{e}");
-                    }
-                }
+            if let Err(e) = handle_input(input) {
+                log::error!(logger: ctx, "{e}");
             }
         }
     }
@@ -297,6 +232,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     fn read_path<'scope>(
         &mut self,
         ctx: &'scope LinkContext<'a>,
+        symbols: &'r SyncSymbolMap<'a>,
         scope: &Scope<'scope>,
         input_ctx: InputArgContext,
         path: &'a Path,
@@ -304,16 +240,16 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     where
         'r: 'scope,
     {
-        if let Some(file) = self.open_unique_path(path, input_ctx) {
-            self.read_file(ctx, scope, input_ctx, path, file?)
-        } else {
-            Ok(())
-        }
+        self.open_unique_path(path, input_ctx)
+            .map_or(Ok(()), |file| {
+                self.read_file(ctx, symbols, scope, input_ctx, path, file?)
+            })
     }
 
     fn read_library<'scope>(
         &mut self,
         ctx: &'scope LinkContext<'a>,
+        symbols: &'r SyncSymbolMap<'a>,
         scope: &Scope<'scope>,
         input_ctx: InputArgContext,
         library: &'a OsStr,
@@ -321,18 +257,18 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     where
         'r: 'scope,
     {
-        if let Some(found) = self.find_unique_library(ctx, library, input_ctx) {
-            let (path, file) = found?;
-            let path = Path::new(*self.strings.alloc_os_str(path.as_os_str()));
-            self.read_file(ctx, scope, input_ctx, path, file)
-        } else {
-            Ok(())
-        }
+        self.find_unique_library(ctx, library, input_ctx)
+            .map_or(Ok(()), |found| {
+                let (path, file) = found?;
+                let path = alloc_path(&self.bump, path.as_path());
+                self.read_file(ctx, symbols, scope, input_ctx, path, file)
+            })
     }
 
     fn read_file<'scope>(
         &mut self,
         ctx: &'scope LinkContext<'a>,
+        symbols: &'r SyncSymbolMap<'a>,
         scope: &Scope<'scope>,
         input_ctx: InputArgContext,
         path: &'a Path,
@@ -341,27 +277,30 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     where
         'r: 'scope,
     {
-        if let Some(mapping) = self.map_unique_file(file, input_ctx) {
-            let mapping = mapping.with_context(|| format!("cannot open {}", path.display()))?;
-            ctx.stats.read.files.fetch_add(1, Ordering::Relaxed);
-            self.parse_input_file(
-                ctx,
-                scope,
-                input_ctx,
-                InputFile {
-                    data: mapping,
-                    path,
-                    parent: None,
-                },
-            )
-        } else {
-            Ok(())
-        }
+        self.map_unique_file(file, input_ctx)
+            .map_or(Ok(()), |mapping| {
+                let mapping = mapping.with_context(|| format!("cannot open {}", path.display()))?;
+                ctx.stats.read.files.fetch_add(1, Ordering::Relaxed);
+                self.parse_input_file(
+                    ctx,
+                    symbols,
+                    scope,
+                    input_ctx,
+                    InputFile {
+                        path: InputFilePath {
+                            disk: path,
+                            member: None,
+                        },
+                        data: &mapping,
+                    },
+                )
+            })
     }
 
     fn parse_input_file<'scope>(
         &mut self,
         ctx: &'scope LinkContext<'a>,
+        symbols: &'r SyncSymbolMap<'a>,
         scope: &Scope<'scope>,
         input_ctx: InputArgContext,
         file: InputFile<'a>,
@@ -369,18 +308,39 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     where
         'r: 'scope,
     {
-        let kind = FileKind::detect(file.data)
-            .with_context(|| format!("cannot parse {}", file.source()))?;
+        let kind = FileKind::detect(file.data).with_context(|| format!("cannot parse {file}"))?;
 
         match kind {
             FileKind::Coff => {
-                let machine = ObjectFile::identify_coff_machine(file.data, 0)?;
+                let machine = ObjectFile::identify_coff_machine(file.data, 0)
+                    .with_context(|| format!("cannot parse {file}"))?;
                 self.validate_architecture(&file, machine)?;
-                let obj = self.make_new_object_file(ctx, input_ctx, file);
-                let obj = self.input_objs.alloc(obj);
+                let id = ObjectFileId::from_usize(self.objs.len());
+                let obj = {
+                    let obj = self.obj_arena.alloc_ref(ObjectFile::default());
+                    self.objs.alloc(obj)
+                };
+
+                if !file.is_archive_member() {
+                    ctx.stats.read.coffs.fetch_add(1, Ordering::Relaxed);
+                }
+
+                let archive_lazy = file.is_archive_member() && !input_ctx.in_whole_archive;
+                let cmdline_lazy = !file.is_archive_member() && !input_ctx.in_lib;
+                let lazy = cmdline_lazy || archive_lazy;
+
+                if !lazy {
+                    self.live_objs.push(id);
+                }
+
                 scope.spawn(move |_| {
-                    if let Err(e) = obj.parse_coff(ctx) {
-                        log::error!(logger: ctx, "cannot parse {}: {e}", obj.source());
+                    let do_parse = || -> crate::Result<()> {
+                        *obj.as_mut() = ObjectFile::parse(ctx, file, lazy, symbols)?;
+                        Ok(())
+                    };
+
+                    if let Err(e) = do_parse() {
+                        log::error!(logger: ctx, "{e}");
                     }
                 });
             }
@@ -388,12 +348,12 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
                 todo!("import files");
             }
             FileKind::Archive => {
-                if file.parent.is_some() {
-                    log::warn!("{}: skipping archive file member in archive", file.source());
+                if file.is_archive_member() {
+                    log::warn!("{file}: skipping archive file member in archive");
                     return Ok(());
                 }
 
-                self.parse_archive_file(ctx, scope, input_ctx, file)?;
+                self.parse_archive_file(ctx, symbols, scope, input_ctx, file)?;
             }
             FileKind::ModuleDef => {
                 todo!("module definition files");
@@ -403,46 +363,20 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
         Ok(())
     }
 
-    fn make_new_object_file<'scope>(
-        &mut self,
-        ctx: &'scope LinkContext<'a>,
-        input_ctx: InputArgContext,
-        file: InputFile<'a>,
-    ) -> ArenaRef<'a, ObjectFile<'a>>
-    where
-        'r: 'scope,
-    {
-        let have_parent = file.parent.is_some();
-        if !have_parent {
-            ctx.stats.read.coffs.fetch_add(1, Ordering::Relaxed);
-        }
-
-        let obj = ObjectFile::new(
-            ObjectFileId::new(self.input_objs.len()),
-            file,
-            input_ctx.in_lib || (have_parent && !input_ctx.in_whole_archive),
-        );
-        ArenaRef::new_in(obj, &self.store.objs)
-    }
-
     fn validate_architecture(
         &mut self,
-        file: &InputFile<'a>,
+        path: &InputFile<'a>,
         machine: ImageFileMachine,
     ) -> crate::Result<()> {
         if !(machine == ImageFileMachine::Amd64 || machine == ImageFileMachine::I386) {
-            bail!(
-                "cannot parse {}: unsupported COFF architecture '{machine:#}'",
-                file.source(),
-            );
+            bail!("cannot parse {path}: unsupported COFF architecture '{machine:#}'",);
         }
 
         if self.architecture == ImageFileMachine::Unknown {
             self.architecture = machine;
         } else if self.architecture != machine {
             bail!(
-                "cannot parse {}: expected machine value '{}' but found '{machine}'",
-                file.source(),
+                "cannot parse {path}: expected machine value '{}' but found '{machine}'",
                 self.architecture,
             );
         }
@@ -453,6 +387,7 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     fn parse_archive_file<'scope>(
         &mut self,
         ctx: &'scope LinkContext<'a>,
+        symbols: &'r SyncSymbolMap<'a>,
         scope: &Scope<'scope>,
         input_ctx: InputArgContext,
         file: InputFile<'a>,
@@ -460,56 +395,56 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     where
         'r: 'scope,
     {
-        let archive = ArchiveFile::parse(file.data)
-            .with_context(|| format!("cannot parse {}", file.source()))?;
-
+        let archive =
+            ArchiveFile::parse(file.data).with_context(|| format!("cannot parse {file}"))?;
         ctx.stats.read.archives.fetch_add(1, Ordering::Relaxed);
-
-        let file = &*self.store.files.alloc(file);
         if archive.is_thin() {
-            self.parse_thin_archive_members(ctx, scope, input_ctx, file, archive)
+            self.parse_thin_archive_members(ctx, symbols, scope, input_ctx, &file, archive)
         } else {
-            self.parse_archive_members(ctx, scope, input_ctx, file, archive)
+            self.parse_archive_members(ctx, symbols, scope, input_ctx, &file, archive)
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn parse_archive_members<'scope>(
         &mut self,
         ctx: &'scope LinkContext<'a>,
+        symbols: &'r SyncSymbolMap<'a>,
         scope: &Scope<'scope>,
         input_ctx: InputArgContext,
-        file: &'a InputFile<'a>,
+        file: &InputFile<'a>,
         archive: ArchiveFile<'a>,
     ) -> crate::Result<()>
     where
         'r: 'scope,
     {
         for member in archive.members() {
-            let member = member.with_context(|| format!("cannot parse {}", file.source()))?;
+            let member = member.with_context(|| format!("cannot parse {file}"))?;
             let offset = member.file_range().0;
-            let member_name = std::str::from_utf8(member.name()).map_err(|_| {
-                make_error!(
-                    "cannot parse {}({offset}): member name is not a valid utf8 string",
-                    file.path.display()
-                )
-            })?;
+            let member_name =
+                std::str::from_utf8(member.name()).map_err(|_| {
+                    make_error!(
+                        "cannot parse {file}({offset}): member name is not a valid utf8 string",
+                    )
+                })?;
             let member_path = Path::new(member_name);
-            let member_data = member.data(file.data).with_context(|| {
-                format!(
-                    "cannot parse {}({})",
-                    file.path.display(),
-                    member_path.display()
-                )
-            })?;
+            let member_path = InputFilePath {
+                disk: file.path.disk,
+                member: Some(member_path),
+            };
+
+            let member_data = member
+                .data(file.data)
+                .with_context(|| format!("cannot parse {member_path}"))?;
 
             self.parse_input_file(
                 ctx,
+                symbols,
                 scope,
                 input_ctx,
                 InputFile {
-                    data: member_data,
                     path: member_path,
-                    parent: Some(file),
+                    data: member_data,
                 },
             )?;
         }
@@ -520,51 +455,56 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
     fn parse_thin_archive_members<'scope>(
         &mut self,
         ctx: &'scope LinkContext<'a>,
+        symbols: &'r SyncSymbolMap<'a>,
         scope: &Scope<'scope>,
         input_ctx: InputArgContext,
-        file: &'a InputFile<'a>,
+        file: &InputFile<'a>,
         archive: ArchiveFile<'a>,
     ) -> crate::Result<()>
     where
         'r: 'scope,
     {
         for member in archive.members() {
-            let member = member.with_context(|| format!("cannot parse {}", file.source()))?;
+            let member = member.with_context(|| format!("cannot parse {file}"))?;
             let offset = member.file_range().0;
-            let member_name = std::str::from_utf8(member.name()).map_err(|_| {
-                make_error!(
-                    "cannot parse {}({offset}): member name is not a valid utf8 string",
-                    file.path.display()
-                )
-            })?;
+            let member_name =
+                std::str::from_utf8(member.name()).map_err(|_| {
+                    make_error!(
+                        "cannot parse {file}({offset}): member name is not a valid utf8 string",
+                    )
+                })?;
             let member_path = {
                 let member_path = Path::new(member_name);
                 let normalized = member_path.normalize_lexically_cpp();
                 if normalized == member_path {
                     member_path
                 } else {
-                    Path::new(*self.strings.alloc_os_str(normalized.as_os_str()))
+                    let bytes = self
+                        .bump
+                        .alloc_bytes(normalized.as_os_str().as_encoded_bytes());
+                    Path::new(unsafe { OsStr::from_encoded_bytes_unchecked(bytes) })
                 }
             };
 
-            let source = InputFileSource::Member {
-                archive: file.path,
-                path: member_path,
+            let disk_path = file.path.disk.join(member_path.normalize_lexically_cpp());
+            let member_path = InputFilePath {
+                disk: file.path.disk,
+                member: Some(member_path),
             };
-            let disk_path = file.path.join(member_path.normalize_lexically_cpp());
+
             let handle = std::fs::File::open(&disk_path)
-                .with_context(|| format!("cannot open {source}: thin archive member"))?;
+                .with_context(|| format!("cannot open {member_path}: thin archive member"))?;
             if let Some(mapping) = self.map_unique_file(handle, input_ctx) {
                 let mapping = mapping
-                    .with_context(|| format!("cannot open {source}: thin archive member"))?;
+                    .with_context(|| format!("cannot open {member_path}: thin archive member"))?;
                 self.parse_input_file(
                     ctx,
+                    symbols,
                     scope,
                     input_ctx,
                     InputFile {
                         path: member_path,
-                        parent: Some(file),
-                        data: mapping,
+                        data: &mapping,
                     },
                 )?;
             }
@@ -578,14 +518,9 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
         path: &'a Path,
         input_ctx: InputArgContext,
     ) -> Option<crate::Result<std::fs::File>> {
-        if self.unique_paths.insert((path, input_ctx)) {
-            Some(
-                std::fs::File::open(path)
-                    .with_context(|| format!("cannot open {}", path.display())),
-            )
-        } else {
-            None
-        }
+        self.unique_paths.insert((path, input_ctx)).then(|| {
+            std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))
+        })
     }
 
     fn map_unique_file(
@@ -593,20 +528,19 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
         file: std::fs::File,
         input_ctx: InputArgContext,
     ) -> Option<crate::Result<&'a Mmap>> {
-        let ufid = match file.unique_id() {
-            Ok(ufid) => ufid,
-            Err(e) => return Some(Err(e.into())),
-        };
-
-        if self.unique_mappings.insert((ufid, input_ctx)) {
-            Some(
-                unsafe { Mmap::map(&file) }
-                    .map(|mapping| &*self.store.mappings.alloc(mapping))
-                    .map_err(crate::Error::from),
-            )
-        } else {
-            None
-        }
+        file.unique_id()
+            .map_err(crate::Error::from)
+            .and_then(|ufid| {
+                self.unique_mappings
+                    .insert((ufid, input_ctx))
+                    .then(|| {
+                        unsafe { Mmap::map(&file) }
+                            .map(|mapping| &*self.mappings.alloc(mapping))
+                            .map_err(crate::Error::from)
+                    })
+                    .transpose()
+            })
+            .transpose()
     }
 
     fn find_unique_library(
@@ -615,12 +549,10 @@ impl<'r, 'a: 'r> InputsReader<'r, 'a> {
         name: &'a OsStr,
         input_ctx: InputArgContext,
     ) -> Option<crate::Result<(PathBuf, std::fs::File)>> {
-        if self.unique_libraries.insert((name, input_ctx)) {
-            let found = find_library(&ctx.options.library_path, input_ctx.in_static, name);
-            Some(found.with_context(|| format!("unable to find library -l{}", name.display())))
-        } else {
-            None
-        }
+        self.unique_libraries.insert((name, input_ctx)).then(|| {
+            find_library(&ctx.options.library_path, input_ctx.in_static, name)
+                .with_context(|| format!("unable to find library -l{}", name.display()))
+        })
     }
 }
 
@@ -677,25 +609,37 @@ fn find_library(
     // <name>.dll.a
     // lib<name>.a
     // <name>.lib
+    // lib<name>.lib
     let mut namebuf = OsString::new();
     search_paths.iter().find_map(|search_path| {
         buf.clear();
         buf.push(search_path);
         buf.push(name);
-        [("lib", "dll.a"), ("", "dll.a"), ("lib", "a"), ("", "lib")]
-            .into_iter()
-            .find_map(|(prefix, ext)| {
-                let mut filename = name;
-                if !prefix.is_empty() {
-                    namebuf.clear();
-                    namebuf.push(prefix);
-                    namebuf.push(name);
-                    filename = &namebuf;
-                }
+        [
+            ("lib", "dll.a"),
+            ("", "dll.a"),
+            ("lib", "a"),
+            ("", "lib"),
+            ("lib", "lib"),
+        ]
+        .into_iter()
+        .find_map(|(prefix, ext)| {
+            let mut filename = name;
+            if !prefix.is_empty() {
+                namebuf.clear();
+                namebuf.push(prefix);
+                namebuf.push(name);
+                filename = &namebuf;
+            }
 
-                buf.set_file_name(filename);
-                buf.add_extension(ext);
-                try_open_path(&buf).map(|f| (buf.to_owned(), f))
-            })
+            buf.set_file_name(filename);
+            buf.add_extension(ext);
+            try_open_path(&buf).map(|f| (buf.to_owned(), f))
+        })
     })
+}
+
+fn alloc_path<'a>(bump: &BumpHandle<'a>, path: &Path) -> &'a Path {
+    let bytes = bump.alloc_bytes(path.as_os_str().as_encoded_bytes());
+    Path::new(unsafe { OsStr::from_encoded_bytes_unchecked(bytes) })
 }

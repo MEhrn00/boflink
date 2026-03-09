@@ -68,9 +68,14 @@ impl Logger {
             prepend: Mutex::new(""),
         }
     }
+
+    pub fn contains_error(&self) -> bool {
+        self.error_count.load(Ordering::Relaxed) > 0
+    }
 }
 
 impl log::Log for Logger {
+    #[inline]
     fn enabled(&self, metadata: &log::Metadata) -> bool {
         metadata.level() <= self.max_level
     }
@@ -121,6 +126,7 @@ impl log::Log for Logger {
         }
     }
 
+    #[inline]
     fn flush(&self) {}
 }
 

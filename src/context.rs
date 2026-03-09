@@ -1,12 +1,15 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 
+use boflink_arena::{BumpPool, TypedArenaPool};
 use bstr::BStr;
+use memmap2::Mmap;
 
 use crate::{
-    arena::ArenaPool,
     cli::CliOptions,
     coff::ImageFileMachine,
-    symbols::{ManglingScheme, SymbolDemangler, SymbolMap},
+    logging::Logger,
+    object::ObjectFile,
+    symbols::{ManglingScheme, SymbolDemangler},
 };
 
 /// Context structure which holds miscellaneous the program context used
@@ -18,86 +21,81 @@ use crate::{
 /// last resort. This structure helps solve a lot of those issues while also
 /// "simulating" having them.
 pub struct LinkContext<'a> {
-    /// The raw command line options passed to the program
+    pub logger: Logger,
     pub options: &'a CliOptions,
-
-    /// Map of symbol names to global symbols
-    pub symbol_map: SymbolMap<'a>,
-
-    /// Flag indicating if the program has encountered an error.
-    ///
-    /// This structure implements the [`log::Log`] trait. This flag will get
-    /// set if any error records have passed through this logger.
-    errored: AtomicBool,
-
-    pub string_pool: &'a ArenaPool<u8>,
+    pub bump_pool: &'a BumpPool,
+    pub mapping_pool: &'a TypedArenaPool<Mmap>,
+    pub obj_pool: &'a TypedArenaPool<ObjectFile<'a>>,
     pub stats: LinkStats,
 }
 
 impl<'a> LinkContext<'a> {
-    pub fn new(options: &'a CliOptions, string_pool: &'a ArenaPool<u8>) -> Self {
-        // This should already be set to reflect the active thread count but
-        // fall back to 1 if it is not.
-        let active_threads = options.threads.map(|num| num.get()).unwrap_or(1);
-
-        // Use the active number of threads to determine slot count for the symbol map.
-        let map_slots = active_threads.next_power_of_two().clamp(2, 256);
-
+    #[inline]
+    pub fn new(
+        logger: Logger,
+        options: &'a CliOptions,
+        bump_pool: &'a BumpPool,
+        mapping_pool: &'a TypedArenaPool<Mmap>,
+        obj_pool: &'a TypedArenaPool<ObjectFile<'a>>,
+    ) -> Self {
         Self {
+            logger,
             options,
-            string_pool,
-            errored: AtomicBool::new(false),
-            symbol_map: SymbolMap::with_slot_count(map_slots),
+            bump_pool,
+            mapping_pool,
+            obj_pool,
             stats: Default::default(),
         }
     }
 
-    /// Function which checks if an error message was logged using this logger
-    /// and exits the program if it has.
-    ///
-    /// This can be used for doing a simple check after a multi-threaded linker
-    /// pass to see if any threads encountered an error. It is generally helpful
-    /// to log all errors that occur during a pass for the user instead of
-    /// short-circuiting and terminating on the first one.
-    ///
-    /// This method takes `self` as `&mut self` to ensure that only a single
-    /// thread is performing this check.
-    pub fn exclusive_check_errored(&mut self) {
-        if *self.errored.get_mut() {
+    #[inline]
+    pub fn exit_on_error(&self) {
+        if self.logger.contains_error() {
             std::process::exit(1);
         }
     }
 
-    pub fn demangle<'s>(
-        &self,
-        symbol: &'s BStr,
-        machine: ImageFileMachine,
-    ) -> ContextDemangler<'s> {
+    #[inline]
+    pub fn demangle<'s>(&self, name: &'s BStr, machine: ImageFileMachine) -> ContextDemangler<'s> {
         if self.options.demangle {
-            ContextDemangler::Demangle(SymbolDemangler::new(
-                symbol,
-                ManglingScheme::machine(machine),
-            ))
+            ContextDemangler::Demangle(SymbolDemangler::new(name, ManglingScheme::machine(machine)))
         } else {
-            ContextDemangler::Plain(symbol)
+            ContextDemangler::Plain(name)
         }
     }
 }
 
 impl<'a> log::Log for &LinkContext<'a> {
+    #[inline]
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        log::logger().enabled(metadata)
+        self.logger.enabled(metadata)
     }
 
+    #[inline]
     fn log(&self, record: &log::Record) {
-        if record.level() == log::Level::Error {
-            self.errored.store(true, Ordering::Release);
-        }
-        log::logger().log(record);
+        self.logger.log(record);
     }
 
+    #[inline]
     fn flush(&self) {
-        log::logger().flush();
+        self.logger.flush();
+    }
+}
+
+impl<'a> log::Log for &mut LinkContext<'a> {
+    #[inline]
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        self.logger.enabled(metadata)
+    }
+
+    #[inline]
+    fn log(&self, record: &log::Record) {
+        self.logger.log(record);
+    }
+
+    #[inline]
+    fn flush(&self) {
+        self.logger.flush();
     }
 }
 
@@ -109,12 +107,29 @@ pub enum ContextDemangler<'a> {
 }
 
 impl<'a> std::fmt::Display for ContextDemangler<'a> {
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Demangle(demangler) => demangler.fmt(f),
             Self::Plain(name) => name.fmt(f),
         }
     }
+}
+
+#[derive(Debug, Default)]
+pub struct ReadStats {
+    pub files: AtomicU32,
+    pub coffs: AtomicU32,
+    pub archives: AtomicU32,
+}
+
+#[derive(Debug, Default)]
+pub struct ParseStats {
+    pub coffs: AtomicU32,
+    pub sections: AtomicUsize,
+    pub symbols: AtomicUsize,
+    pub input_sections: AtomicUsize,
+    pub input_symbols: AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -125,6 +140,7 @@ pub struct LinkStats {
 }
 
 impl LinkStats {
+    #[inline]
     pub fn print_yaml(&mut self) {
         self.write_yaml(std::io::stdout().lock()).unwrap();
     }
@@ -141,9 +157,7 @@ impl LinkStats {
         let parse_sections = *self.parse.sections.get_mut();
         let parse_symbols = *self.parse.symbols.get_mut();
         let parse_input_sections = *self.parse.input_sections.get_mut();
-        let parse_external_symbols = *self.parse.external_symbols.get_mut();
-        let parse_local_symbols = *self.parse.local_symbols.get_mut();
-        let parse_comdats = *self.parse.comdats.get_mut();
+        let parse_input_symbols = *self.parse.input_symbols.get_mut();
         let globals = *self.globals.get_mut();
 
         write!(
@@ -158,29 +172,9 @@ impl LinkStats {
     sections: {parse_sections}
     symbols: {parse_symbols}
     input_sections: {parse_input_sections}
-    external_symbols: {parse_external_symbols}
-    local_symbols: {parse_local_symbols}
-    comdats: {parse_comdats}
+    input_symbols: {parse_input_symbols}
   globals: {globals}
 "#
         )
     }
-}
-
-#[derive(Debug, Default)]
-pub struct ReadStats {
-    pub files: AtomicU32,
-    pub coffs: AtomicU32,
-    pub archives: AtomicU32,
-}
-
-#[derive(Debug, Default)]
-pub struct ParseStats {
-    pub coffs: AtomicU32,
-    pub sections: AtomicUsize,
-    pub symbols: AtomicUsize,
-    pub external_symbols: AtomicUsize,
-    pub input_sections: AtomicUsize,
-    pub local_symbols: AtomicUsize,
-    pub comdats: AtomicUsize,
 }

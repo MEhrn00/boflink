@@ -1,60 +1,37 @@
-use std::{collections::HashSet, num::NonZeroUsize, path::Path, process::ExitCode};
+use std::{ffi::OsString, io::IsTerminal, num::NonZeroUsize, process::ExitCode};
 
-use bstr::BStr;
-use typed_arena::Arena;
+use boflink_arena::{BumpPool, TypedArenaPool};
 
-use crate::{
-    arena::ArenaPool,
-    cli::{CliArgs, CliOptions},
-    coff::ImageFileMachine,
+use boflink::{
+    ErrorContext,
+    cli::{CARGO_PKG_NAME, Cli, CliOptions},
     context::LinkContext,
-    inputs::InputsStore,
-    linker::Linker,
-    timing::DurationExt,
+    linker::LinkInputs,
+    logging::Logger,
+    stdext::time::DurationExt,
 };
-
-mod arena;
-mod bit_set;
-mod cli;
-mod coff;
-mod concurrent_indexmap;
-mod context;
-mod error;
-mod gc_sections;
-mod inputs;
-mod linker;
-mod logging;
-mod object;
-mod outputs;
-mod sparse_set;
-mod stdext;
-mod symbols;
-mod timing;
-
-#[cfg(windows)]
-mod undname;
-
-pub use error::*;
+use indexmap::IndexSet;
 
 /// cli entrypoint
 fn main() -> ExitCode {
-    let mut args = CliArgs::default();
-    let cmdline = cli::expand_response_files(std::env::args_os());
+    let cmdline = Cli::expand_response_files(std::env::args_os());
+    let mut args = Cli::new();
     let res = args.try_update_from(cmdline.iter().skip(1));
-    setup_logging(&args.options);
+    setup_global_logging(&args.options);
 
     if args.options.verbose >= 1 {
-        cli::log_cmdline(&cmdline);
+        log::info!("{}", args.render_version());
+        log_cmdline(&cmdline);
     }
 
     if args.options.help {
-        cli::print_help(args.options.help_ignored);
+        println!("{}", args.render_help(args.options.help_ignored));
         return ExitCode::SUCCESS;
     } else if args.options.version {
-        cli::print_version();
+        println!("{}", args.render_version());
         return ExitCode::SUCCESS;
     } else if args.options.print_gcc_specs {
-        cli::print_gcc_specs();
+        print_gcc_specs();
         return ExitCode::SUCCESS;
     }
 
@@ -75,14 +52,14 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn try_main(mut args: CliArgs) -> Result<()> {
+fn try_main(mut args: Cli) -> boflink::Result<()> {
     let num_threads = args.options.threads.get_or_insert_with(|| {
         std::thread::available_parallelism().map_or_else(
             |_| NonZeroUsize::new(1).unwrap(),
             |threads| {
-                // Cap the number of threads to 16 if Rust detects more than 16
+                // Cap the number of threads to 32 if Rust detects more than 32
                 // available parallel units.
-                threads.min(NonZeroUsize::new(16).unwrap())
+                threads.min(NonZeroUsize::new(32).unwrap())
             },
         )
     });
@@ -92,92 +69,43 @@ fn try_main(mut args: CliArgs) -> Result<()> {
         .build()
         .context("cannot create thread pool")?;
 
-    thread_pool.install(|| run_boflink(args))
+    let print_timing = args.options.print_timing;
+    let timer = std::time::Instant::now();
+    thread_pool.install(|| run_boflink(args))?;
+
+    if print_timing {
+        let elapsed = std::time::Instant::now() - timer;
+        log::info!("link time: {}", elapsed.display());
+    }
+
+    Ok(())
 }
 
-fn run_boflink(mut args: CliArgs) -> Result<()> {
-    let timer = std::time::Instant::now();
-
-    let string_pool = ArenaPool::new();
-    let instore = InputsStore::default();
+fn run_boflink(mut args: Cli) -> boflink::Result<()> {
+    let bump_pool = BumpPool::new();
+    let mapping_pool = TypedArenaPool::new();
+    let obj_pool = TypedArenaPool::new();
     let inputs = std::mem::take(&mut args.inputs);
     setup_options(&mut args.options);
-    let mut ctx = LinkContext::new(&args.options, &string_pool);
 
-    let mut linker = Linker::read_inputs(&ctx, &inputs, &instore)?;
-    ctx.exclusive_check_errored();
+    let logger = create_logger(&args.options);
+    let mut ctx = LinkContext::new(logger, &args.options, &bump_pool, &mapping_pool, &obj_pool);
+    let mut link_inputs = LinkInputs::read_inputs(&mut ctx, &inputs)?;
+    link_inputs.add_symbols(&ctx);
+    let mut linker = link_inputs.resolve_symbols(&ctx);
 
-    if linker.objs.is_empty() {
-        bail!("no input files");
+    if ctx.options.gc_sections {
+        linker.do_gc(&ctx);
     }
 
-    if linker.output.architecture() == ImageFileMachine::Unknown {
-        bail!("unable to detect target architecture from input files");
-    }
-
-    // Add command line symbols as GC roots
-    for symbol in [&args.options.entry]
-        .into_iter()
-        .chain(args.options.require_defined.iter())
-        .chain(args.options.undefined.iter())
-    {
-        linker.add_gc_root(&mut ctx, BStr::new(symbol.as_bytes()));
-    }
-
-    // Add require defined symbols
-    for symbol in args.options.require_defined.iter() {
-        linker.add_required_symbol(&mut ctx, BStr::new(symbol.as_bytes()));
-    }
-
-    // Add traced symbols
-    for symbol in args.options.trace_symbol.iter() {
-        linker.add_traced_symbol(&mut ctx, BStr::new(symbol.as_bytes()));
-    }
-
-    // Add ignored undefined symbols
-    for symbol in args.options.ignore_unresolved_symbol.iter() {
-        linker.add_ignored_undefined_symbol(&mut ctx, BStr::new(symbol.as_bytes()));
-    }
-
-    linker.resolve_symbols(&mut ctx);
-    log::debug!(
-        "found {} live objects after symbol resolution",
-        linker.objs.len() - 1
-    );
-
-    linker.fix_commons_resolution(&ctx);
+    linker.dedup_gcc_ident();
 
     if ctx.options.define_common {
         linker.define_common_symbols(&ctx);
     }
 
-    linker.report_duplicate_symbols(&ctx);
-
-    if ctx.options.gc_sections {
-        linker.do_gc(&mut ctx);
-    }
-
-    linker.create_output_sections(&mut ctx);
-    linker.mark_import_symbols(&ctx);
-    linker.claim_undefined_symbols(&ctx);
-
-    linker.scan_relocations(&mut ctx);
-    linker.sort_section_mappings(&ctx);
-
-    linker.rewrite_dfr_imports(&ctx);
-    linker.compute_sections(&ctx);
-
-    let mut stats = std::mem::take(&mut ctx.stats);
-    drop(linker);
-    drop(ctx);
-
-    if args.options.stats {
-        stats.print_yaml();
-    }
-
-    if args.options.print_timing {
-        let elapsed = std::time::Instant::now() - timer;
-        log::info!("link time: {}", elapsed.display());
+    if ctx.options.stats {
+        ctx.stats.print_yaml();
     }
 
     Ok(())
@@ -195,18 +123,14 @@ fn setup_options(options: &mut CliOptions) {
 }
 
 fn dedup_library_paths(options: &mut CliOptions) {
-    let arena = Arena::<u8>::new();
-    let mut seen = HashSet::<&[u8]>::with_capacity(options.library_path.len());
+    let library_path = std::mem::take(&mut options.library_path)
+        .into_iter()
+        .collect::<IndexSet<_>>();
 
-    let save =
-        |path: &Path| arena.alloc_extend(path.as_os_str().as_encoded_bytes().iter().copied());
-
-    options
-        .library_path
-        .retain(|path| seen.insert(save(path.as_path())));
+    options.library_path = library_path.into_iter().collect();
 }
 
-fn setup_logging(options: &CliOptions) {
+fn setup_global_logging(options: &CliOptions) {
     let mut max_level = log::Level::Info;
     if options.verbose >= 2 {
         max_level = log::Level::Trace;
@@ -214,6 +138,43 @@ fn setup_logging(options: &CliOptions) {
         max_level = log::Level::Debug;
     }
 
-    crate::logging::init(max_level, options.color_diagnostics, options.error_limit)
+    boflink::logging::init(max_level, options.color_diagnostics, options.error_limit)
         .expect("logging should only be initialized once");
+}
+
+fn create_logger(options: &CliOptions) -> Logger {
+    let mut max_level = log::Level::Info;
+    if options.verbose >= 2 {
+        max_level = log::Level::Trace;
+    } else if options.verbose >= 1 {
+        max_level = log::Level::Debug;
+    }
+
+    Logger::new(max_level, options.color_diagnostics, options.error_limit)
+}
+
+fn log_cmdline(args: &[OsString]) {
+    let args = args.iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>();
+    log::info!("command line: {}", args.join(" "));
+}
+
+fn print_gcc_specs() {
+    // Print out a header with instructions only if printing to a terminal.
+    // Just print out the raw spec file content if the output is potentially being redirected to a
+    // file.
+    if std::io::stdout().is_terminal() {
+        println!(
+            "# Copy the text below '---' to a file named \"boflink.specs\" and run \"x86_64-w64-mingw32-gcc -specs=boflink.specs ...\"\n---"
+        );
+    }
+
+    let current_exe = std::env::current_exe()
+        .map(|exe| exe.into_os_string())
+        .unwrap_or_else(|_| OsString::from(CARGO_PKG_NAME));
+
+    println!(
+        "*linker:\n\
+        {current_exe}",
+        current_exe = current_exe.display()
+    );
 }
