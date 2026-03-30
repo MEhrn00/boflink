@@ -6,20 +6,22 @@ pub trait SectionChunk<'a> {
     /// Either the short or long name.
     fn name_bytes(&self) -> &'a [u8];
 
-    /// The `IMAGE_SCN_CNT_*` flags of the section
+    /// The `IMAGE_SCN_CNT_*` flags of the section.
     fn contents_flags(&self) -> u32;
 
-    /// The `IMAGE_SCN_MEM_*` flags of the section
+    /// The `IMAGE_SCN_MEM_*` flags of the section.
     fn memory_flags(&self) -> u32;
 
     /// Section alignment as a power of 2.
     fn p2align(&self) -> P2Align;
 
+    /// Returns the section alignment.
     #[inline]
     fn alignment(&self) -> u32 {
         self.p2align().value()
     }
 
+    /// Returns `true` if the section is for codeview debug info
     #[inline]
     fn is_codeview(&self) -> bool {
         let names = [b".debug$F", b".debug$S", b".debug$P", b".debug$T"];
@@ -27,48 +29,64 @@ pub trait SectionChunk<'a> {
         self.memory_flags() & pe::IMAGE_SCN_MEM_DISCARDABLE != 0 && names.iter().any(|&n| name == n)
     }
 
+    /// Returns `true` if the section is for DWARF debug info.
+    ///
+    /// # Note
+    /// This will only return `true` if the [`SectionChunk::name_bytes()`]
+    /// implementation returns the full name.
     #[inline]
     fn is_dwarf_debug(&self) -> bool {
         self.memory_flags() & pe::IMAGE_SCN_MEM_DISCARDABLE != 0
             && self.name_bytes().starts_with(b".debug_")
     }
 
+    /// Returns `true` if this is either a codeview or DWARF debug section.
     #[inline]
     fn is_debug(&self) -> bool {
         self.is_codeview() || self.is_dwarf_debug()
     }
 
+    /// Returns `true` if this section is for import data.
     #[inline]
     fn is_idata(&self) -> bool {
         let name = self.name_bytes();
         name == b".idata" || name.starts_with(b".idata$")
     }
 
+    /// Returns `true` if this is an .idata section for import directories.
     #[inline]
     fn is_import_dir(&self) -> bool {
         self.name_bytes() == b".idata$2"
     }
 
+    /// Returns `true` if this is an .idata section with import lookup table
+    /// entries.
     #[inline]
     fn is_import_lookup(&self) -> bool {
         self.name_bytes() == b".idata$4"
     }
 
+    /// Returns `true` if this is an .idata section with import address table
+    /// entries.
     #[inline]
     fn is_import_address(&self) -> bool {
         self.name_bytes() == b".idata$5"
     }
 
+    /// Returns `true` if this is an .idata section with import hint/name entries.
     #[inline]
     fn is_import_hintname(&self) -> bool {
         self.name_bytes() == b".idata$6"
     }
 
+    /// Returns `true` if this is an .idata section with the import directory
+    /// DLL name entry.
     #[inline]
     fn is_import_dllname(&self) -> bool {
         self.name_bytes() == b".idata$7"
     }
 
+    /// Returns `true` if this section should be retained during GC sections
     #[inline]
     fn is_gc_retained(&self) -> bool {
         self.is_idata() || self.is_debug()
@@ -81,13 +99,14 @@ pub trait SectionChunk<'a> {
 pub struct P2Align(u8);
 
 impl P2Align {
+    /// Returns the expanded alignment value.
     #[inline]
     pub const fn value(&self) -> u32 {
         1u32 << self.0
     }
 
-    /// Extracts the section alignment from the specified `IMAGE_SCN_*`
-    /// flags
+    /// Constructs a new [`P2Align`] from the specified COFF section header
+    /// characteristics.
     #[inline]
     pub fn from_scn_flags(flags: u32) -> Self {
         if flags & pe::IMAGE_SCN_TYPE_NO_PAD != 0 {
@@ -104,6 +123,10 @@ impl P2Align {
         ((self.0 + 1) as u32) << 20
     }
 
+    /// Constructs a new [`P2Align`] using the specified value.
+    ///
+    /// # Panics
+    /// Panics if `value` is not a power of two in range `0..=8192`
     #[inline]
     pub fn from_value(value: u32) -> Self {
         let value = value.max(1);
@@ -118,34 +141,10 @@ impl P2Align {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct Chunk {
-    pub rva: u32,
-    p2align: u8,
-}
-
-impl Chunk {
-    #[inline]
-    pub fn set_alignment(&mut self, value: usize) {
-        let value = value.max(1);
-        assert!(
-            value.is_power_of_two(),
-            "alignment value must be a power of two"
-        );
-        assert!(
-            value <= 8192,
-            "alignment must be within range 0 <= align <= 8192"
-        );
-
-        self.p2align = value.ilog2() as u8;
-    }
-
-    #[inline]
-    pub const fn alignment(&self) -> usize {
-        1usize << self.p2align
-    }
-}
-
+/// Computes the JamCRC checksum for the specified data.
+///
+/// This is the checkum used for the `IMAGE_AUX_SYMBOL_SECTION` checksum
+/// value.
 pub fn compute_checksum(data: &[u8]) -> u32 {
     let mut h = crc32fast::Hasher::new_with_initial(!0);
     h.update(data);

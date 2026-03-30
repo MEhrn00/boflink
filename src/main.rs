@@ -101,7 +101,7 @@ fn run_boflink(mut args: Cli) -> boflink::Result<()> {
     linker.dedup_gcc_ident();
 
     if ctx.options.define_common {
-        linker.define_common_symbols(&ctx);
+        linker.define_common_symbols();
     }
 
     if ctx.options.stats {

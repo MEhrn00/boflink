@@ -17,17 +17,13 @@ use boflink_index::{
     bit_set::{AtomicDenseBitSet, DenseBitSet},
 };
 use bstr::BStr;
-use object::{
-    ReadRef, U16Bytes,
-    coff::{self, CoffHeader},
-    pe,
-};
+use object::{ReadRef, U16Bytes, coff::CoffHeader, pe};
 use parking_lot::RwLockUpgradableReadGuard;
 
 use crate::{
     ErrorContext, bail,
     chunks::{P2Align, SectionChunk},
-    coff::{ImageFileMachine, SectionIndex, SectionTable, SymbolIndex, SymbolTable},
+    coff::{ImageFileMachine, ImageSymbol, SectionIndex, SectionTable, SymbolIndex, SymbolTable},
     context::LinkContext,
     fatal,
     inputs::InputFile,
@@ -236,7 +232,7 @@ impl<'a> ObjectFile<'a> {
                 live: true,
                 visited: AtomicBool::new(ctx.options.gc_sections && header.is_gc_retained()),
                 flags,
-                checksum: 0,
+                check_sum: 0,
                 selection: 0,
                 follower_index: SectionIndex(0),
             });
@@ -327,7 +323,7 @@ impl<'a> ObjectFile<'a> {
                 if let Some(section_aux) = definition.symbol {
                     let section = self.sections[definition.index].as_mut().unwrap();
                     section.length = section_aux.length.get(object::LittleEndian);
-                    section.checksum = section_aux.check_sum.get(object::LittleEndian);
+                    section.check_sum = section_aux.check_sum.get(object::LittleEndian);
                     section.selection = section_aux.selection;
 
                     if section_aux.selection == pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE {
@@ -350,9 +346,9 @@ impl<'a> ObjectFile<'a> {
                         let section = self.sections[definition.index].as_mut().unwrap();
                         section.follower_index = head;
                     } else if section_aux.selection == pe::IMAGE_COMDAT_SELECT_EXACT_MATCH
-                        && section.checksum == 0
+                        && section.check_sum == 0
                     {
-                        section.checksum = crate::chunks::compute_checksum(section.data);
+                        section.check_sum = crate::chunks::compute_checksum(section.data);
                     }
                 } else if definition.section.characteristics.get(object::LittleEndian)
                     & pe::IMAGE_SCN_LNK_COMDAT
@@ -385,7 +381,7 @@ impl<'a> ObjectFile<'a> {
         debug_assert!(symbol.is_global());
 
         let mut hidden = false;
-        if coff::ImageSymbol::has_aux_weak_external(symbol) {
+        if symbol.has_aux_weak_external() {
             let weak_aux = self
                 .coff_symbols
                 .aux_weak_external(i)
@@ -395,7 +391,7 @@ impl<'a> ObjectFile<'a> {
             let default_index = weak_aux.default_symbol();
             let default_symbol = self
                 .coff_symbols
-                .symbol(SymbolIndex(default_index.0 as u32))
+                .symbol(default_index)
                 .map_err(|_| make_error!("weak tag index references invalid symbol"))?;
 
             if default_symbol.storage_class != pe::IMAGE_SYM_CLASS_EXTERNAL
@@ -404,7 +400,7 @@ impl<'a> ObjectFile<'a> {
                 bail!("weak default symbol is local {default_index}")
             }
 
-            let weak_search = weak_aux.weak_search_type.get(object::LittleEndian);
+            let weak_search = weak_aux.characteristics.get(object::LittleEndian);
             // Weak externals need to be linkage scoped per the COFF spec.
             // Some weak externals, however, are treated as locally scoped
             // during symbol resolution. Making an external symbol hidden
@@ -415,7 +411,7 @@ impl<'a> ObjectFile<'a> {
         }
 
         Ok(ExternalSymbol {
-            id: symtab.get_or_create_default(BStr::new(self.read_symbol_name(symbol)?)),
+            id: symtab.get_or_create_default(self.read_symbol_name(symbol)?),
             selection: 0,
             hidden,
             weak_claimed: false,
@@ -447,7 +443,7 @@ impl<'a> ObjectFile<'a> {
                 .section(index)
                 .map_err(|_| make_error!("section number is invalid {index}"))
                 .and_then(|section| {
-                    if coff::ImageSymbol::has_aux_section(symbol) {
+                    if symbol.has_aux_section() {
                         let section_def = self.coff_symbols.aux_section(i)?;
                         Ok((section, Some(section_def)))
                     } else {
@@ -462,8 +458,10 @@ impl<'a> ObjectFile<'a> {
         })
     }
 
-    fn read_symbol_name(&self, symbol: &'a pe::ImageSymbol) -> crate::Result<&'a [u8]> {
-        coff::ImageSymbol::name(symbol, self.coff_symbols.strings()).context("reading symbol name")
+    fn read_symbol_name(&self, symbol: &'a pe::ImageSymbol) -> crate::Result<&'a BStr> {
+        symbol
+            .name_bstr(self.coff_symbols.strings())
+            .context("reading symbol name")
     }
 
     pub fn resolve_symbols(&self, id: ObjectFileId, symtab: &SymbolMap<'a>) {
@@ -673,7 +671,7 @@ impl<'a> ObjectFile<'a> {
                             let owner_section =
                                 owner.section(global.section_index().unwrap()).unwrap();
                             !(section.length == owner_section.length
-                                && section.checksum == owner_section.checksum)
+                                && section.check_sum == owner_section.check_sum)
                         }
                         pe::IMAGE_COMDAT_SELECT_ANY | pe::IMAGE_COMDAT_SELECT_LARGEST => false,
                         _ => false,
@@ -741,7 +739,7 @@ impl<'a> ObjectFile<'a> {
                 let mut default_index;
                 let mut default_coffsym;
                 loop {
-                    default_index = SymbolIndex(weak_symbol.default_symbol().0 as u32);
+                    default_index = weak_symbol.default_symbol();
                     default_coffsym = self.coff_symbols.symbol(default_index).unwrap();
                     // Cycles are invalid in the COFF/PE spec
                     if default_index == i {
@@ -786,46 +784,37 @@ impl<'a> ObjectFile<'a> {
         }
     }
 
-    pub fn define_common_symbols(
-        &mut self,
-        ctx: &LinkContext<'a>,
-        id: ObjectFileId,
-        symtab: &SymbolMap<'a>,
-    ) {
+    pub fn define_common_symbols(&mut self, id: ObjectFileId, symtab: &SymbolMap<'a>) {
         if !self.has_common_symbols() {
             return;
         }
 
-        let mut common_size = 0u32;
-        let mut bss_index = SectionIndex(0);
-        for (i, coff_symbol) in self.coff_symbols.iter() {
-            if coff_symbol.is_local() && coff::ImageSymbol::has_aux_section(coff_symbol) {
-                if &coff_symbol.name == b".bss\0\0\0\0" {
-                    bss_index = coff_symbol.section_index().unwrap();
-                }
-                continue;
-            }
+        let mut common = InputSection {
+            name: BStr::new(b".common"),
+            flags: pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA
+                | pe::IMAGE_SCN_MEM_READ
+                | pe::IMAGE_SCN_MEM_WRITE,
+            live: true,
+            ..Default::default()
+        };
 
+        for (i, coff_symbol) in self.coff_symbols.iter() {
             if coff_symbol.is_common() {
                 let external = self.symbols[i].as_ref().unwrap().external().unwrap();
-                let global = symtab.get(external.id).unwrap().read();
+                let mut global = symtab.get(external.id).unwrap().write();
                 if global.owner == id && global.index == i {
                     let size = coff_symbol.value();
-                    common_size = common_size.next_multiple_of(size);
-                    common_size += size;
+                    common.length = common.length.next_multiple_of(size);
+                    global.value = common.length;
+                    global.section_number = self.sections.len() as i32;
+                    common.length += size;
                 }
             }
         }
 
-        if common_size == 0 {
-            return;
+        if common.length > 0 {
+            self.sections.push(Some(common));
         }
-
-        if bss_index.0 == 0 {
-            todo!("allocate new .bss section for common definitions");
-        }
-
-        let section = self.sections[bss_index].as_mut().unwrap();
     }
 }
 
@@ -860,7 +849,7 @@ pub struct InputSection<'a> {
     pub name: &'a BStr,
     pub data: &'a [u8],
     pub length: u32,
-    pub checksum: u32,
+    pub check_sum: u32,
     pub selection: u8,
     pub flags: u32,
     pub relocs: &'a [pe::ImageRelocation],
@@ -883,6 +872,23 @@ impl<'a> InputSection<'a> {
     #[inline]
     pub fn mark_visited(&self) -> bool {
         !(self.visited.load(Ordering::Relaxed) || self.visited.swap(true, Ordering::Relaxed))
+    }
+}
+
+impl<'a> std::default::Default for InputSection<'a> {
+    fn default() -> Self {
+        Self {
+            name: Default::default(),
+            data: Default::default(),
+            length: Default::default(),
+            check_sum: Default::default(),
+            selection: Default::default(),
+            flags: Default::default(),
+            relocs: Default::default(),
+            live: false,
+            visited: AtomicBool::new(false),
+            follower_index: SectionIndex(0),
+        }
     }
 }
 
@@ -917,6 +923,7 @@ bitflags! {
         /// Section is live
         const Live = 1;
 
+        /// Section is for allocated COMMON symbols
         const SyntheticCommon = 1 << 1;
     }
 }

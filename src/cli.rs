@@ -119,7 +119,7 @@ fn render_help(include_ignored: bool) -> String {
         Arguments:\n\
         {arguments}\n\n\
         Options:\n\
-        {options}",
+        {options}\n\n",
         arguments = HELP_ARGUMENTS.trim_matches('\n'),
         options = HELP_OPTIONS.trim_matches('\n'),
     ));

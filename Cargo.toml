@@ -40,6 +40,7 @@ rustc-demangle = "0.1.26"
 dashmap = { version = "6.1.0", features = ["rayon"] }
 crossbeam-channel = "0.5.15"
 smallvec = "1.15.1"
+memchr = "2.8.0"
 
 [dependencies.object]
 version = "0.38.0"

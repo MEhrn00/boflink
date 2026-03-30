@@ -97,7 +97,7 @@ impl<'a> LinkInputs<'a> {
             id
         };
 
-        // Add command line symbols as GC roots
+        // Add all command line symbols as GC roots
         for name in [&ctx.options.entry]
             .into_iter()
             .chain(ctx.options.require_defined.iter())
@@ -146,11 +146,13 @@ impl<'a> LinkInputs<'a> {
             }
         };
 
+        // Mark command line inputs as live
         for obj in std::mem::take(&mut self.live_objs) {
             mark_live(obj);
         }
 
-        let gc_roots = self.gc_roots.iter().chain(self.required_symbols.iter());
+        // Mark objects containing GC root symbols as live
+        let gc_roots = self.gc_roots.iter();
         for &symbol in gc_roots {
             let global = self.symbols.get_exclusive_symbol(symbol).unwrap();
             if !global.is_undefined() {
@@ -399,8 +401,9 @@ impl<'a> Linker<'a> {
         }
     }
 
+    /// Removes sections containing duplicate GCC identification strings
     pub fn dedup_gcc_ident(&mut self) {
-        let kept_idents = self
+        let idents = self
             .objs
             .par_iter_mut()
             .map(|obj| {
@@ -411,7 +414,7 @@ impl<'a> Linker<'a> {
                         (section.live && section.relocs.is_empty() && section.name == b".rdata$zzz")
                             .then(|| {
                                 section.live = false;
-                                (section.checksum, section)
+                                (section.check_sum, section)
                             })
                     })
                     .collect::<HashMap<_, _>>()
@@ -421,10 +424,14 @@ impl<'a> Linker<'a> {
                 a
             });
 
-        kept_idents.into_par_iter().for_each(|(_, section)| {
+        idents.into_par_iter().for_each(|(_, section)| {
             section.live = true;
         });
     }
 
-    pub fn define_common_symbols(&mut self, ctx: &LinkContext<'a>) {}
+    pub fn define_common_symbols(&mut self) {
+        self.objs.par_iter_enumerated_mut().for_each(|(id, obj)| {
+            obj.define_common_symbols(id, &self.symbols);
+        });
+    }
 }
