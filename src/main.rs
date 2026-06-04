@@ -1,10 +1,10 @@
-use std::{ffi::OsString, process::ExitCode};
+use std::{ffi::OsString, io::IsTerminal, process::ExitCode};
 
 use anyhow::{Context, Result, bail};
 use log::{error, info};
 
 use crate::{
-    cli::{Cli, CliOptions},
+    cli::{CARGO_PKG_NAME, Cli, CliOptions},
     linker::{Config, Linker},
 };
 
@@ -47,6 +47,9 @@ fn try_main() -> Result<()> {
         return Ok(());
     } else if args.options.version {
         println!("{}", args.render_version());
+        return Ok(());
+    } else if args.options.print_gcc_specs {
+        print_gcc_specs();
         return Ok(());
     }
 
@@ -121,4 +124,25 @@ fn setup_global_logging(options: &CliOptions) {
 fn log_cmdline(args: &[OsString]) {
     let args = args.iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>();
     log::info!("command line: {}", args.join(" "));
+}
+
+fn print_gcc_specs() {
+    // Print out a header with instructions only if printing to a terminal.
+    // Just print out the raw spec file content if the output is potentially being redirected to a
+    // file.
+    if std::io::stdout().is_terminal() {
+        println!(
+            "# Copy the text below the '---' line to a file named \"boflink.specs\" and run \"x86_64-w64-mingw32-gcc -specs=boflink.specs ...\"\n---"
+        );
+    }
+
+    let current_exe = std::env::current_exe()
+        .map(|exe| exe.into_os_string())
+        .unwrap_or_else(|_| OsString::from(CARGO_PKG_NAME));
+
+    println!(
+        "*linker:\n\
+        {current_exe}",
+        current_exe = current_exe.display()
+    );
 }

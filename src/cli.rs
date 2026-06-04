@@ -52,6 +52,7 @@ fn render_help(include_ignored: bool) -> String {
   --mingw32                  Query i686-w64-mingw32-gcc for its list of library search paths
   -o <file>, --output=<file>
                              Path to write the output file [default: a.bof]
+  --print-gcc-specs          Print out a GCC spec file for using boflink with GCC
   --print-gc-sections        Print sections discarded during '--gc-sections'
   --print-timing             Print timing information
   --require-defined=<symbol>
@@ -466,6 +467,8 @@ impl CliOptions {
             self.plugin = Some(v?.into());
         } else if let Some(v) = anyval("plugin-opt", "-plugin-opt") {
             self.plugin_opt.push(v?);
+        } else if long_opt("print-gcc-specs") {
+            self.print_gcc_specs = true;
         } else if long_opt("print-gc-sections") {
             self.print_gc_sections = true;
         } else if long_opt("print-timing") {
