@@ -7,8 +7,6 @@ use std::{
     },
 };
 
-use clap::ValueEnum;
-
 const CARGO_PKG_NAME: &str = env!("CARGO_PKG_NAME");
 
 /// Log level message strings.
@@ -125,35 +123,22 @@ impl log::Log for Logger {
 }
 
 /// Color options for the logger
-#[derive(ValueEnum, Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ColorOption {
     /// Automatically use colors depending on the environment
-    #[value(name = "auto")]
     #[default]
     Auto,
 
     /// Always use colors
-    #[value(name = "always")]
     Always,
 
     /// Never use colors
-    #[value(name = "never")]
     Never,
-}
-
-impl std::fmt::Display for ColorOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(v) = self.to_possible_value() {
-            write!(f, "{}", v.get_name())?;
-        }
-
-        Ok(())
-    }
 }
 
 impl ColorOption {
     /// Attempts to parse the specified string value into a ColorOption.
-    pub fn _parse(value: impl AsRef<OsStr>, ignore_case: bool) -> Option<ColorOption> {
+    pub fn parse(value: impl AsRef<OsStr>, ignore_case: bool) -> Option<ColorOption> {
         let optmap = [
             ("auto", ColorOption::Auto),
             ("always", ColorOption::Always),

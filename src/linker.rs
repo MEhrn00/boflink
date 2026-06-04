@@ -1,5 +1,6 @@
 use std::{
     collections::{HashSet, VecDeque},
+    ffi::OsString,
     io::{BufWriter, ErrorKind},
     path::{Path, PathBuf},
 };
@@ -17,6 +18,7 @@ use typed_arena::Arena;
 
 use crate::{
     api::ApiSymbols,
+    cli::{InputArg, InputArgVariant},
     drectve,
     graph::SpecLinkGraph,
     linkobject::archive::{LinkArchive, LinkArchiveMemberVariant},
@@ -50,37 +52,14 @@ impl TryFrom<object::Architecture> for LinkerTargetArch {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct LinkInput {
-    pub variant: LinkInputVariant,
-    pub options: LinkInputOptions,
-}
-
-/// The linker input types.
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub enum LinkInputVariant {
-    /// A file path passed on the command line.
-    File(PathBuf),
-
-    /// A link library passed on the command line.
-    Library(String),
-}
-
-/// The input attributes.
-#[derive(Debug, Default, PartialEq, Eq, Hash)]
-pub struct LinkInputOptions {
-    /// If the input is a static archive, include all the members as inputs
-    pub whole: bool,
-}
-
 #[derive(Debug, Default)]
 pub struct Config {
-    pub custom_api: Option<String>,
+    pub custom_api: Option<OsString>,
     pub entrypoint: Option<String>,
     pub gc_sections: bool,
     pub gc_roots: IndexSet<String>,
     pub ignored_unresolved_symbols: HashSet<String>,
-    pub inputs: IndexSet<LinkInput>,
+    pub inputs: IndexSet<InputArg>,
     pub link_graph_output: Option<PathBuf>,
     pub merge_bss: bool,
     pub merge_grouped_sections: bool,
@@ -166,7 +145,7 @@ impl Linker {
             .config
             .custom_api
             .take()
-            .map(|api| input_processor.open_custom_api(api))
+            .map(|api| input_processor.open_custom_api(api.to_string_lossy().to_string()))
             .unwrap_or_else(|| Ok(ApiSymbols::beacon(&string_arena, target_arch)))?;
 
         // Build the graph
@@ -466,9 +445,9 @@ impl<'b, 'a> LinkInputProcessor<'b, 'a> {
         }
     }
 
-    pub fn process_input(&mut self, input: LinkInput) -> anyhow::Result<()> {
+    pub fn process_input(&mut self, input: InputArg) -> anyhow::Result<()> {
         match input.variant {
-            LinkInputVariant::File(file_path) => {
+            InputArgVariant::File(file_path) => {
                 let buffer = std::fs::read(&file_path)
                     .with_context(|| format!("cannot open {}", file_path.display()))?;
                 let (file_path, buffer) = self.arena.alloc((file_path, buffer));
@@ -477,7 +456,7 @@ impl<'b, 'a> LinkInputProcessor<'b, 'a> {
                     let library = LinkArchive::parse(buffer.as_slice())
                         .with_context(|| format!("cannot parse {}", file_path.display()))?;
 
-                    if input.options.whole {
+                    if input.context.in_whole_archive {
                         self.add_archive_members(file_path.as_path(), library)
                             .with_context(|| format!("{}", file_path.display()))?;
                     } else if !self.link_libraries.contains_key(file_path.as_path()) {
@@ -496,7 +475,8 @@ impl<'b, 'a> LinkInputProcessor<'b, 'a> {
                     }
                 }
             }
-            LinkInputVariant::Library(library_name) => {
+            InputArgVariant::Library(library_name) => {
+                let library_name = library_name.to_string_lossy().to_string();
                 if !self.opened_library_names.contains(&library_name) {
                     let (library_path, library_buffer) =
                         find_library(self.search_paths, &library_name)
@@ -504,7 +484,7 @@ impl<'b, 'a> LinkInputProcessor<'b, 'a> {
 
                     self.opened_library_names.insert(library_name);
 
-                    if input.options.whole {
+                    if input.context.in_whole_archive {
                         let (library_path, library_buffer) =
                             self.arena.alloc((library_path, library_buffer));
                         let archive = LinkArchive::parse(library_buffer.as_slice())

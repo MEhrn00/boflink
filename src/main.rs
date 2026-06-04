@@ -1,20 +1,15 @@
-use std::{
-    path::PathBuf,
-    process::{Command, ExitCode},
-};
+use std::{ffi::OsString, process::ExitCode};
 
 use anyhow::{Context, Result, bail};
 use log::{error, info};
 
-use arguments::{ParsedCliArgs, ParsedCliInput};
-
 use crate::{
-    arguments::CliOptionArgs,
-    linker::{Config, LinkInput, LinkInputOptions, LinkInputVariant, Linker},
+    cli::{Cli, CliOptions},
+    linker::{Config, Linker},
 };
 
 mod api;
-mod arguments;
+mod cli;
 mod drectve;
 mod fsutils;
 mod graph;
@@ -37,7 +32,31 @@ fn main() -> ExitCode {
 
 /// Main program entrypoint
 fn try_main() -> Result<()> {
-    let mut args = arguments::parse_arguments()?;
+    let cmdline = Cli::expand_response_files(std::env::args_os());
+    let mut args = Cli::new();
+    let res = args.try_update_from(cmdline.iter().skip(1));
+    setup_global_logging(&args.options);
+
+    if args.options.verbose >= 1 {
+        log::info!("{}", args.render_version());
+        log_cmdline(&cmdline);
+    }
+
+    if args.options.help {
+        println!("{}", args.render_help(args.options.help_ignored));
+        return Ok(());
+    } else if args.options.version {
+        println!("{}", args.render_version());
+        return Ok(());
+    }
+
+    if args.options.color_used {
+        log::warn!("'--color' is deprecated and will be removed in a future release");
+    }
+
+    if let Err(e) = res {
+        bail!("{e:#}");
+    }
 
     let it = std::time::Instant::now();
 
@@ -52,12 +71,12 @@ fn try_main() -> Result<()> {
 }
 
 /// Runs the linker with the command line arguments
-fn run_linker(args: &mut ParsedCliArgs) -> anyhow::Result<()> {
+fn run_linker(args: &mut Cli) -> anyhow::Result<()> {
     let mut config = Config {
         custom_api: args.options.custom_api.take(),
         entrypoint: Some(std::mem::take(&mut args.options.entry)),
         gc_sections: args.options.gc_sections,
-        gc_roots: std::mem::take(&mut args.options.keep_symbol)
+        gc_roots: std::mem::take(&mut args.options.require_defined)
             .into_iter()
             .collect(),
         ignored_unresolved_symbols: std::mem::take(&mut args.options.ignore_unresolved_symbol)
@@ -67,46 +86,18 @@ fn run_linker(args: &mut ParsedCliArgs) -> anyhow::Result<()> {
         merge_bss: args.options.merge_bss,
         merge_grouped_sections: args.options.merge_groups,
         print_gc_sections: args.options.print_gc_sections,
-        search_paths: std::mem::take(&mut args.options.library_paths)
+        search_paths: std::mem::take(&mut args.options.library_path)
             .into_iter()
             .collect(),
         target_architecture: args.options.machine.take().map(Into::into),
         warn_unresolved: args.options.warn_unresolved_symbols,
-        ..Default::default()
+        inputs: std::mem::take(&mut args.inputs).into_iter().collect(),
     };
 
-    if cfg!(windows) {
-        if let Some(libenv) = std::env::var_os("LIB") {
-            config.search_paths.extend(std::env::split_paths(&libenv));
-        }
-    }
-
-    config
-        .search_paths
-        .extend(include_mingw_search_paths(&args.options)?);
-
-    let mut whole = false;
-    for input in std::mem::take(&mut args.inputs) {
-        match input {
-            ParsedCliInput::WholeArchiveStart => {
-                whole = true;
-            }
-            ParsedCliInput::WholeArchiveEnd => {
-                whole = false;
-            }
-            ParsedCliInput::File(file_path) => {
-                config.inputs.insert(LinkInput {
-                    variant: LinkInputVariant::File(file_path),
-                    options: LinkInputOptions { whole },
-                });
-            }
-            ParsedCliInput::Library(library) => {
-                config.inputs.insert(LinkInput {
-                    variant: LinkInputVariant::Library(library),
-                    options: LinkInputOptions { whole },
-                });
-            }
-        }
+    if cfg!(windows)
+        && let Some(libenv) = std::env::var_os("LIB")
+    {
+        config.search_paths.extend(std::env::split_paths(&libenv));
     }
 
     let mut linker = Linker::new(config);
@@ -115,50 +106,19 @@ fn run_linker(args: &mut ParsedCliArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn include_mingw_search_paths(options: &CliOptionArgs) -> anyhow::Result<Vec<PathBuf>> {
-    let mut search_paths = Vec::new();
-    if options.mingw64 {
-        search_paths = query_gcc("x86_64-w64-mingw32-gcc")?;
-    } else if options.mingw32 {
-        search_paths = query_gcc("i686-w64-mingw32-gcc")?;
-    } else if options.ucrt64 {
-        search_paths = query_gcc("x86_64-w64-mingw32ucrt-gcc")?;
-    } else if options.ucrt32 {
-        search_paths = query_gcc("i686-w64-mingw32ucrt-gcc")?;
+fn setup_global_logging(options: &CliOptions) {
+    let mut max_level = log::Level::Info;
+    if options.verbose >= 2 {
+        max_level = log::Level::Trace;
+    } else if options.verbose >= 1 {
+        max_level = log::Level::Debug;
     }
 
-    Ok(search_paths)
+    crate::logging::init(max_level, options.color_diagnostics, options.error_limit)
+        .expect("logging should only be initialized once");
 }
 
-/// Queries the specified MinGW GCC executable for its list of library search
-/// paths.
-fn query_gcc(gcc: &str) -> anyhow::Result<Vec<PathBuf>> {
-    let cmdline = || format!("{gcc} --print-search-dirs");
-
-    let print_search_dirs = Command::new(gcc)
-        .arg("--print-search-dirs")
-        .output()
-        .with_context(|| format!("cannot run '{}'", cmdline()))?;
-
-    if !print_search_dirs.status.success() {
-        if let Some(code) = print_search_dirs.status.code() {
-            bail!("'{}' returned a non-zero exit code {code}", cmdline());
-        } else {
-            bail!("'{}' exited abruptly", cmdline());
-        }
-    }
-
-    let stdout = std::str::from_utf8(&print_search_dirs.stdout)
-        .with_context(|| format!("cannot decode '{}' output", cmdline()))?;
-
-    let libraries = stdout.lines().find_map(|line| {
-        let line = line.strip_prefix("libraries: ")?;
-        Some(line.trim_start_matches("="))
-    });
-
-    let search_dirs = Vec::from_iter(libraries.into_iter().flat_map(|libraries| {
-        std::env::split_paths(libraries).map(fsutils::lexically_normalize_path)
-    }));
-
-    Ok(search_dirs)
+fn log_cmdline(args: &[OsString]) {
+    let args = args.iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>();
+    log::info!("command line: {}", args.join(" "));
 }
