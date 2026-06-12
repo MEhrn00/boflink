@@ -61,12 +61,12 @@ mod windows {
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct UniqueFileIdInner {
+    pub struct UniqueFileId {
         volume_serial_number: u64,
         file_id: u128,
     }
 
-    impl UniqueFileIdInner {
+    impl UniqueFileId {
         pub fn compute_id(file: &std::fs::File) -> std::io::Result<Self> {
             let mut fileinfo = FILE_ID_INFO::default();
 
