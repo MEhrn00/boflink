@@ -77,7 +77,7 @@ mod windows {
                     &raw mut fileinfo as _,
                     std::mem::size_of_val(&fileinfo) as u32,
                 )
-                .map_err(|e| std::io::Error::from(e))?;
+                .map_err(std::io::Error::from)?;
             }
 
             Ok(Self {
