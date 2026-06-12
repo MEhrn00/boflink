@@ -167,14 +167,13 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
         // Setup the GC roots
         let mut section_dfs = ReachableDfs::with_capacity(section_count);
 
-        if let Some(entrypoint_symbol) = entrypoint {
-            if let Some(entrypoint_definition) = self
+        if let Some(entrypoint_symbol) = entrypoint
+            && let Some(entrypoint_definition) = self
                 .external_symbols
                 .get(&entrypoint_symbol.as_ref())
                 .and_then(|symbol| symbol.definitions().front())
-            {
-                section_dfs.visit(entrypoint_definition.target());
-            }
+        {
+            section_dfs.visit(entrypoint_definition.target());
         }
 
         for gc_symbol in roots {

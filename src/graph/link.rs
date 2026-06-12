@@ -426,21 +426,19 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
         for code_section in self.cache.iter_code_sections() {
             // If this is a non-COMDAT code section, add an associative edge to
             // the .pdata section which contains the exception information
-            if !code_section.is_comdat() {
-                if let Some(pdata_section) = code_section.find_associated_pdata_section() {
-                    // Only add the associative edge if it does not already exist
-                    if !code_section
-                        .associative_edges()
-                        .iter()
-                        .any(|edge| edge.target().name().group_name() == ".pdata")
-                    {
-                        code_section
-                            .associative_edges()
-                            .push_back(self.arena.alloc_with(|| {
-                                Edge::new(code_section, pdata_section, AssociativeSectionEdgeWeight)
-                            }));
-                    }
-                }
+            if !code_section.is_comdat()
+                && let Some(pdata_section) = code_section.find_associated_pdata_section()
+                && !code_section
+                    .associative_edges()
+                    .iter()
+                    .any(|edge| edge.target().name().group_name() == ".pdata")
+            {
+                // Only add the associative edge if it does not already exist
+                code_section
+                    .associative_edges()
+                    .push_back(self.arena.alloc_with(|| {
+                        Edge::new(code_section, pdata_section, AssociativeSectionEdgeWeight)
+                    }));
             }
         }
 

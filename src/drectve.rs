@@ -161,10 +161,10 @@ pub fn parse_defaultlibs_normalized<'a>(
 ) -> Option<impl Iterator<Item = &'a str>> {
     parse_defaultlibs(coff).map(|libraries| {
         libraries.map(|library| {
-            if let Some((prefix, suffix)) = library.rsplit_once(".") {
-                if suffix.eq_ignore_ascii_case("lib") {
-                    return prefix;
-                }
+            if let Some((prefix, suffix)) = library.rsplit_once(".")
+                && suffix.eq_ignore_ascii_case("lib")
+            {
+                return prefix;
             }
 
             library
