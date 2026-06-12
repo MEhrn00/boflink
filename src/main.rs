@@ -6,16 +6,17 @@ use log::{error, info};
 use crate::{
     cli::{CARGO_PKG_NAME, Cli, CliOptions},
     linker::{Config, Linker},
+    stdext::time::DurationExt,
 };
 
 mod api;
 mod cli;
 mod drectve;
-mod fsutils;
 mod graph;
 mod linker;
 mod linkobject;
 mod logging;
+mod stdext;
 
 #[cfg(windows)]
 mod undname;
@@ -67,7 +68,7 @@ fn try_main() -> Result<()> {
 
     let elapsed = std::time::Instant::now() - it;
     if args.options.print_timing {
-        info!("link time: {}ms", elapsed.as_micros() as f64 / 1000f64);
+        info!("link time: {}", elapsed.display());
     }
 
     link_result

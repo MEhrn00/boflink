@@ -1,16 +1,14 @@
 use std::{
     collections::{HashSet, VecDeque},
     ffi::{OsStr, OsString},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
 };
 
 use object::pe::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386};
 use os_str_bytes::OsStrBytesExt;
 
-use crate::{
-    bail, fsutils::lexically_normalize_path, linker::LinkerTargetArch, logging::ColorOption,
-};
+use crate::{bail, linker::LinkerTargetArch, logging::ColorOption, stdext::path::PathExt};
 use anyhow::Context;
 
 pub const CARGO_PKG_NAME: &str = env!("CARGO_PKG_NAME");
@@ -226,7 +224,7 @@ impl Cli {
 
         if !arg.starts_with("-") {
             self.inputs.push(InputArg {
-                variant: InputArgVariant::File(lexically_normalize_path(arg)),
+                variant: InputArgVariant::File(Path::new(arg).normalize_lexically_cpp()),
                 context: self.state,
             });
         } else if let Some(name) = arg.strip_prefix("-l")
@@ -416,10 +414,12 @@ impl CliOptions {
         } else if let Some(dir) = arg.strip_prefix("-L")
             && !dir.is_empty()
         {
-            self.library_path.push(lexically_normalize_path(dir));
+            self.library_path
+                .push(Path::new(dir).normalize_lexically_cpp());
         } else if let Some(dir) = anyval("L", "library-path") {
             let v = dir?;
-            self.library_path.push(lexically_normalize_path(v));
+            self.library_path
+                .push(Path::new(&v).normalize_lexically_cpp());
         } else if let Some(v) = anyval("m", "") {
             let v = v?;
             self.machine = Some(
@@ -571,11 +571,9 @@ fn query_gcc(gcc: &str) -> anyhow::Result<Vec<PathBuf>> {
         Some(line.trim_start_matches("="))
     });
 
-    let search_dirs = Vec::from_iter(
-        libraries
-            .into_iter()
-            .flat_map(|libraries| std::env::split_paths(libraries).map(lexically_normalize_path)),
-    );
+    let search_dirs = Vec::from_iter(libraries.into_iter().flat_map(|libraries| {
+        std::env::split_paths(libraries).map(|p| p.normalize_lexically_cpp())
+    }));
 
     Ok(search_dirs)
 }
