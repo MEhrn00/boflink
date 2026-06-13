@@ -18,6 +18,8 @@ const BEACONAPI_SYMBOLS: &[&str] = &[
     "BeaconDataParse",
     "BeaconDataPtr",
     "BeaconDataShort",
+    "BeaconDataStoreAddItem",
+    "BeaconDataStoreRemoveItem",
     "BeaconDataStoreGetItem",
     "BeaconDataStoreMaxEntries",
     "BeaconDataStoreProtectItem",
