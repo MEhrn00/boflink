@@ -21,8 +21,30 @@ pub struct LegacyImportSymbolMember<'a> {
 }
 
 impl<'a> LegacyImportSymbolMember<'a> {
+    /// Checks if the passed in COFF is a symbol member for a legacy import library
+    pub fn check(coff: &CoffFile<'a>) -> bool {
+        if coff.coff_section_table().len() <= 10 {
+            let mut have_iat_section = false;
+            let mut have_hintname_section = false;
+            for section in coff.sections() {
+                if let Ok(name) = section.name() {
+                    if name == ".idata$5" {
+                        have_iat_section = true;
+                    } else if name == ".idata$6" {
+                        have_hintname_section = true;
+                    }
+                }
+
+                if have_iat_section && have_hintname_section {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
     pub fn parse(coff: &CoffFile<'a>) -> anyhow::Result<LegacyImportSymbolMember<'a>> {
-        if coff.coff_section_table().len() > 7 {
+        if coff.coff_section_table().len() > 10 {
             bail!("COFF is not a legacy import symbol member");
         }
 
@@ -30,6 +52,10 @@ impl<'a> LegacyImportSymbolMember<'a> {
         let mut have_iat_section = false;
         let mut have_hintname_section = false;
         for section in coff.sections() {
+            if have_iat_section && have_hintname_section {
+                break;
+            }
+
             let name = section.name()?;
             if name == ".idata$5" {
                 have_iat_section = true;

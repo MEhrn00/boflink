@@ -3,7 +3,6 @@ use std::{cell::RefCell, collections::BTreeMap, path::Path};
 use anyhow::{Context, anyhow, bail};
 use indexmap::IndexMap;
 use object::{
-    Object, ObjectSection,
     coff::{CoffFile, ImportFile},
     read::archive::{
         ArchiveFile, ArchiveMember, ArchiveMemberIterator, ArchiveOffset, ArchiveSymbol,
@@ -153,18 +152,8 @@ impl<'a> LinkArchive<'a> {
         } else {
             let coff: CoffFile = CoffFile::parse(member_data)?;
 
-            if coff.coff_section_table().len() < 10
-                && coff.sections().any(|section| {
-                    section.name().is_ok_and(|name| {
-                        name == ".idata$2"
-                            || name == ".idata$4"
-                            || name == ".idata$5"
-                            || name == ".idata$6"
-                            || name == ".idata$7"
-                    })
-                })
-            {
-                self.parse_legacy_import_member(member_name, &coff)
+            if LegacyImportSymbolMember::check(&coff) {
+                self.parse_legacy_import(member_name, &coff)
                     .map(|member| (member_path, LinkArchiveMemberVariant::Import(member)))
             } else {
                 Ok((member_path, LinkArchiveMemberVariant::Coff(coff)))
@@ -173,7 +162,7 @@ impl<'a> LinkArchive<'a> {
     }
 
     /// Parses a COFF from the archive as a legacy import symbol member.
-    fn parse_legacy_import_member(
+    fn parse_legacy_import(
         &self,
         member_name: &str,
         coff: &CoffFile<'a>,
