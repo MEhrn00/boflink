@@ -29,7 +29,7 @@ jobs:
       BOFLINK_TEST_DLLTOOL: llvm-dlltool-20
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install clippy and rustfmt
         run: |
@@ -45,7 +45,7 @@ jobs:
   ci-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install clippy and rustfmt
         run: |
