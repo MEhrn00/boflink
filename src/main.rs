@@ -133,7 +133,7 @@ fn print_gcc_specs() {
     // file.
     if std::io::stdout().is_terminal() {
         println!(
-            "# Copy the text below the '---' line to a file named \"boflink.specs\" and run \"x86_64-w64-mingw32-gcc -specs=boflink.specs ...\"\n---"
+            "# Copy the text below the dashed '---' line to a file named \"boflink.specs\" and run \"x86_64-w64-mingw32-gcc -specs=boflink.specs ...\"\n---"
         );
     }
 
@@ -142,7 +142,11 @@ fn print_gcc_specs() {
         .unwrap_or_else(|_| OsString::from(CARGO_PKG_NAME));
 
     println!(
-        "*linker:\n\
+        "*startfile:\n\
+        \n\n\
+        *endfile:\n\
+        \n\n\
+        *linker:\n\
         {current_exe}",
         current_exe = current_exe.display()
     );
