@@ -54,9 +54,7 @@ fn try_main() -> Result<()> {
         return Ok(());
     }
 
-    if args.options.color_used {
-        log::warn!("'--color' is deprecated and will be removed in a future release");
-    }
+    args.emit_warnings();
 
     if let Err(e) = res {
         bail!("{e:#}");

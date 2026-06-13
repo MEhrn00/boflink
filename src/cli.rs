@@ -5,6 +5,7 @@ use std::{
     process::Command,
 };
 
+use indexmap::IndexSet;
 use object::pe::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386};
 use os_str_bytes::OsStrBytesExt;
 
@@ -46,8 +47,8 @@ fn render_help(include_ignored: bool) -> String {
     --no-merge-bss
   --merge-groups             Combine grouped sections (default)
     --no-merge-groups
-  --mingw64                  Query x86_64-w64-mingw32-gcc for its list of library search paths
-  --mingw32                  Query i686-w64-mingw32-gcc for its list of library search paths
+  --mingw64                  Query x86_64-w64-mingw32-gcc for its list of library search paths (deprecated)
+  --mingw32                  Query i686-w64-mingw32-gcc for its list of library search paths (deprecated)
   -o <file>, --output=<file>
                              Path to write the output file [default: a.bof]
   --print-gcc-specs          Print out a GCC spec file for using boflink with GCC
@@ -56,8 +57,8 @@ fn render_help(include_ignored: bool) -> String {
   --require-defined=<symbol>
                              Ensure <symbol> is defined in the final output
   --sysroot=<dir>            Set the sysroot path
-  --ucrt64                   Query x86_64-w64-mingw32ucrt-gcc for its list of library search paths
-  --ucrt32                   Query i686-w64-mingw32ucrt-gcc for its list of library search paths
+  --ucrt64                   Query x86_64-w64-mingw32ucrt-gcc for its list of library search paths (deprecated)
+  --ucrt32                   Query i686-w64-mingw32ucrt-gcc for its list of library search paths (deprecated)
   --warn-unresolved-symbols  Report unresolved symbols as warnings
     --no-warn-unresolved-symbols
   --whole-archive            Include all objects from following archives
@@ -130,6 +131,7 @@ pub struct Cli {
     pub inputs: Vec<InputArg>,
     pub options: CliOptions,
     state: InputArgContext,
+    warnings: IndexSet<String>,
 }
 
 impl Cli {
@@ -147,6 +149,12 @@ impl Cli {
 
     pub fn render_help(&self, include_ignored: bool) -> String {
         render_help(include_ignored)
+    }
+
+    pub fn emit_warnings(&mut self) {
+        for msg in std::mem::take(&mut self.warnings) {
+            log::warn!("{msg}");
+        }
     }
 
     pub fn expand_response_files(cmdline: impl Iterator<Item = OsString>) -> Vec<OsString> {
@@ -202,7 +210,17 @@ impl Cli {
             let arg = arg.into();
 
             if self.try_update_inputs_from(&arg, arg_iter.by_ref())?
-                || self.options.try_update_from(&arg, arg_iter.by_ref())?
+                || self
+                    .options
+                    .try_update_from(&arg, arg_iter.by_ref(), |args| {
+                        if let Some(args_str) = args.as_str() {
+                            if !self.warnings.contains(args_str) {
+                                self.warnings.insert(args.to_string());
+                            }
+                        } else {
+                            self.warnings.insert(args.to_string());
+                        }
+                    })?
             {
             } else {
                 bail!("unknown argument: {}", arg.display());
@@ -285,7 +303,6 @@ pub struct InputArgContext {
 pub struct CliOptions {
     pub auto_image_base: bool,
     pub color_diagnostics: ColorOption,
-    pub color_used: bool,
     pub custom_api: Option<OsString>,
     pub dump_link_graph: Option<PathBuf>,
     pub dynamicbase: bool,
@@ -323,7 +340,6 @@ impl std::default::Default for CliOptions {
         Self {
             auto_image_base: false,
             color_diagnostics: ColorOption::Auto,
-            color_used: false,
             custom_api: None,
             dump_link_graph: None,
             dynamicbase: false,
@@ -359,7 +375,12 @@ impl std::default::Default for CliOptions {
 }
 
 impl CliOptions {
-    fn try_update_from<I>(&mut self, arg: &OsStr, mut it: I) -> crate::Result<bool>
+    fn try_update_from<I>(
+        &mut self,
+        arg: &OsStr,
+        mut it: I,
+        warn: impl FnOnce(std::fmt::Arguments),
+    ) -> crate::Result<bool>
     where
         I: Iterator,
         <I as Iterator>::Item: Into<OsString>,
@@ -378,7 +399,9 @@ impl CliOptions {
             let v = v?;
             self.color_diagnostics = ColorOption::parse(&v, true)
                 .with_context(|| format!("unknown '--color-diagnostics' value: {}", v.display()))?;
-            self.color_used = true;
+            warn(format_args!(
+                "'--color' is deprecated and will be removed in a future release. Use '--color-diagnostics' instead"
+            ));
         } else if long_opt("color-diagnostics") {
             self.color_diagnostics = ColorOption::Auto;
         } else if let Some(v) = arg.strip_prefix("--color-diagnostics=") {
@@ -455,8 +478,14 @@ impl CliOptions {
         } else if long_opt("mingw64") {
             self.library_path
                 .extend(query_gcc("x86_64-w64-mingw32-gcc")?);
+            warn(format_args!(
+                "'--mingw64' is deprecated and will be removed in a future release"
+            ));
         } else if long_opt("mingw32") {
             self.library_path.extend(query_gcc("i686-w64-mingw32-gcc")?);
+            warn(format_args!(
+                "'--mingw32' is deprecated and will be removed in a future release"
+            ));
         } else if long_opt("nxcompat") {
             self.nxcompat = true;
         } else if let Some(v) = anyval("o", "output") {
@@ -481,9 +510,15 @@ impl CliOptions {
         } else if long_opt("ucrt64") {
             self.library_path
                 .extend(query_gcc("x86_64-w64-mingw32ucrt-gcc")?);
+            warn(format_args!(
+                "'--ucrt64' is deprecated and will be removed in a future release"
+            ));
         } else if long_opt("ucrt32") {
             self.library_path
                 .extend(query_gcc("i686-w64-mingw32ucrt-gcc")?);
+            warn(format_args!(
+                "'--ucrt32' is deprecated and will be removed in a future release"
+            ));
         } else if let Some(v) = long_bool("warn-unresolved-symbols") {
             self.warn_unresolved_symbols = v;
         } else if short_opt('v') {
