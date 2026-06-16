@@ -30,7 +30,7 @@ impl<'a> DirectiveParser<'a> {
             .enumerate()
             .find(|(_, c)| *c != ' ')
             .map(|(offset, _)| offset)
-            .unwrap_or_default();
+            .unwrap_or_else(|| data.len());
 
         Self {
             offset: offset + whitespace_count,
@@ -54,9 +54,10 @@ impl<'a> DirectiveParser<'a> {
                 self.data = remaining;
                 Some(Ok((flag, value)))
             }
-            Err(_) => Some(Err(anyhow!(
-                "cannot parse .drectve section data as a string"
-            ))),
+            Err(_) => {
+                self.data = "";
+                Some(Err(anyhow!("cannot parse .drectve section data")))
+            }
         }
     }
 }
@@ -269,5 +270,14 @@ mod tests {
                 .expect("alternatename value missing a '='");
             assert_eq!(alternatename, expected);
         }
+    }
+
+    #[test]
+    fn empty_spaces() {
+        const INPUT: &str = "   ";
+
+        let parser = DirectiveParser::new(INPUT);
+        let mut it = parser.into_iter();
+        assert!(it.next().is_none());
     }
 }
