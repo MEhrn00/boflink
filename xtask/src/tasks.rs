@@ -70,42 +70,11 @@ pub fn install() -> Result<(), Box<dyn Error>> {
             .chain(std::env::args_os().skip(2)),
     )?;
 
-    if cfg!(unix) {
-        let exe_install_path = utils::env::cargo_home()?.join("bin").join("boflink");
-
-        let libexec = utils::env::install_libexec().join("boflink");
-        println!("mkdir -p {}", libexec.display());
-        std::fs::create_dir_all(&libexec)?;
-
-        let ldsymlink = libexec.join("ld");
-        println!(
-            "ln -sf {} {}",
-            exe_install_path.display(),
-            ldsymlink.display()
-        );
-
-        let _ = std::fs::remove_file(&ldsymlink);
-
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(exe_install_path, ldsymlink)?;
-    }
-
     Ok(())
 }
 
 pub fn uninstall() -> Result<(), Box<dyn Error>> {
     let _ = utils::shell::run_cargo(["uninstall", "boflink"]);
-
-    if cfg!(unix) {
-        let libexec = utils::env::install_libexec().join("boflink");
-
-        let symlink = libexec.join("ld");
-        println!("rm -f {}", symlink.display());
-        let _ = std::fs::remove_file(symlink);
-
-        println!("rmdir {}", libexec.display());
-        let _ = std::fs::remove_dir(libexec);
-    }
 
     Ok(())
 }
