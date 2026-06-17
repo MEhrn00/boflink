@@ -33,15 +33,16 @@ boflink -o mybof.bof -L/path/to/windows/libs -lkernel32 -ladvapi32 source.c obje
 ```
 
 ### Using MinGW GCC on Linux
-MinGW GCC can be used to invoke boflink using its configured link libraries and library search paths.
+MinGW GCC can be used to invoke boflink through a GCC spec file.
 
 ```bash
-x86_64-w64-mingw32-gcc -B ~/.local/libexec/boflink -fno-lto -nostartfiles <args>...
-x86_64-w64-mingw32-gcc -B ~/.local/libexec/boflink -fno-lto -nostartfiles -o mybof.bof source.c object.o
+boflink --print-gcc-specs > boflink.specs
+x86_64-w64-mingw32-gcc -specs=boflink.specs <args>...
+x86_64-w64-mingw32-gcc -specs=boflink.specs -o mybof.bof source.c object.o
 ```
 
 ### Using Clang  on Linux
-Clang can be used to invoke boflink using its configured link libraries and library search paths.
+Clang can be used to invoke boflink by passing `--ld-path` with the full path to the executable.
 
 ```bash
 clang --ld-path=/path/to/boflink --target=x86_64-windows-gnu -nostartfiles <args>...
@@ -49,7 +50,7 @@ clang --ld-path=/path/to/boflink --target=x86_64-windows-gnu -nostartfiles -o my
 ```
 
 ### Using MSVC on Windows
-Windows requires running the boflink executable in a Visual Studio Developer Console.
+Windows requires running boflink inside a Visual Studio Developer Console.
 
 ```powershell
 boflink <args>...
