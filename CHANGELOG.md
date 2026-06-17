@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-06-16
+
+### Added
+
+- `--color-diagnostics` command line argument for controlling colors in log messages. (0c60713)
+- `--error-limit` command line argument for limiting the number of error messages. (2740cb7)
+- `--print-gcc-specs` command line argument for printing out a GCC spec file that integrates with boflink. (624c633)
+
+### Changed
+
+- File paths in diagnostic messages are normalized with `..`s removed. (d82e2f8)
+- Bumped MSRV to Rust 1.91. (6524b3e)
+- Migrated to new command line interface frontend. (e1f1e6c)
+
+### Deprecated
+
+- The `--color` command line option is being deprecated and replaced with `--color-diagnostics`. (646ee7d)
+- The `--mingw64`, `--mingw32`, `--ucrt64` and `--ucrt32` command line options are being
+  deprecated in favor of using the GCC spec file (`--print-gcc-specs`). (646ee7d)
+
+### Fixed
+
+- Custom API import libraries causing errors when built with MinGW dlltool. (57c7cac)
+- Added missing beacon data store symbols to the list of builtin Beacon API symbols. (49610e0)
+- Potential infinite loop when parsing COFFs compiled with MSVC. (5cdcb99)
+
 ## [0.6.2] - 2026-01-28
 
 ### Fixed
@@ -122,7 +148,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial release
 
-[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.6.2...HEAD
+[unreleased]: https://github.com/MEhrn00/boflink/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/MEhrn00/boflink/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/MEhrn00/boflink/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/MEhrn00/boflink/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/MEhrn00/boflink/compare/v0.5.0...v0.6.0

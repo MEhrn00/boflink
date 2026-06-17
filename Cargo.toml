@@ -3,7 +3,7 @@ members = ["crates/*", "xtask"]
 
 [package]
 name = "boflink"
-version = "0.6.2"
+version = "0.6.3"
 authors = ["Matt Ehrnschwender <matthewe2020@gmail.com>"]
 edition = "2024"
 rust-version = "1.91"
