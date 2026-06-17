@@ -38,6 +38,7 @@ jobs:
 
       - name: Install CI deps
         run: |
+          sudo apt-get update -y
           sudo apt-get install -y clang-20 llvm-20
 
       - run: cargo xtask ci
