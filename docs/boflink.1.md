@@ -9,103 +9,136 @@ footer: boflink
 boflink - Linker for Beacon Object Files.
 
 # SYNOPSIS
-boflink [OPTIONS] [files]...
+boflink [options] files...
 
 # DESCRIPTION
 **boflink** is a tool for linking multiple compiler-generated COFFs into a single BOF more
 suitable for loading at runtime with a COFF loader.
 
 # OPTIONS
-**`-l, --libraries <LIBNAME>`**
-: Adds the specified library to search for undefined symbols. This can be specified multiple
-  times.
+**`--color[=<color>]`**
+: Deprecated alias for **`--color-diagnostics`**
 
-**`--whole-archive`**
-: Include all objects from following archives
+**`--color-diagnostics[=<color>]`**
+: Use colors in diagnostic messages [default: auto] [possible values: auto, always, never]
 
-**`--no-whole-archive`**
-: Turn off **`--whole-archive`**
+**`--custom-api=<libname>`**
+: Custom API to use for the Beacon API [aliases: --api]
 
-**`-o, --output <FILE>`**
-: Set the output file name [default: a.bof]
+**`--dump-link-graph=<file>`**
+: Write the link graph to <file>
 
-**`-L, --library-path <DIRECTORY>`**
-: Add the directory to the list of paths to search for libraries
+**`-e <symbol>, --entry=<symbol>`**
+: Name of the entrypoint symbol [default: go]
 
-**`--sysroot <DIRECTORY>`**
-: Set the sysroot path
+**`--error-limit=<number>`**
+: Number of errors to print before exiting [default: 20]
 
-**`-m, --machine <EMULATION>`**
-: Set the target machine emulation [possible values: i386pep, i386pe]
+**`--[no-]gc-sections`**
+: Garbage collect unused sections
 
-**`-e, --entry <SYMBOL>`**
-: Name of the BOF entrypoint symbol [default: go]
+**`--ignore-unresolved-symbol=<symbol>`**
+: Unresolved <symbol> will not cause an error or warning
 
-**`--dump-link-graph <FILE>`**
-: Dump the link graph to the specified file
+**`--keep-symbol=<symbol>`**
+: Alias for **`--require-defined`**
 
-**`--custom-api <LIBRARY>`**
-: Custom API to use instead of the Beacon API [aliases: --api]
+**`-l <libname>, --library=<libname>`**
+: Search for the library <libname>
 
-**`--merge-bss`**
+**`-L <dir>, --library-path=<dir>`**
+: Add <dir> to the list of library search paths
+
+**`-m <emulation>`**
+: Set the target emulation [possible values: i386pep, i386pe]
+
+**`--[no-]merge-bss`**
 : Initialize the .bss section and merge it with the .data section
 
-**`--no-merge-groups`**
-: Do not merge grouped sections
+**`--[no-]merge-groups`**
+: Combine grouped sections (default)
 
-**`--gc-sections`**
-: Enable garbage collection of unused sections
+**`--mingw64`**
+: Query x86_64-w64-mingw32-gcc for its list of library search paths (deprecated)
 
-**`--keep-symbol <SYMBOL>`**
-: Ensure that the specified symbols are kept during **`--gc-sections`**
+**`--mingw32`**
+: Query i686-w64-mingw32-gcc for its list of library search paths (deprecated)
+
+**`-o <file>, --output=<file>`**
+: Path to write the output file [default: a.bof]
+
+**`--print-gcc-specs`**
+: Print out a GCC spec file for using boflink with GCC
 
 **`--print-gc-sections`**
 : Print sections discarded during **`--gc-sections`**
 
-**`--warn-unresolved-symbols`**
-: Report unresolved symbols as warnings
-
-**`--ignore-unresolved-symbol <SYMBOL>`**
-: Unresolved `<SYMBOL>` will not cause an error or warning
-
-**`--mingw64`**
-: Query x86_64-w64-mingw32-gcc for its list of library search paths
-
-**`--mingw32`**
-: Query i686-w64-mingw32-gcc for its list of library search paths
-
-**`--ucrt64`**
-: Query x86_64-w64-mingw32ucrt-gcc for its list of library search paths
-
-**`--ucrt32`**
-: Query i686-w64-mingw32ucrt-gcc for its list of library search paths
-
-**`--color <COLOR>`**
-: Print colored output [default: auto] [possible values: never, auto, always, ansi]
-
-**`-v, --verbose...`**
-: Increasing logging verbosity
-
 **`--print-timing`**
 : Print timing information
 
-**`--Bdynamic`**
-: Ignored for compatibility with GCC
+**`--require-defined=<symbol>`**
+: Ensure <symbol> is defined in the final output
 
-**`--out-implib <FILE>`**
-: Ignored for compatibility with GCC
+**`--sysroot=<dir>`**
+: Set the sysroot path
 
-**`--major-image-version <NUMBER>`**
-: Ignored for compatibility with GCC
+**`--ucrt64`**
+: Query x86_64-w64-mingw32ucrt-gcc for its list of library search paths (deprecated)
 
-**`--minor-image-version <NUMBER>`**
-: Ignored for compatibility with GCC
+**`--ucrt32`**
+: Query i686-w64-mingw32ucrt-gcc for its list of library search paths (deprecated)
 
-**`-h, --help`**
-: Print help
+**`--[no-]warn-unresolved-symbols`**
+: Report unresolved symbols as warnings
+
+**`--[no-]whole-archive`**
+: Include all objects from following archives
+
+**`-v, --verbose...`**
+: Increase logging verbosity
+
+**`-h, --help[=ignored]`**
+: Print help and exit
 
 **`-V, --version`**
-: Print version
+: Print version and exit
+
+# IGNORED OPTIONS
+**`--Bdynamic`**
+: Ignored for GCC compatibility
+
+**`--Bstatic`**
+: Ignored for GCC compatibility
+
+**`--[disable-]dynamicbase`**
+: Ignored for Rust compatibility
+
+**`--[enable|disable]-auto-image-base`**
+: Ignored for Rust compatibility
+
+**`-f[no-]lto`**
+: Ignored for GCC LTO option compatibility
+
+**`--high-entropy-va`**
+: Ignored for Rust compatibility
+
+**`--majory-image-version=<number>`**
+: Ignored for CMake compatibility
+
+**`--minor-image-version=<number>`**
+: Ignored for CMake compatibility
+
+**`--nxcompat`**
+: Ignored for Rust compatibility
+
+**`--out-implib=<file>`**
+: Ignored for CMake compatibility
+
+**`-plugin <plugin>`**
+: Ignored for GCC plugin compatibility
+
+**`-plugin-opt=<arg>`**
+: Ignored for GCC plugin compatibility
 
 # BUGS
 Issues can be reported at https://github.com/MEhrn00/boflink/issues
