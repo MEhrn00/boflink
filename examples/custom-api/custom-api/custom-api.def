@@ -1,0 +1,6 @@
+LIBRARY CustomApi
+EXPORTS
+CustomApiVersion
+CustomApiPrintf
+CustomApiAlloc
+CustomApiFree

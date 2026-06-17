@@ -1,0 +1,7 @@
+boflink.specs
+*.o
+*.obj
+*.bof
+*.dll.a
+*.exp
+*.lib

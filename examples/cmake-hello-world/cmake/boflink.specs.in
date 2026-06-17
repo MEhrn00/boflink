@@ -1,0 +1,8 @@
+*startfile:
+
+
+*endfile:
+
+
+*linker:
+@BOFLINK@

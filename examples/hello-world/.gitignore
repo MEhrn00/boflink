@@ -1,0 +1,4 @@
+boflink.specs
+*.o
+*.obj
+*.bof

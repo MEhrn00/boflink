@@ -1,0 +1,6 @@
+boflink.specs
+example.bof
+libmylib.a
+libmylib.lib
+*.o
+*.obj
