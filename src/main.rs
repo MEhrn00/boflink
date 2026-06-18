@@ -15,7 +15,6 @@ mod drectve;
 mod graph;
 mod linker;
 mod linkobject;
-mod logging;
 mod stdext;
 
 #[cfg(windows)]
@@ -116,7 +115,7 @@ fn setup_global_logging(options: &CliOptions) {
         max_level = log::Level::Debug;
     }
 
-    crate::logging::init(max_level, options.color_diagnostics, options.error_limit)
+    boflink_log::init_logger(CARGO_PKG_NAME, options.color_diagnostics, max_level)
         .expect("logging should only be initialized once");
 }
 

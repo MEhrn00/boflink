@@ -9,7 +9,7 @@ use indexmap::IndexSet;
 use object::pe::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386};
 use os_str_bytes::OsStrBytesExt;
 
-use crate::{bail, linker::LinkerTargetArch, logging::ColorOption, stdext::path::PathExt};
+use crate::{bail, linker::LinkerTargetArch, stdext::path::PathExt};
 use anyhow::Context;
 
 pub const CARGO_PKG_NAME: &str = env!("CARGO_PKG_NAME");
@@ -302,7 +302,7 @@ pub struct InputArgContext {
 #[derive(Debug)]
 pub struct CliOptions {
     pub auto_image_base: bool,
-    pub color_diagnostics: ColorOption,
+    pub color_diagnostics: boflink_log::ColorChoice,
     pub custom_api: Option<OsString>,
     pub dump_link_graph: Option<PathBuf>,
     pub dynamicbase: bool,
@@ -339,7 +339,7 @@ impl std::default::Default for CliOptions {
     fn default() -> Self {
         Self {
             auto_image_base: false,
-            color_diagnostics: ColorOption::Auto,
+            color_diagnostics: boflink_log::ColorChoice::Auto,
             custom_api: None,
             dump_link_graph: None,
             dynamicbase: false,
@@ -397,15 +397,15 @@ impl CliOptions {
             self.auto_image_base = false;
         } else if let Some(v) = anyval("color", "") {
             let v = v?;
-            self.color_diagnostics = ColorOption::parse(&v, true)
+            self.color_diagnostics = boflink_log::parse_color_choice(&v, true)
                 .with_context(|| format!("unknown '--color-diagnostics' value: {}", v.display()))?;
             warn(format_args!(
                 "'--color' is deprecated and will be removed in a future release. Use '--color-diagnostics' instead"
             ));
         } else if long_opt("color-diagnostics") {
-            self.color_diagnostics = ColorOption::Auto;
+            self.color_diagnostics = boflink_log::ColorChoice::Auto;
         } else if let Some(v) = arg.strip_prefix("--color-diagnostics=") {
-            self.color_diagnostics = ColorOption::parse(v, true)
+            self.color_diagnostics = boflink_log::parse_color_choice(v, true)
                 .with_context(|| format!("unknown '--color-diagnostics' value: {}", v.display()))?;
         } else if let Some(v) = anyval("custom-api", "api") {
             self.custom_api = Some(v?);

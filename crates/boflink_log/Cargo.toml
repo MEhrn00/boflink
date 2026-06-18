@@ -1,0 +1,17 @@
+[package]
+name = "boflink_log"
+version = "0.1.0"
+authors = ["Matt Ehrnschwender <matthewe2020@gmail.com>"]
+edition = "2024"
+description = "logger for boflink"
+homepage = "https://github.com/MEhrn00/boflink/tree/main/crates/boflink_log"
+repository = "https://github.com/MEhrn00/boflink"
+publish = false
+
+[dependencies]
+anstream = { version = "1.0.0", features = ["auto"] }
+anstyle = "1.0.14"
+log.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
