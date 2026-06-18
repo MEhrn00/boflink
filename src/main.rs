@@ -11,7 +11,7 @@ use crate::{
 
 mod api;
 mod cli;
-mod drectve;
+mod directives;
 mod graph;
 mod linker;
 mod linkobject;

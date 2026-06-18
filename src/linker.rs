@@ -19,7 +19,7 @@ use typed_arena::Arena;
 use crate::{
     api::ApiSymbols,
     cli::{InputArg, InputArgVariant},
-    drectve,
+    directives,
     graph::SpecLinkGraph,
     linkobject::archive::{LinkArchive, LinkArchiveMemberVariant},
 };
@@ -154,7 +154,7 @@ impl Linker {
 
         // Add COFFs
         for (coff_path, coff) in &input_processor.coffs {
-            for library_name in drectve::parse_defaultlibs_normalized(coff)
+            for library_name in directives::parse_defaultlibs_normalized(coff)
                 .into_iter()
                 .flatten()
             {
@@ -306,7 +306,7 @@ impl Linker {
                         LinkArchiveMemberVariant::Coff(coff) => {
                             // Add any .drectve link libraries from linked in COFFs
                             // to the drectve queue
-                            for drectve_library in drectve::parse_defaultlibs_normalized(&coff)
+                            for drectve_library in directives::parse_defaultlibs_normalized(&coff)
                                 .into_iter()
                                 .flatten()
                             {
