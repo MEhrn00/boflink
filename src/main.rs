@@ -1,12 +1,12 @@
 use std::{ffi::OsString, io::IsTerminal, process::ExitCode};
 
 use anyhow::{Context, Result, bail};
+use boflink_stdext::time::DurationExt;
 use log::{error, info};
 
 use crate::{
     cli::{CARGO_PKG_NAME, Cli, CliOptions},
     linker::{Config, Linker},
-    stdext::time::DurationExt,
 };
 
 mod api;
@@ -15,7 +15,6 @@ mod drectve;
 mod graph;
 mod linker;
 mod linkobject;
-mod stdext;
 
 #[cfg(windows)]
 mod undname;

@@ -6,6 +6,7 @@ pub trait DurationExt {
 }
 
 impl DurationExt for std::time::Duration {
+    #[inline]
     fn display(&self) -> DurationDisplay<'_> {
         DurationDisplay { inner: self }
     }

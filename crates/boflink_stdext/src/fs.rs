@@ -7,7 +7,6 @@ use unix as platform;
 use windows as platform;
 
 /// Extension trait for [`std::fs::File`]
-#[allow(unused)]
 pub trait FileExt: Sealed {
     fn unique_id(&self) -> Result<UniqueFileId, std::io::Error>;
 }

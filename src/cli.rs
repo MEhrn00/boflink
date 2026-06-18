@@ -5,11 +5,12 @@ use std::{
     process::Command,
 };
 
+use boflink_stdext::path::PathExt;
 use indexmap::IndexSet;
 use object::pe::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386};
 use os_str_bytes::OsStrBytesExt;
 
-use crate::{bail, linker::LinkerTargetArch, stdext::path::PathExt};
+use crate::{bail, linker::LinkerTargetArch};
 use anyhow::Context;
 
 pub const CARGO_PKG_NAME: &str = env!("CARGO_PKG_NAME");

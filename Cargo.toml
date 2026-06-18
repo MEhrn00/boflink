@@ -3,6 +3,7 @@ members = ["crates/*", "xtask"]
 
 [workspace.dependencies]
 log = { version = "0.4.26", features = ["std"] }
+windows = "0.62.2"
 
 [package]
 name = "boflink"
@@ -25,6 +26,7 @@ anyhow = "1.0.92"
 argfile = "1.0.0"
 bitflags = "2.9.0"
 boflink_log = { path = "crates/boflink_log" }
+boflink_stdext = { path = "crates/boflink_stdext" }
 bumpalo = "3.17.0"
 cpp_demangle = "0.5.0"
 crc32fast = "1.5.0"
@@ -42,7 +44,7 @@ default-features = false
 features = ["archive", "coff", "write", "read"]
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = [
+windows = { workspace = true, features = [
   "Win32_Storage_FileSystem",
   "Win32_System_Console",
   "Win32_System_Diagnostics_Debug"

@@ -1,0 +1,14 @@
+[package]
+name = "boflink_stdext"
+version = "0.1.0"
+authors = ["Matt Ehrnschwender <matthewe2020@gmail.com>"]
+edition = "2024"
+description = "Standard library extensions"
+homepage = "https://github.com/MEhrn00/boflink/tree/main/crates/boflink_stdext"
+repository = "https://github.com/MEhrn00/boflink"
+publish = false
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }
