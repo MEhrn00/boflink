@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
+use bumpalo::Bump;
 use object::Architecture;
-use typed_arena::Arena;
 
 use crate::{
     linker::LinkerTargetArch,
@@ -67,7 +67,7 @@ const BEACONAPI_SYMBOLS: &[&str] = &[
 ];
 
 pub fn symbols<'a>(
-    strings: &'a Arena<u8>,
+    bump: &'a Bump,
     architecture: LinkerTargetArch,
 ) -> HashMap<&'a str, ImportMember<'a>> {
     let mut symbol_map = HashMap::with_capacity(BEACONAPI_SYMBOLS.len() * 2);
@@ -75,13 +75,13 @@ pub fn symbols<'a>(
 
     if architecture == Architecture::I386 {
         for &name in BEACONAPI_SYMBOLS {
-            let mangled = &*strings.alloc_str(&format!("_{name}"));
+            let mangled = &*bump.alloc_str(&format!("_{name}"));
 
             // Add plain symbol name
             symbol_map.insert(mangled, make_import_member(architecture, mangled, name));
 
             // Add declspec name
-            let declspec = &*strings.alloc_str(&format!("__imp_{mangled}"));
+            let declspec = &*bump.alloc_str(&format!("__imp_{mangled}"));
             symbol_map.insert(declspec, make_import_member(architecture, mangled, name));
         }
     } else {
@@ -90,7 +90,7 @@ pub fn symbols<'a>(
             symbol_map.insert(name, make_import_member(architecture, name, name));
 
             // Add declspec names
-            let declspec = &*strings.alloc_str(&format!("__imp_{name}"));
+            let declspec = &*bump.alloc_str(&format!("__imp_{name}"));
             symbol_map.insert(declspec, make_import_member(architecture, name, name));
         }
     }

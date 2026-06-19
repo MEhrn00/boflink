@@ -1,283 +1,232 @@
-use anyhow::anyhow;
-use nom::{
-    AsChar, Finish, Offset, Parser,
-    branch::alt,
-    bytes::{
-        complete::{escaped, is_not, take_until1, take_while},
-        tag,
-    },
-    character::complete::{char as nomchar, one_of, space0},
-    combinator::verify,
-    error::context,
-    sequence::{delimited, preceded, separated_pair, terminated},
-};
+use anyhow::Context;
+use bstr::{BStr, ByteSlice};
+use bumpalo::Bump;
 use object::{Object, ObjectSection, coff::CoffFile, pe::IMAGE_SCN_LNK_INFO};
 
-pub struct DirectiveParser<'a> {
-    offset: usize,
-    data: &'a str,
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum LinkerDirective<'a> {
+    Defaultlib(&'a BStr),
+    Other(&'a BStr),
 }
 
-impl<'a> DirectiveParser<'a> {
-    #[allow(unused)]
-    pub fn new(data: &'a str) -> DirectiveParser<'a> {
-        Self::with_offset(0, data)
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum WinsplitState {
+    Init,
+    InQuote,
+    NoQuote,
+}
+
+fn split_once_exclusive<T, F: FnMut(&T) -> bool>(slce: &[T], pred: F) -> Option<(&[T], &[T])> {
+    let index = slce.iter().position(pred)?;
+    Some((&slce[..index], &slce[index..]))
+}
+
+fn is_whitespace_or_null(b: u8) -> bool {
+    b.is_ascii_whitespace() || b == 0
+}
+
+fn is_special(b: u8) -> bool {
+    is_whitespace_or_null(b) || b == b'\\' || b == b'"'
+}
+
+fn trim_ascii_space_or_null(data: &[u8]) -> &[u8] {
+    data.trim_start_with(|c| c == ' ' || c == '\0')
+}
+
+fn parse_backslash<'a>(data: &'a [u8], arg: &mut Vec<u8>) -> &'a [u8] {
+    let mut remaining = data;
+    remaining = remaining.trim_start_with(|c| c == '\\');
+    let count = data.len() - remaining.len();
+    if remaining.first() == Some(&b'"') {
+        arg.extend(std::iter::repeat_n(b'\\', count / 2));
+        if !count.is_multiple_of(2) {
+            arg.push(b'"');
+            remaining = &remaining[1..];
+            return remaining;
+        }
+    } else {
+        arg.extend(std::iter::repeat_n(b'\\', count));
     }
 
-    pub fn with_offset(offset: usize, data: &'a str) -> DirectiveParser<'a> {
-        let whitespace_count = data
-            .chars()
-            .enumerate()
-            .find(|(_, c)| *c != ' ')
-            .map(|(offset, _)| offset)
-            .unwrap_or_else(|| data.len());
+    remaining
+}
 
-        Self {
-            offset: offset + whitespace_count,
-            data: &data[whitespace_count..],
-        }
-    }
+fn winsplit<'a>(arena: &'a Bump, cmdline: &'a [u8]) -> Vec<&'a BStr> {
+    let mut args = Vec::new();
 
-    pub fn parse_next(&mut self) -> Option<anyhow::Result<(&'a str, &'a str)>> {
-        if self.data.is_empty() {
-            return None;
-        }
+    let save =
+        |v: &mut Vec<u8>| -> &'a BStr { BStr::new(arena.alloc_slice_copy(&std::mem::take(v))) };
 
-        let mut parser = terminated(
-            separated_pair(cmdline_flag, nomchar(':'), flag_value),
-            space0,
-        );
+    let mut arg: Vec<u8> = Vec::new();
+    let mut state = WinsplitState::Init;
+    let mut remaining = cmdline;
+    while !remaining.is_empty() {
+        match state {
+            WinsplitState::Init => {
+                remaining = trim_ascii_space_or_null(remaining);
+                if remaining.is_empty() {
+                    break;
+                }
 
-        match parser.parse(self.data).finish() {
-            Ok((remaining, (flag, value))) => {
-                self.offset += self.data.offset(remaining);
-                self.data = remaining;
-                Some(Ok((flag, value)))
+                let (arg_slice, rem) =
+                    split_once_exclusive(remaining, |b| is_special(*b)).unwrap_or((remaining, &[]));
+                remaining = rem;
+
+                let next_char = remaining.first().copied();
+                if next_char.is_none_or(is_whitespace_or_null) {
+                    args.push(BStr::new(arg_slice));
+                    continue;
+                }
+
+                let next_char = next_char.unwrap_or_else(|| unreachable!());
+                if next_char == b'"' {
+                    remaining = &remaining[1..];
+                    arg.extend_from_slice(arg_slice);
+                    state = WinsplitState::InQuote;
+                } else if next_char == b'\\' {
+                    arg.extend_from_slice(arg_slice);
+                    remaining = parse_backslash(remaining, &mut arg);
+                    state = WinsplitState::NoQuote;
+                }
             }
-            Err(_) => {
-                self.data = "";
-                Some(Err(anyhow!("cannot parse .drectve section data")))
+            WinsplitState::InQuote => {
+                let (&ch, rem) = remaining
+                    .split_first()
+                    .unwrap_or_else(|| unreachable!("remaining should not be empty"));
+                remaining = rem;
+
+                if ch == b'"' {
+                    if remaining.first() == Some(&b'"') {
+                        arg.push(b'"');
+                        remaining = &remaining[1..];
+                    } else {
+                        state = WinsplitState::NoQuote;
+                    }
+                } else if ch == b'\\' {
+                    remaining = parse_backslash(remaining, &mut arg);
+                } else {
+                    arg.push(ch);
+                }
+            }
+            WinsplitState::NoQuote => {
+                let (&ch, rem) = remaining
+                    .split_first()
+                    .unwrap_or_else(|| unreachable!("remaining should not be empty"));
+                remaining = rem;
+
+                if is_whitespace_or_null(ch) {
+                    args.push(save(&mut arg));
+                    state = WinsplitState::Init;
+                } else if ch == b'"' {
+                    state = WinsplitState::InQuote;
+                } else if ch == b'\\' {
+                    remaining = parse_backslash(remaining, &mut arg);
+                } else {
+                    arg.push(ch);
+                }
             }
         }
     }
-}
 
-fn not_space1(input: &str) -> nom::IResult<&str, &str> {
-    verify(take_while(|c| !AsChar::is_space(c)), |s: &str| {
-        !s.is_empty()
-    })
-    .parse(input)
-}
-
-fn cmdline_flag(input: &str) -> nom::IResult<&str, &str> {
-    preceded(
-        context("command line flag prefix (\"/\" or \"-\")", one_of("/-")),
-        context("command line flag", take_until1(":")),
-    )
-    .parse(input)
-}
-
-fn quoted_value(input: &str) -> nom::IResult<&str, &str> {
-    delimited(tag("\""), is_not("\""), tag("\"")).parse(input)
-}
-
-fn escaped_value(input: &str) -> nom::IResult<&str, &str> {
-    escaped(not_space1, '\\', one_of(r#"\" "#)).parse(input)
-}
-
-fn flag_value(input: &str) -> nom::IResult<&str, &str> {
-    context(
-        "command line flag value",
-        alt((quoted_value, escaped_value)),
-    )
-    .parse(input)
-}
-
-impl<'a> Iterator for DirectiveParser<'a> {
-    type Item = anyhow::Result<(&'a str, &'a str)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.parse_next()
+    if state != WinsplitState::Init {
+        args.push(save(&mut arg));
     }
+
+    args
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(v: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    v.split_at_checked(prefix.len())
+        .and_then(|(pre, remaining)| {
+            if prefix.eq_ignore_ascii_case(pre) {
+                Some(remaining)
+            } else {
+                None
+            }
+        })
+}
+
+fn parse_directive_data<'a>(
+    arena: &'a Bump,
+    data: &'a [u8],
+) -> anyhow::Result<Vec<LinkerDirective<'a>>> {
+    let mut parsed = Vec::new();
+
+    let is_flag_char = |b: u8| b == b'/' || b == b'-';
+
+    for arg in winsplit(arena, data) {
+        if let Some(arg) = arg
+            .first()
+            .and_then(|b| is_flag_char(*b).then_some(&arg[1..]))
+            && let Some(v) = strip_prefix_ignore_ascii_case(arg, b"defaultlib:")
+        {
+            parsed.push(LinkerDirective::Defaultlib(BStr::new(v)));
+            continue;
+        }
+        parsed.push(LinkerDirective::Other(arg));
+    }
+    Ok(parsed)
 }
 
 /// Parses the .drectve section inside the COFF.
 ///
-/// Returns `Ok(None)` if the COFF does not contain a .drectve section.
+/// Returns an empty `Vec` if the COFF does not contain a `.drectve` section.
 pub fn parse_linker_directives<'a>(
+    arena: &'a Bump,
     coff: &CoffFile<'a>,
-) -> anyhow::Result<Option<DirectiveParser<'a>>> {
-    let drectve_section = match coff.section_by_name(".drectve") {
-        Some(section) => {
-            if section
-                .coff_section()
-                .characteristics
-                .get(object::LittleEndian)
-                & IMAGE_SCN_LNK_INFO
-                == 0
-            {
-                return Ok(None);
-            }
+) -> anyhow::Result<Vec<LinkerDirective<'a>>> {
+    for section in coff.sections() {
+        let flags = section
+            .coff_section()
+            .characteristics
+            .get(object::LittleEndian);
 
-            section
+        if (flags & IMAGE_SCN_LNK_INFO) != 0
+            && section.name_bytes().is_ok_and(|name| name == b".drectve")
+        {
+            let data = section.data().context("reading .drectve section data")?;
+            return parse_directive_data(arena, data);
         }
-        None => return Ok(None),
-    };
+    }
 
-    let section_data = drectve_section.data()?;
-
-    let mut offset = 0;
-    let section_data = if section_data
-        .get(..3)
-        .is_some_and(|prefix| prefix == [0xef, 0xbb, 0xbf])
-    {
-        offset = 3;
-        section_data.get(3..).unwrap_or_default()
-    } else {
-        section_data
-    };
-
-    Ok(Some(DirectiveParser::with_offset(
-        offset,
-        std::str::from_utf8(section_data)?,
-    )))
-}
-
-/// Parses the .drectve section of the COFF returning an iterator over all
-/// "/DEFAULTLIB" values.
-pub fn parse_defaultlibs<'a>(coff: &CoffFile<'a>) -> Option<impl Iterator<Item = &'a str>> {
-    let parser = parse_linker_directives(coff).ok().flatten()?;
-
-    Some(
-        parser
-            .flatten()
-            .filter(|(flag, _)| flag.eq_ignore_ascii_case("DEFAULTLIB"))
-            .map(|(_, value)| value),
-    )
-}
-
-/// Parses the .drectve section "/DEFAULTLIB" values but normalizes the result.
-pub fn parse_defaultlibs_normalized<'a>(
-    coff: &CoffFile<'a>,
-) -> Option<impl Iterator<Item = &'a str>> {
-    parse_defaultlibs(coff).map(|libraries| {
-        libraries.map(|library| {
-            if let Some((prefix, suffix)) = library.rsplit_once(".")
-                && suffix.eq_ignore_ascii_case("lib")
-            {
-                return prefix;
-            }
-
-            library
-        })
-    })
-}
-
-/// Parses the .drectve section "/ALTERNATENAME" flags and returns the result
-/// as a pair of (<symbol>, <alias>).
-#[allow(unused)]
-pub fn parse_alternatenames<'a>(
-    coff: &CoffFile<'a>,
-) -> Option<impl Iterator<Item = (&'a str, &'a str)>> {
-    let parser = parse_linker_directives(coff).ok().flatten()?;
-
-    Some(
-        parser
-            .flatten()
-            .filter(|(flag, _)| flag.eq_ignore_ascii_case("ALTERNATENAME"))
-            .filter_map(|(_, value)| value.split_once('=')),
-    )
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::DirectiveParser;
+
+    use bumpalo::Bump;
+
+    use crate::directives::{LinkerDirective, parse_directive_data, winsplit};
 
     #[test]
-    fn quoted_defaultlibs() {
-        const INPUT: &str =
-            "  /DEFAULTLIB:\"uuid.lib\" /DEFAULTLIB:\"advapi32.lib\" /DEFAULTLIB:\"OLDNAMES\" ";
+    fn defaultlibs() {
+        const INPUT: &[u8] =
+            b"  /DEFAULTLIB:\"uuid.lib\" /defaultlib:\"uuid.lib\" /DEFAULTLIB:uuid.lib";
+        let arena = Bump::new();
 
-        const LIBRARIES: [&str; 3] = ["uuid.lib", "advapi32.lib", "OLDNAMES"];
-
-        let parser = DirectiveParser::new(INPUT);
-
-        for (parse_result, expected) in parser.zip(LIBRARIES) {
-            let (flag, library) = parse_result.expect("could not parse data");
-            assert_eq!(flag, "DEFAULTLIB");
-            assert_eq!(library, expected,);
-        }
-    }
-
-    #[test]
-    fn unquoted_defaultlibs() {
-        const INPUT: &str = "  /DEFAULTLIB:uuid.lib /DEFAULTLIB:advapi32.lib /DEFAULTLIB:OLDNAMES ";
-
-        const LIBRARIES: [&str; 3] = ["uuid.lib", "advapi32.lib", "OLDNAMES"];
-
-        let parser = DirectiveParser::new(INPUT);
-
-        for (parse_result, expected) in parser.zip(LIBRARIES) {
-            let (flag, library) = parse_result.expect("could not parse data");
-            assert_eq!(flag, "DEFAULTLIB");
-            assert_eq!(library, expected,);
-        }
-    }
-
-    #[test]
-    fn mixed_defautlibs() {
-        const INPUT: &str =
-            "  /DEFAULTLIB:uuid.lib /DEFAULTLIB:\"advapi32.lib\" /DEFAULTLIB:OLDNAMES ";
-
-        const LIBRARIES: [&str; 3] = ["uuid.lib", "advapi32.lib", "OLDNAMES"];
-
-        let parser = DirectiveParser::new(INPUT);
-
-        for (parse_result, expected) in parser.zip(LIBRARIES) {
-            let (flag, library) = parse_result.expect("could not parse data");
-            assert_eq!(flag, "DEFAULTLIB");
-            assert_eq!(library, expected,);
-        }
-    }
-
-    #[test]
-    fn defaultlibs_no_trailing_whitespace() {
-        const INPUT: &str = "  /DEFAULTLIB:uuid.lib";
-
-        const LIBRARIES: [&str; 1] = ["uuid.lib"];
-
-        let parser = DirectiveParser::new(INPUT);
-
-        for (parse_result, expected) in parser.zip(LIBRARIES) {
-            let (flag, library) = parse_result.expect("could not parse data");
-            assert_eq!(flag, "DEFAULTLIB");
-            assert_eq!(library, expected,);
-        }
-    }
-
-    #[test]
-    fn alternatenames() {
-        const INPUT: &str = "  /ALTERNATENAME:foo=bar /alternatename:foo=bar";
-
-        const NAMES: [(&str, &str); 2] = [("foo", "bar"), ("foo", "bar")];
-
-        let parser = DirectiveParser::new(INPUT);
-
-        for (parse_result, expected) in parser.zip(NAMES) {
-            let (_, value) = parse_result.expect("could not parse data");
-            let alternatename = value
-                .split_once('=')
-                .expect("alternatename value missing a '='");
-            assert_eq!(alternatename, expected);
+        let parsed = parse_directive_data(&arena, INPUT).expect("could not parse data");
+        for d in parsed {
+            assert_eq!(d, LinkerDirective::Defaultlib(b"uuid.lib".into()));
         }
     }
 
     #[test]
     fn empty_spaces() {
-        const INPUT: &str = "   ";
+        const INPUT: &[u8] = b"   ";
+        let arena = Bump::new();
 
-        let parser = DirectiveParser::new(INPUT);
-        let mut it = parser.into_iter();
-        assert!(it.next().is_none());
+        let parsed = parse_directive_data(&arena, INPUT).expect("could not parse data");
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn winsplit_test() {
+        const INPUT: &[u8] = b"/DEFAULTLIB:\"uuid.lib\" /DEFAULTLIB:\"uuid.lib\"";
+        let arena = Bump::new();
+        let parsed = winsplit(&arena, INPUT);
+        for token in parsed {
+            println!("{token}");
+        }
     }
 }

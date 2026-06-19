@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashSet, VecDeque},
     ffi::OsString,
     io::{BufWriter, ErrorKind},
@@ -6,6 +7,8 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use bstr::ByteSlice;
+use bumpalo::Bump;
 use indexmap::{IndexMap, IndexSet};
 use log::warn;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
@@ -19,7 +22,7 @@ use typed_arena::Arena;
 use crate::{
     api::ApiSymbols,
     cli::{InputArg, InputArgVariant},
-    directives,
+    directives::{LinkerDirective, parse_linker_directives},
     graph::SpecLinkGraph,
     linkobject::archive::{LinkArchive, LinkArchiveMemberVariant},
 };
@@ -140,13 +143,13 @@ impl Linker {
             })
             .context("cannot detect target architecture from input files")?;
 
-        let string_arena = Arena::new();
+        let bump = Bump::new();
         let api_symbols = self
             .config
             .custom_api
             .take()
             .map(|api| input_processor.open_custom_api(api.to_string_lossy().to_string()))
-            .unwrap_or_else(|| Ok(ApiSymbols::beacon(&string_arena, target_arch)))?;
+            .unwrap_or_else(|| Ok(ApiSymbols::beacon(&bump, target_arch)))?;
 
         // Build the graph
         let graph_arena = input_processor.spec.alloc_arena();
@@ -154,51 +157,65 @@ impl Linker {
 
         // Add COFFs
         for (coff_path, coff) in &input_processor.coffs {
-            for library_name in directives::parse_defaultlibs_normalized(coff)
-                .into_iter()
-                .flatten()
-            {
-                if input_processor.opened_library_names.contains(library_name) {
-                    continue;
-                }
+            match parse_linker_directives(&bump, coff) {
+                Ok(directives) => {
+                    for directive in directives {
+                        let LinkerDirective::Defaultlib(library_name) = directive else {
+                            continue;
+                        };
+                        let library_name = library_name.to_str_lossy();
+                        if input_processor
+                            .opened_library_names
+                            .contains(library_name.as_ref())
+                        {
+                            continue;
+                        }
 
-                let search_result = find_library(&self.config.search_paths, library_name)
-                    .with_context(|| format!("{coff_path}: unable to find library {library_name}"));
+                        let search_result = find_library(&self.config.search_paths, &library_name)
+                            .with_context(|| {
+                                format!("{coff_path}: unable to find library {library_name}")
+                            });
 
-                let (library_path, buffer) = match search_result {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::error!("{e}");
-                        errored = true;
-                        continue;
+                        let (library_path, buffer) = match search_result {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log::error!("{e}");
+                                errored = true;
+                                continue;
+                            }
+                        };
+
+                        input_processor
+                            .opened_library_names
+                            .insert(library_name.to_string());
+
+                        if input_processor
+                            .link_libraries
+                            .contains_key(library_path.as_path())
+                        {
+                            continue;
+                        }
+
+                        let (library_path, library_buffer) =
+                            input_processor.arena.alloc((library_path, buffer));
+                        let archive = match LinkArchive::parse(library_buffer.as_slice()) {
+                            Ok(parsed) => parsed,
+                            Err(e) => {
+                                log::error!("{}: {e}", library_path.as_path().display());
+                                errored = true;
+                                continue;
+                            }
+                        };
+
+                        input_processor
+                            .link_libraries
+                            .insert(library_path.as_path(), archive);
                     }
-                };
-
-                input_processor
-                    .opened_library_names
-                    .insert(library_name.to_string());
-
-                if input_processor
-                    .link_libraries
-                    .contains_key(library_path.as_path())
-                {
-                    continue;
                 }
-
-                let (library_path, library_buffer) =
-                    input_processor.arena.alloc((library_path, buffer));
-                let archive = match LinkArchive::parse(library_buffer.as_slice()) {
-                    Ok(parsed) => parsed,
-                    Err(e) => {
-                        log::error!("{}: {e}", library_path.as_path().display());
-                        errored = true;
-                        continue;
-                    }
-                };
-
-                input_processor
-                    .link_libraries
-                    .insert(library_path.as_path(), archive);
+                Err(e) => {
+                    log::error!("{coff_path}: {e}");
+                    errored = true;
+                }
             }
 
             if let Err(e) = graph.add_coff(coff_path.file_path, coff_path.member_path, coff) {
@@ -212,7 +229,7 @@ impl Linker {
             std::process::exit(1);
         }
 
-        let mut drectve_queue: VecDeque<((&Path, &Path), &str)> = VecDeque::new();
+        let mut drectve_queue: VecDeque<((&Path, &Path), Cow<'_, str>)> = VecDeque::new();
 
         let resolve_count = graph.archive_resolvable_externals().count();
         let mut symbol_search_buffer = VecDeque::with_capacity(resolve_count);
@@ -248,11 +265,11 @@ impl Linker {
                 while let Some(((library_path, coff_path), drectve_library)) =
                     drectve_queue.pop_front()
                 {
-                    match find_library(&self.config.search_paths, drectve_library) {
+                    match find_library(&self.config.search_paths, &drectve_library) {
                         Some(found) => {
                             if !input_processor
                                 .opened_library_names
-                                .contains(drectve_library)
+                                .contains(drectve_library.as_ref())
                             {
                                 input_processor
                                     .opened_library_names
@@ -306,16 +323,30 @@ impl Linker {
                         LinkArchiveMemberVariant::Coff(coff) => {
                             // Add any .drectve link libraries from linked in COFFs
                             // to the drectve queue
-                            for drectve_library in directives::parse_defaultlibs_normalized(&coff)
-                                .into_iter()
-                                .flatten()
-                            {
-                                if !input_processor
-                                    .opened_library_names
-                                    .contains(drectve_library)
-                                {
-                                    drectve_queue
-                                        .push_back(((library_path, member_path), drectve_library));
+                            match parse_linker_directives(&bump, &coff) {
+                                Ok(directives) => {
+                                    for directive in directives {
+                                        let LinkerDirective::Defaultlib(library_name) = directive
+                                        else {
+                                            continue;
+                                        };
+                                        let name_str = library_name.to_str_lossy();
+                                        if !input_processor
+                                            .opened_library_names
+                                            .contains(name_str.as_ref())
+                                        {
+                                            drectve_queue
+                                                .push_back(((library_path, member_path), name_str));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "{}({}): {e}",
+                                        library_path.display(),
+                                        member_path.display()
+                                    );
+                                    errored = true;
                                 }
                             }
 
