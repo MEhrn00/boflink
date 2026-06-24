@@ -100,11 +100,11 @@ impl SpecLinkGraph {
     }
 
     /// Allocates the [`LinkGraph`] using the specified `arena`.
-    pub fn alloc_graph<'data>(
-        self,
-        arena: &LinkGraphArena,
+    pub fn alloc_graph<'a, 'data>(
+        &self,
+        arena: &'a LinkGraphArena,
         machine: LinkerTargetArch,
-    ) -> LinkGraph<'_, 'data> {
+    ) -> LinkGraph<'a, 'data> {
         LinkGraph {
             machine,
             section_nodes: Vec::with_capacity(self.sections),
