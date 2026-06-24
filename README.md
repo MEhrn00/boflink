@@ -10,7 +10,7 @@ Linker for Beacon Object Files.
 - [Examples](#examples)
 
 ## Installation
-Requires: [Rust](https://www.rust-lang.org/tools/install) >=1.85.0
+Requires: [Rust](https://www.rust-lang.org/tools/install) >=1.91.0
 ```bash
 rustc --version
 ```
