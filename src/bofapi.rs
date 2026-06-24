@@ -4,11 +4,9 @@ use bumpalo::Bump;
 use object::Architecture;
 
 use crate::{
+    coff::{ImportFile, ImportName, ImportType},
     linker::LinkerTargetArch,
-    linkobject::{
-        archive::{LinkArchive, LinkArchiveMemberVariant},
-        import::{ImportMember, ImportName, ImportType},
-    },
+    linkobject::archive::{LinkArchive, LinkArchiveMemberVariant},
 };
 
 const BEACONAPI_SYMBOLS: &[&str] = &[
@@ -74,7 +72,7 @@ pub struct ApiSymbols<'a> {
     archive_path: &'a Path,
 
     /// The symbols
-    symbols: HashMap<&'a str, ImportMember<'a>>,
+    symbols: HashMap<&'a str, ImportFile<'a>>,
 }
 
 impl<'a> ApiSymbols<'a> {
@@ -142,7 +140,7 @@ impl<'a> ApiSymbols<'a> {
     }
 
     /// Gets the [`ImportMember`] associated with the specified symbol.
-    pub fn get(&self, symbol: impl AsRef<str>) -> Option<&ImportMember<'a>> {
+    pub fn get(&self, symbol: impl AsRef<str>) -> Option<&ImportFile<'a>> {
         self.symbols.get(symbol.as_ref())
     }
 }
@@ -151,8 +149,8 @@ const fn make_import_member<'a>(
     architecture: Architecture,
     symbol: &'a str,
     import_name: &'a str,
-) -> ImportMember<'a> {
-    ImportMember {
+) -> ImportFile<'a> {
+    ImportFile {
         architecture,
         symbol,
         dll: "Beacon API",

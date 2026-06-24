@@ -3,22 +3,22 @@ use std::{cell::RefCell, collections::BTreeMap, path::Path};
 use anyhow::{Context, anyhow, bail};
 use indexmap::IndexMap;
 use object::{
-    coff::{CoffFile, ImportFile},
+    coff::CoffFile,
     read::archive::{
         ArchiveFile, ArchiveMember, ArchiveMemberIterator, ArchiveOffset, ArchiveSymbol,
         ArchiveSymbolIterator,
     },
 };
 
-use super::import::{ImportMember, object_is_import_file};
-
 use legacy_importlib::{LegacyImportHeadMember, LegacyImportSymbolMember, LegacyImportTailMember};
+
+use crate::coff::{ImportFile, object_is_import_file};
 
 mod legacy_importlib;
 
 pub enum LinkArchiveMemberVariant<'a> {
     Coff(CoffFile<'a>),
-    Import(ImportMember<'a>),
+    Import(ImportFile<'a>),
 }
 
 /// The archive symbol map iterator with caching.
@@ -166,7 +166,7 @@ impl<'a> LinkArchive<'a> {
         &self,
         member_name: &str,
         coff: &CoffFile<'a>,
-    ) -> anyhow::Result<ImportMember<'a>> {
+    ) -> anyhow::Result<ImportFile<'a>> {
         let member_path = Path::new(member_name);
 
         // Parse this COFF as a symbol member

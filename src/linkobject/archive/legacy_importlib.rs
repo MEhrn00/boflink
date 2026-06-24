@@ -6,14 +6,14 @@ use object::{
     pe::IMAGE_SCN_CNT_CODE,
 };
 
-use crate::linkobject::import::{ImportMember, ImportName, ImportType};
+use crate::coff::{ImportFile, ImportName, ImportType};
 
 /// A parsed legacy import library member for a symbol.
 pub struct LegacyImportSymbolMember<'a> {
     /// The partiall built import file member.
     ///
     /// The dll portion is missing and lookup for the import tail
-    pub import: ImportMember<'a>,
+    pub import: ImportFile<'a>,
 
     /// The name of the head symbol which links this legacy import library
     /// symbol member to the import directory entry.
@@ -100,7 +100,7 @@ impl<'a> LegacyImportSymbolMember<'a> {
         let import_symbol =
             import_symbol.context("import address table entry is missing or malformed")?;
 
-        let mut import = ImportMember {
+        let mut import = ImportFile {
             architecture: coff.architecture(),
             typ: ImportType::Data,
             ..Default::default()

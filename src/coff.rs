@@ -47,26 +47,26 @@ impl From<object::read::coff::ImportType> for ImportType {
     }
 }
 
-/// A short import COFF member from import libraries.
+/// A short COFF member from import libraries.
 #[derive(Debug, Clone)]
-pub struct ImportMember<'a> {
+pub struct ImportFile<'a> {
     /// The architecture for the import.
-    pub(crate) architecture: Architecture,
+    pub architecture: Architecture,
 
     /// The public symbol name.
-    pub(crate) symbol: &'a str,
+    pub symbol: &'a str,
 
     /// The name of the DLL the symbol is from.
-    pub(crate) dll: &'a str,
+    pub dll: &'a str,
 
     /// The name exported from the DLL.
-    pub(crate) import: ImportName<'a>,
+    pub import: ImportName<'a>,
 
     /// The type of import.
-    pub(crate) typ: ImportType,
+    pub typ: ImportType,
 }
 
-impl<'a> std::default::Default for ImportMember<'a> {
+impl<'a> std::default::Default for ImportFile<'a> {
     fn default() -> Self {
         Self {
             architecture: Architecture::Unknown,
@@ -78,20 +78,20 @@ impl<'a> std::default::Default for ImportMember<'a> {
     }
 }
 
-impl<'a> TryFrom<object::read::coff::ImportFile<'a>> for ImportMember<'a> {
-    type Error = anyhow::Error;
-
-    fn try_from(value: object::read::coff::ImportFile<'a>) -> Result<Self, Self::Error> {
+impl<'a> ImportFile<'a> {
+    pub fn parse(data: &'a [u8]) -> anyhow::Result<Self> {
+        let parsed = object::read::coff::ImportFile::parse(data)?;
         Ok(Self {
-            architecture: value.architecture(),
-            symbol: std::str::from_utf8(value.symbol())
+            architecture: parsed.architecture(),
+            symbol: std::str::from_utf8(parsed.symbol())
                 .context("symbol field value could not be parsed")?,
-            dll: std::str::from_utf8(value.dll()).context("DLL field value could not be parsed")?,
-            import: value
+            dll: std::str::from_utf8(parsed.dll())
+                .context("DLL field value could not be parsed")?,
+            import: parsed
                 .import()
                 .try_into()
                 .context("import field value could not be parsed")?,
-            typ: value.import_type().into(),
+            typ: parsed.import_type().into(),
         })
     }
 }

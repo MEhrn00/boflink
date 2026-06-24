@@ -26,6 +26,7 @@ use crate::{
 
 mod bofapi;
 mod cli;
+mod coff;
 mod directives;
 mod graph;
 mod linker;

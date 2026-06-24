@@ -16,12 +16,12 @@ use object::{
 };
 
 use crate::{
+    coff::{ImportFile, ImportName},
     graph::{
         edge::{WeakDefaultEdgeWeight, WeakDefaultSearch},
         node::{SymbolName, SymbolNodeType},
     },
     linker::LinkerTargetArch,
-    linkobject::import::{ImportMember, ImportName},
 };
 
 use super::{
@@ -463,7 +463,7 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
     pub fn add_api_import(
         &mut self,
         symbol: &str,
-        import: &ImportMember<'data>,
+        import: &ImportFile<'data>,
     ) -> anyhow::Result<()> {
         let api_node = *self.api_node.get_or_insert_with(|| {
             self.arena
@@ -480,7 +480,7 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
     pub fn add_library_import(
         &mut self,
         symbol: &str,
-        import: &ImportMember<'data>,
+        import: &ImportFile<'data>,
     ) -> anyhow::Result<()> {
         let library_node = *self.library_nodes.entry(import.dll).or_insert_with(|| {
             self.arena
@@ -494,7 +494,7 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
         &mut self,
         symbol: &str,
         library: &'arena LibraryNode<'arena, 'data>,
-        import: &ImportMember<'data>,
+        import: &ImportFile<'data>,
     ) -> anyhow::Result<()> {
         let symbol_node = self
             .external_symbols
