@@ -15,7 +15,7 @@ use object::{
 use typed_arena::Arena;
 
 use crate::{
-    api::ApiSymbols,
+    bofapi::ApiSymbols,
     cli::{InputArg, InputArgVariant},
     graph::{LinkGraph, LinkGraphArena, SpecLinkGraph},
     linkobject::archive::{LinkArchive, LinkArchiveMemberVariant},

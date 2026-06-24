@@ -17,14 +17,14 @@ use object::Object;
 use typed_arena::Arena;
 
 use crate::{
-    api::ApiSymbols,
+    bofapi::ApiSymbols,
     cli::{CARGO_PKG_NAME, Cli, CliOptions},
     directives::{LinkerDirective, parse_linker_directives},
     linker::{LinkInputProcessor, LinkerTargetArch, find_library},
     linkobject::archive::{LinkArchive, LinkArchiveMemberVariant},
 };
 
-mod api;
+mod bofapi;
 mod cli;
 mod directives;
 mod graph;
