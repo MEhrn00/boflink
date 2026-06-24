@@ -17,20 +17,20 @@ use object::Object;
 use typed_arena::Arena;
 
 use crate::{
+    archive::{LinkArchive, LinkArchiveMemberVariant},
     bofapi::ApiSymbols,
     cli::{CARGO_PKG_NAME, Cli, CliOptions},
     directives::{LinkerDirective, parse_linker_directives},
     linker::{LinkInputProcessor, LinkerTargetArch, find_library},
-    linkobject::archive::{LinkArchive, LinkArchiveMemberVariant},
 };
 
+mod archive;
 mod bofapi;
 mod cli;
 mod coff;
 mod directives;
 mod graph;
 mod linker;
-mod linkobject;
 
 #[cfg(windows)]
 mod undname;

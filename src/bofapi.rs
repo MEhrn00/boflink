@@ -4,9 +4,9 @@ use bumpalo::Bump;
 use object::Architecture;
 
 use crate::{
+    archive::{LinkArchive, LinkArchiveMemberVariant},
     coff::{ImportFile, ImportName, ImportType},
     linker::LinkerTargetArch,
-    linkobject::archive::{LinkArchive, LinkArchiveMemberVariant},
 };
 
 const BEACONAPI_SYMBOLS: &[&str] = &[

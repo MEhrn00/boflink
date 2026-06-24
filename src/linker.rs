@@ -15,10 +15,10 @@ use object::{
 use typed_arena::Arena;
 
 use crate::{
+    archive::{LinkArchive, LinkArchiveMemberVariant},
     bofapi::ApiSymbols,
     cli::{InputArg, InputArgVariant},
     graph::{LinkGraph, LinkGraphArena, SpecLinkGraph},
-    linkobject::archive::{LinkArchive, LinkArchiveMemberVariant},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
