@@ -1,7 +1,7 @@
 use std::{ffi::OsStr, io::Write, sync::Mutex};
 
 use anstream::AutoStream;
-use anstyle::{AnsiColor, Style};
+use anstyle::{AnsiColor, Reset, Style};
 
 pub use anstream::ColorChoice;
 
@@ -74,9 +74,9 @@ impl log::Log for Logger {
             let mut stream = AutoStream::new(std::io::stderr(), self.colors).lock();
             writeln!(
                 stream,
-                "{}: {level_style}{level_name}:{reset} {msg}",
+                "{}: {level_style}{level_name}{reset} {msg}",
                 self.progname,
-                reset = Style::new().render_reset()
+                reset = Reset.render(),
             )
             .unwrap();
             if is_multiline {
