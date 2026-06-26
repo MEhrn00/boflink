@@ -18,9 +18,10 @@ use crate::utils;
 use super::sha256::Sha256Writer;
 
 const INSTALL_SCRIPT: &str = r#"#!/bin/sh
-/usr/bin/install -m 755 -v boflink ~/.local/bin/boflink
-/usr/bin/install -v -D -d ~/.local/libexec/boflink
-/usr/bin/ln -svf ~/.local/bin/boflink ~/.local/libexec/boflink/ld
+PREFIX="${PREFIX:-$HOME/.local}"
+
+/usr/bin/install -v -m 755 boflink $PREFIX/bin/boflink
+/usr/bin/ln -vsf -T boflink $PREFIX/bin/ld.boflink
 "#;
 
 pub fn dist() -> Result<(), Box<dyn Error>> {
