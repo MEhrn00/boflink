@@ -75,6 +75,15 @@ pub struct ApiSymbols<'a> {
     symbols: HashMap<&'a str, ImportFile<'a>>,
 }
 
+impl<'a> std::default::Default for ApiSymbols<'a> {
+    fn default() -> Self {
+        Self {
+            archive_path: Path::new(""),
+            symbols: HashMap::new(),
+        }
+    }
+}
+
 impl<'a> ApiSymbols<'a> {
     /// Creates a new [`ApiSymbols`] but using the Beacon API symbols.
     pub fn beacon(bump: &'a Bump, architecture: LinkerTargetArch) -> ApiSymbols<'a> {
