@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     ffi::OsString,
-    io::{BufWriter, IsTerminal},
+    io::BufWriter,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -551,15 +551,6 @@ fn log_cmdline(args: &[OsString]) {
 }
 
 fn print_gcc_specs() {
-    // Print out a header with instructions only if printing to a terminal.
-    // Just print out the raw spec file content if the output is potentially being redirected to a
-    // file.
-    if std::io::stdout().is_terminal() {
-        println!(
-            "# Copy the text below the dashed '---' line to a file named \"boflink.specs\" and run \"x86_64-w64-mingw32-gcc -specs=boflink.specs ...\"\n---"
-        );
-    }
-
     let current_exe = std::env::current_exe()
         .map(|exe| exe.into_os_string())
         .unwrap_or_else(|_| OsString::from(CARGO_PKG_NAME));
