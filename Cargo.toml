@@ -6,7 +6,7 @@ windows = "0.62.2"
 
 [package]
 name = "boflink"
-version = "0.6.3"
+version = "0.6.4-dev"
 authors = ["Matt Ehrnschwender <matthewe2020@gmail.com>"]
 edition = "2024"
 rust-version = "1.91"
