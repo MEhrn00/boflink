@@ -41,7 +41,7 @@ typed-arena = "2.0.2"
 [dependencies.object]
 version = "0.39.0"
 default-features = false
-features = ["archive", "coff", "write", "read"]
+features = ["read_core", "write_core", "archive", "coff"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
