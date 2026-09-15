@@ -1,12 +1,9 @@
 use std::collections::HashMap;
 
 use indexmap::IndexMap;
-use object::{SectionIndex, SymbolIndex};
+use object::{ComdatKind, SectionIndex, SymbolIndex};
 
-use super::{
-    edge::ComdatSelection,
-    node::{SectionNode, SymbolNode},
-};
+use super::node::{SectionNode, SymbolNode};
 
 /// Cache for inserting COFFs into the graph.
 pub struct LinkGraphCache<'arena, 'data> {
@@ -20,7 +17,7 @@ pub struct LinkGraphCache<'arena, 'data> {
     code_sections: IndexMap<SectionIndex, &'arena SectionNode<'arena, 'data>>,
 
     /// Cached selection and section symbol values for COMDAT symbols.
-    comdat_selections: HashMap<SectionIndex, Option<ComdatSelection>>,
+    comdat_selections: HashMap<SectionIndex, ComdatKind>,
 
     /// List of symbols with weak external auxiliary records.
     weak_symbols: Vec<SymbolIndex>,
@@ -69,12 +66,8 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
         let _ = self.symbols.insert(idx, symbol);
     }
 
-    pub fn insert_comdat_leader_selection(
-        &mut self,
-        idx: SectionIndex,
-        selection: ComdatSelection,
-    ) {
-        let _ = self.comdat_selections.insert(idx, Some(selection));
+    pub fn insert_comdat_leader_selection(&mut self, idx: SectionIndex, selection: ComdatKind) {
+        let _ = self.comdat_selections.insert(idx, selection);
     }
 
     pub fn insert_code_section(
@@ -102,12 +95,9 @@ impl<'arena, 'data> LinkGraphCache<'arena, 'data> {
     ///
     /// Returns `None` if a COMDAT selection was never added for the section index.
     ///
-    /// If the returned value is `&mut None`, this means that the COMDAT leader
+    /// If the returned value is `&mut ComdatKind::Unknown` this means that the COMDAT leader
     /// has already been handled.
-    pub fn get_comdat_leader_selection(
-        &mut self,
-        idx: SectionIndex,
-    ) -> Option<&mut Option<ComdatSelection>> {
+    pub fn get_comdat_leader_selection(&mut self, idx: SectionIndex) -> Option<&mut ComdatKind> {
         self.comdat_selections.get_mut(&idx)
     }
 

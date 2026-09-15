@@ -4,26 +4,15 @@ use std::{
     ops::Deref,
 };
 
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 use object::{
+    ComdatKind,
     coff::{CoffHeader, ImageSymbol},
-    pe::{
-        IMAGE_SYM_ABSOLUTE, IMAGE_SYM_CLASS_ARGUMENT, IMAGE_SYM_CLASS_AUTOMATIC,
-        IMAGE_SYM_CLASS_BIT_FIELD, IMAGE_SYM_CLASS_BLOCK, IMAGE_SYM_CLASS_CLR_TOKEN,
-        IMAGE_SYM_CLASS_END_OF_FUNCTION, IMAGE_SYM_CLASS_END_OF_STRUCT, IMAGE_SYM_CLASS_ENUM_TAG,
-        IMAGE_SYM_CLASS_EXTERNAL, IMAGE_SYM_CLASS_EXTERNAL_DEF, IMAGE_SYM_CLASS_FILE,
-        IMAGE_SYM_CLASS_FUNCTION, IMAGE_SYM_CLASS_LABEL, IMAGE_SYM_CLASS_MEMBER_OF_ENUM,
-        IMAGE_SYM_CLASS_MEMBER_OF_STRUCT, IMAGE_SYM_CLASS_MEMBER_OF_UNION, IMAGE_SYM_CLASS_NULL,
-        IMAGE_SYM_CLASS_REGISTER, IMAGE_SYM_CLASS_REGISTER_PARAM, IMAGE_SYM_CLASS_SECTION,
-        IMAGE_SYM_CLASS_STATIC, IMAGE_SYM_CLASS_STRUCT_TAG, IMAGE_SYM_CLASS_TYPE_DEFINITION,
-        IMAGE_SYM_CLASS_UNDEFINED_LABEL, IMAGE_SYM_CLASS_UNDEFINED_STATIC,
-        IMAGE_SYM_CLASS_UNION_TAG, IMAGE_SYM_CLASS_WEAK_EXTERNAL, IMAGE_SYM_DEBUG,
-    },
+    pe,
 };
 
 use crate::graph::edge::{
-    ComdatSelection, DefinitionEdge, EdgeList, EdgeListIter, ImportEdge, IncomingEdges,
-    OutgoingEdges, RelocationEdge, WeakDefaultEdge, WeakDefaultSearch,
+    DefinitionEdge, EdgeList, EdgeListIter, ImportEdge, IncomingEdges, OutgoingEdges,
+    RelocationEdge, WeakDefaultEdge, WeakDefaultSearch,
 };
 
 use super::{SectionNode, SectionType};
@@ -52,7 +41,7 @@ pub struct SymbolNode<'arena, 'data> {
     name: BorrowedSymbolName<'arena>,
 
     /// The storage class of the symbol.
-    storage_class: SymbolNodeStorageClass,
+    storage_class: u8,
 
     /// If this is a section symbol.
     section: bool,
@@ -64,7 +53,7 @@ pub struct SymbolNode<'arena, 'data> {
 impl<'arena, 'data> SymbolNode<'arena, 'data> {
     pub fn new(
         name: impl Into<BorrowedSymbolName<'arena>>,
-        storage_class: SymbolNodeStorageClass,
+        storage_class: u8,
         section: bool,
         typ: SymbolNodeType,
     ) -> SymbolNode<'arena, 'data> {
@@ -94,11 +83,11 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
             table_index: OnceCell::new(),
             output_name: OnceCell::new(),
             name: name.into(),
-            storage_class: coff_symbol.storage_class().try_into()?,
+            storage_class: coff_symbol.storage_class(),
             section: coff_symbol.has_aux_section(),
             typ: Cell::new(match coff_symbol.section_number() {
-                IMAGE_SYM_ABSOLUTE => SymbolNodeType::Absolute(coff_symbol.value()),
-                IMAGE_SYM_DEBUG => SymbolNodeType::Debug,
+                pe::IMAGE_SYM_ABSOLUTE => SymbolNodeType::Absolute(coff_symbol.value()),
+                pe::IMAGE_SYM_DEBUG => SymbolNodeType::Debug,
                 _ => SymbolNodeType::Value(coff_symbol.typ()),
             }),
         })
@@ -151,7 +140,7 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     }
 
     /// Returns the storage class of the symbol.
-    pub fn storage_class(&self) -> SymbolNodeStorageClass {
+    pub fn storage_class(&self) -> u8 {
         self.storage_class
     }
 
@@ -162,13 +151,13 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
 
     /// Returns `true` if this symbol is externally visible.
     pub fn is_external(&self) -> bool {
-        self.storage_class == SymbolNodeStorageClass::External
-            || self.storage_class == SymbolNodeStorageClass::WeakExternal
+        self.storage_class == pe::IMAGE_SYM_CLASS_EXTERNAL
+            || self.storage_class == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
     }
 
     /// Returns `true` if this symbol is a label.
     pub fn is_label(&self) -> bool {
-        self.storage_class == SymbolNodeStorageClass::Label || self.is_msvc_label()
+        self.storage_class == pe::IMAGE_SYM_CLASS_LABEL || self.is_msvc_label()
     }
 
     /// Returns `true` if this is an MSVC .data label.
@@ -176,7 +165,7 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     /// These are symbols with static storage class, have a name format of
     /// `$SG<number>` and are defined in a data section.
     pub fn is_msvc_label(&self) -> bool {
-        self.storage_class() == SymbolNodeStorageClass::Static
+        self.storage_class() == pe::IMAGE_SYM_CLASS_STATIC
             && self
                 .name()
                 .as_str()
@@ -229,7 +218,7 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
     pub fn is_duplicate(&self) -> bool {
         self.definitions()
             .iter()
-            .filter(|definition| definition.weight().selection().is_none())
+            .filter(|definition| definition.weight().selection() == ComdatKind::Unknown)
             .count()
             > 1
     }
@@ -245,19 +234,19 @@ impl<'arena, 'data> SymbolNode<'arena, 'data> {
 
         for definition in self.definitions().iter() {
             let selection = match definition.weight().selection() {
-                Some(sel) => sel,
-                None => continue,
+                ComdatKind::Unknown => continue,
+                k => k,
             };
 
             match selection {
-                ComdatSelection::NoDuplicates => {
+                ComdatKind::NoDuplicates => {
                     noduplicates = true;
                 }
-                ComdatSelection::SameSize => {
+                ComdatKind::SameSize => {
                     sizes.insert(definition.target().data().len());
                     samesize = true;
                 }
-                ComdatSelection::ExactMatch => {
+                ComdatKind::ExactMatch => {
                     // TODO: This will just check if the section data matches.
                     // Also need to check that the relocations and definitions
                     // match.
@@ -484,44 +473,6 @@ impl<T: Deref<Target = str>> std::fmt::Display for QuotedSymbolNameDemangler<'_,
 
         Ok(())
     }
-}
-
-#[derive(Debug, Copy, Clone, thiserror::Error)]
-#[error("unknown storage class value ({0})")]
-pub struct TryFromStorageClassError(u8);
-
-/// The storage class of a symbol.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
-#[num_enum(error_type(name = TryFromStorageClassError, constructor = TryFromStorageClassError))]
-#[repr(u8)]
-pub enum SymbolNodeStorageClass {
-    EndOfFunction = IMAGE_SYM_CLASS_END_OF_FUNCTION,
-    Null = IMAGE_SYM_CLASS_NULL,
-    Automatic = IMAGE_SYM_CLASS_AUTOMATIC,
-    External = IMAGE_SYM_CLASS_EXTERNAL,
-    Static = IMAGE_SYM_CLASS_STATIC,
-    Register = IMAGE_SYM_CLASS_REGISTER,
-    ExternalDef = IMAGE_SYM_CLASS_EXTERNAL_DEF,
-    Label = IMAGE_SYM_CLASS_LABEL,
-    UndefinedLabel = IMAGE_SYM_CLASS_UNDEFINED_LABEL,
-    MemberOfStruct = IMAGE_SYM_CLASS_MEMBER_OF_STRUCT,
-    Argument = IMAGE_SYM_CLASS_ARGUMENT,
-    StructTag = IMAGE_SYM_CLASS_STRUCT_TAG,
-    MemberOfUnion = IMAGE_SYM_CLASS_MEMBER_OF_UNION,
-    UnionTag = IMAGE_SYM_CLASS_UNION_TAG,
-    TypeDefinition = IMAGE_SYM_CLASS_TYPE_DEFINITION,
-    UndefinedStatic = IMAGE_SYM_CLASS_UNDEFINED_STATIC,
-    EnumTag = IMAGE_SYM_CLASS_ENUM_TAG,
-    MemberOfEnum = IMAGE_SYM_CLASS_MEMBER_OF_ENUM,
-    RegisterParam = IMAGE_SYM_CLASS_REGISTER_PARAM,
-    BitField = IMAGE_SYM_CLASS_BIT_FIELD,
-    Block = IMAGE_SYM_CLASS_BLOCK,
-    Function = IMAGE_SYM_CLASS_FUNCTION,
-    EndOfStruct = IMAGE_SYM_CLASS_END_OF_STRUCT,
-    File = IMAGE_SYM_CLASS_FILE,
-    Section = IMAGE_SYM_CLASS_SECTION,
-    WeakExternal = IMAGE_SYM_CLASS_WEAK_EXTERNAL,
-    ClrToken = IMAGE_SYM_CLASS_CLR_TOKEN,
 }
 
 /// The type of symbol.

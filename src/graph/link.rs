@@ -11,15 +11,16 @@ use anyhow::{Context, anyhow, bail};
 use indexmap::{IndexMap, IndexSet};
 use log::warn;
 use object::{
-    Architecture, Object, ObjectSection, ObjectSymbol, SectionIndex,
+    Architecture, ComdatKind, Object, ObjectSection, ObjectSymbol, SectionIndex,
     coff::{CoffFile, CoffHeader, ImageSymbol},
+    pe,
 };
 
 use crate::{
     coff::{ImportFile, ImportName},
     graph::{
         edge::{WeakDefaultEdgeWeight, WeakDefaultSearch},
-        node::{SymbolName, SymbolNodeType},
+        node::{ImageScn, P2Align, SymbolName, SymbolNodeType},
     },
     linker::LinkerTargetArch,
 };
@@ -28,13 +29,10 @@ use super::{
     BuiltLinkGraph,
     cache::LinkGraphCache,
     edge::{
-        AssociativeSectionEdgeWeight, ComdatSelection, DefinitionEdgeWeight, Edge,
-        ImportEdgeWeight, RelocationEdgeWeight,
+        AssociativeSectionEdgeWeight, DefinitionEdgeWeight, Edge, ImportEdgeWeight,
+        RelocationEdgeWeight,
     },
-    node::{
-        CoffNode, LibraryNode, LibraryNodeWeight, SectionNode, SectionNodeCharacteristics,
-        SectionNodeData, SymbolNode,
-    },
+    node::{CoffNode, LibraryNode, LibraryNodeWeight, SectionNode, SectionNodeData, SymbolNode},
 };
 
 pub type LinkGraphArena = bumpalo::Bump;
@@ -119,31 +117,28 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
             let section_name = section.name()?;
             let coff_section = section.coff_section();
 
-            let characteristics = SectionNodeCharacteristics::from_bits_truncate(
-                coff_section.characteristics.get(object::LittleEndian),
-            );
+            let flags = coff_section.characteristics.get(object::LittleEndian);
+            let flags = ImageScn::from_bits_retain(flags);
 
-            let section_data =
-                if characteristics.contains(SectionNodeCharacteristics::CntUninitializedData) {
-                    SectionNodeData::Uninitialized(
-                        coff_section.size_of_raw_data.get(object::LittleEndian),
-                    )
-                } else {
-                    SectionNodeData::Initialized(section.data()?)
-                };
+            let data = if flags.contains(ImageScn::CNT_UNINITIALIZED_DATA) {
+                let size = coff_section.size_of_raw_data.get(object::LittleEndian);
+                SectionNodeData::Uninitialized(size)
+            } else {
+                SectionNodeData::Initialized(section.data()?)
+            };
 
-            if characteristics.contains(SectionNodeCharacteristics::LnkComdat) {
+            if flags.contains(ImageScn::LNK_COMDAT) {
                 comdat_count += 1;
             }
 
-            let section_node = self.arena.alloc_with(|| {
-                SectionNode::new(section_name, characteristics, section_data, 0, coff_node)
-            });
+            let section_node = self
+                .arena
+                .alloc_with(|| SectionNode::new(section_name, flags, data, 0, coff_node));
 
             self.node_count += 1;
 
             self.cache.insert_section(section.index(), section_node);
-            if characteristics.contains(SectionNodeCharacteristics::CntCode) {
+            if flags.contains(ImageScn::CNT_CODE) {
                 self.cache
                     .insert_code_section(section.index(), section_node);
             }
@@ -197,17 +192,13 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                             self.arena.alloc_with(|| {
                                 SectionNode::new(
                                     "COMMON data",
-                                    SectionNodeCharacteristics::CntUninitializedData
-                                        | SectionNodeCharacteristics::MemRead
-                                        | SectionNodeCharacteristics::MemWrite
-                                        | match self.machine {
-                                            LinkerTargetArch::Amd64 => {
-                                                SectionNodeCharacteristics::Align8Bytes
-                                            }
-                                            LinkerTargetArch::I386 => {
-                                                SectionNodeCharacteristics::Align4Bytes
-                                            }
-                                        },
+                                    (ImageScn::CNT_UNINITIALIZED_DATA
+                                        | ImageScn::MEM_READ
+                                        | ImageScn::MEM_WRITE)
+                                        .with_align(P2Align::new(match self.machine {
+                                            LinkerTargetArch::Amd64 => 8,
+                                            LinkerTargetArch::I386 => 4,
+                                        })),
                                     SectionNodeData::Uninitialized(0),
                                     0,
                                     self.root_coff,
@@ -219,7 +210,7 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                             Edge::new(
                                 graph_symbol,
                                 common_section,
-                                DefinitionEdgeWeight::new(coff_symbol.value(), None),
+                                DefinitionEdgeWeight::new(coff_symbol.value(), ComdatKind::Unknown),
                             )
                         });
 
@@ -247,7 +238,7 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
             let mut definition_edge = Edge::new(
                 graph_symbol,
                 graph_section,
-                DefinitionEdgeWeight::new(coff_symbol.value(), None),
+                DefinitionEdgeWeight::new(coff_symbol.value(), ComdatKind::Unknown),
             );
 
             if coff_symbol.has_aux_section() {
@@ -255,15 +246,12 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                 let mut checksum = aux_section.check_sum.get(object::LittleEndian);
 
                 if graph_section.is_comdat() {
-                    let selection =
-                        ComdatSelection::try_from(aux_section.selection).with_context(|| {
-                            format!("symbol '{}' at index {}", symbol_name, symbol.index())
-                        })?;
+                    let selection = aux_section.selection;
 
                     // If this is a COMDAT to an associative section, add an
                     // associative edge from the section specified in the
                     // selection number to this section
-                    if selection == ComdatSelection::Associative {
+                    if selection == pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE {
                         let aux_section_number = aux_section.number.get(object::LittleEndian);
 
                         let associative_section_index = SectionIndex(aux_section_number as usize);
@@ -288,6 +276,18 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                                 )
                             }));
                     } else {
+                        let selection = match aux_section.selection {
+                            pe::IMAGE_COMDAT_SELECT_ANY => ComdatKind::Any,
+                            pe::IMAGE_COMDAT_SELECT_NODUPLICATES => ComdatKind::NoDuplicates,
+                            pe::IMAGE_COMDAT_SELECT_SAME_SIZE => ComdatKind::SameSize,
+                            pe::IMAGE_COMDAT_SELECT_EXACT_MATCH => ComdatKind::ExactMatch,
+                            pe::IMAGE_COMDAT_SELECT_LARGEST => ComdatKind::Largest,
+                            o => bail!(
+                                "symbol '{}' at index {}: invalid COMDAT selection {o}",
+                                symbol_name,
+                                symbol.index()
+                            ),
+                        };
                         // Store the selection value for the leader symbol to
                         // handle
                         self.cache
@@ -312,8 +312,8 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                 // This symbol is possibly the COMDAT leader for the section.
                 // If the COMDAT section has no auxiliary section symbol, issue
                 // an error.
-                // If the entry is present but `None`, the leader was already
-                // handled and this is a regular definition for the section.
+                // If the entry is present but [`ComdatKind::Unknown`], the
+                // leader was already handled.
                 let selection_entry = self
                     .cache
                     .get_comdat_leader_selection(section_idx)
@@ -325,17 +325,12 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                         )
                     })?;
 
-                if let Some(selection) = selection_entry {
-                    // Associative COMDATs are only for sections and not leader
-                    // symbols
-                    if *selection != ComdatSelection::Associative {
-                        // Add the COMDAT selection to the leader symbol's definition
-                        // edge
-                        definition_edge.weight_mut().selection = Some(*selection);
-                    }
-
-                    // Set the entry to `None` for marking the COMDAT as handled
-                    *selection_entry = None;
+                if *selection_entry != ComdatKind::Unknown {
+                    // Add the COMDAT selection to the leader symbol's definition
+                    // edge.
+                    // Set the entry to `ComdatKind::Unknown` for marking the COMDAT as handled
+                    definition_edge.weight_mut().selection =
+                        std::mem::replace(selection_entry, ComdatKind::Unknown);
                 }
             }
 
@@ -369,11 +364,10 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                     )
                 })?;
 
-            let weak_search =
-                WeakDefaultSearch::try_from(weak_aux.weak_search_type.get(object::LittleEndian))
-                    .with_context(|| {
-                        format!("symbol '{}' at index {}", graph_symbol.name(), symbol_idx)
-                    })?;
+            let weak_search = weak_aux.weak_search_type.get(object::LittleEndian);
+            let weak_search = WeakDefaultSearch::try_from(weak_search).with_context(|| {
+                format!("symbol '{}' at index {symbol_idx}", graph_symbol.name())
+            })?;
 
             let default_edge = self.arena.alloc_with(|| {
                 Edge::new(
@@ -716,20 +710,20 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
 
             section_flags.clear();
             bitflags::parser::to_writer(
-                &section.characteristics().zero_align(),
+                &section.characteristics().without_align(),
                 &mut section_flags,
             )
             .unwrap();
 
             writeln!(
                 w,
-                "{pad}{section_idx} [ label=\"{{ {} | {} | {{ Size: {:#x}\\l | Align: {:#x}\\l | Checksum: {:#x}\\l }} | {{ {} }} }}\" shape=record ]",
-                section.name(),
-                section.coff().short_name(),
-                section.data().len(),
-                section.characteristics().alignment().unwrap_or(0),
-                section.checksum(),
-                section_flags,
+                "{pad}{section_idx} [ label=\"{{ {name} | {coff_name} | {{ Size: {size:#x}\\l | Align: {align}\\l | Checksum: {checksum:#x}\\l }} | {{ {flags} }} }}\" shape=record ]",
+                name = section.name(),
+                coff_name = section.coff().short_name(),
+                size = section.data().len(),
+                align = section.alignment(),
+                checksum = section.checksum(),
+                flags = section_flags,
             )?;
 
             for symbol in section
@@ -877,7 +871,9 @@ impl<'arena, 'data> LinkGraph<'arena, 'data> {
                     definition.weight().address()
                 )?;
 
-                if let Some(selection) = definition.weight().selection() {
+                if let selection = definition.weight().selection()
+                    && selection != ComdatKind::Unknown
+                {
                     write!(w, " ({selection:?})")?;
                 }
 

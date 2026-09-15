@@ -8,14 +8,7 @@ use crate::{
 use super::node::{BorrowedSymbolName, SymbolReferencesIter};
 
 use __private::SealedTrait;
-use num_enum::{IntoPrimitive, TryFromPrimitive};
-use object::pe::{
-    IMAGE_COMDAT_SELECT_ANY, IMAGE_COMDAT_SELECT_ASSOCIATIVE, IMAGE_COMDAT_SELECT_EXACT_MATCH,
-    IMAGE_COMDAT_SELECT_LARGEST, IMAGE_COMDAT_SELECT_NODUPLICATES, IMAGE_COMDAT_SELECT_SAME_SIZE,
-    IMAGE_REL_AMD64_ADDR32, IMAGE_REL_AMD64_ADDR64, IMAGE_REL_I386_DIR32,
-    IMAGE_WEAK_EXTERN_SEARCH_ALIAS, IMAGE_WEAK_EXTERN_SEARCH_LIBRARY,
-    IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY,
-};
+use object::{ComdatKind, pe};
 
 pub trait EdgeListTraversal: SealedTrait {}
 
@@ -306,15 +299,12 @@ pub struct DefinitionEdgeWeight {
     /// The virtual address for the definition.
     virtual_address: Cell<u32>,
 
-    /// The COMDAT selection if the symbol is a COMDAT symbol.
-    pub(super) selection: Option<ComdatSelection>,
+    /// The COMDAT selection if the symbol is a COMDAT symbol or unknown.
+    pub(super) selection: ComdatKind,
 }
 
 impl DefinitionEdgeWeight {
-    pub(super) fn new(
-        virtual_address: u32,
-        selection: Option<ComdatSelection>,
-    ) -> DefinitionEdgeWeight {
+    pub(super) fn new(virtual_address: u32, selection: ComdatKind) -> DefinitionEdgeWeight {
         Self {
             virtual_address: Cell::new(virtual_address),
             selection,
@@ -334,30 +324,9 @@ impl DefinitionEdgeWeight {
     }
 
     /// Returns the COMDAT selection for the symbol if this is a COMDAT symbol.
-    pub fn selection(&self) -> Option<ComdatSelection> {
+    pub fn selection(&self) -> ComdatKind {
         self.selection
     }
-}
-
-#[derive(Debug, Copy, Clone, thiserror::Error)]
-#[error("invalid COMDAT selection ({0})")]
-pub struct TryFromComdatSelectionError(u8);
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
-#[num_enum(
-    error_type(
-        name = TryFromComdatSelectionError,
-        constructor = TryFromComdatSelectionError,
-    )
-)]
-#[repr(u8)]
-pub enum ComdatSelection {
-    NoDuplicates = IMAGE_COMDAT_SELECT_NODUPLICATES,
-    Any = IMAGE_COMDAT_SELECT_ANY,
-    SameSize = IMAGE_COMDAT_SELECT_SAME_SIZE,
-    ExactMatch = IMAGE_COMDAT_SELECT_EXACT_MATCH,
-    Associative = IMAGE_COMDAT_SELECT_ASSOCIATIVE,
-    Largest = IMAGE_COMDAT_SELECT_LARGEST,
 }
 
 pub type DefinitionEdge<'arena, 'data> =
@@ -391,9 +360,9 @@ impl RelocationEdgeWeight {
     pub fn is_vabased(&self, arch: LinkerTargetArch) -> bool {
         let typ = self.typ();
         if arch == LinkerTargetArch::Amd64 {
-            typ == IMAGE_REL_AMD64_ADDR64 || typ == IMAGE_REL_AMD64_ADDR32
+            typ == pe::IMAGE_REL_AMD64_ADDR64 || typ == pe::IMAGE_REL_AMD64_ADDR32
         } else {
-            typ == IMAGE_REL_I386_DIR32
+            typ == pe::IMAGE_REL_I386_DIR32
         }
     }
 }
@@ -436,20 +405,27 @@ pub type AssociativeEdge<'arena, 'data> = Edge<
 
 #[derive(Debug, Copy, Clone, thiserror::Error)]
 #[error("invalid weak external auxiliary record characteristics ({0})")]
-pub struct TryFromWeakDefaultSearch(u32);
+pub struct TryFromWeakDefaultSearchError(u32);
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
-#[num_enum(
-    error_type(
-        name = TryFromWeakDefaultSearch,
-        constructor = TryFromWeakDefaultSearch,
-    )
-)]
-#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum WeakDefaultSearch {
-    NoLibrary = IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY,
-    Library = IMAGE_WEAK_EXTERN_SEARCH_LIBRARY,
-    Alias = IMAGE_WEAK_EXTERN_SEARCH_ALIAS,
+    NoLibrary = pe::IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY as u8,
+    Library = pe::IMAGE_WEAK_EXTERN_SEARCH_LIBRARY as u8,
+    Alias = pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS as u8,
+}
+
+impl TryFrom<u32> for WeakDefaultSearch {
+    type Error = TryFromWeakDefaultSearchError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Ok(match value {
+            _ if value == pe::IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY => Self::NoLibrary,
+            _ if value == pe::IMAGE_WEAK_EXTERN_SEARCH_LIBRARY => Self::Library,
+            _ if value == pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS => Self::Alias,
+            o => return Err(TryFromWeakDefaultSearchError(o)),
+        })
+    }
 }
 
 /// The weight for an edge to a weak symbol's default definition.

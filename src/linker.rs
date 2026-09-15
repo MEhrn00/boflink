@@ -5,7 +5,6 @@ use std::{
 
 use bumpalo::Bump;
 use indexmap::{IndexMap, IndexSet};
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 use object::{
     coff::CoffFile,
     pe::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386},
@@ -16,7 +15,7 @@ use crate::{
     archive::LinkArchive, bofapi::ApiSymbols, cli::CliOptions, graph::SpecLinkGraph, logging,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum LinkerTargetArch {
     Amd64 = IMAGE_FILE_MACHINE_AMD64,
@@ -28,6 +27,15 @@ impl From<LinkerTargetArch> for object::Architecture {
         match value {
             LinkerTargetArch::Amd64 => object::Architecture::X86_64,
             LinkerTargetArch::I386 => object::Architecture::I386,
+        }
+    }
+}
+
+impl From<LinkerTargetArch> for u16 {
+    fn from(value: LinkerTargetArch) -> Self {
+        match value {
+            LinkerTargetArch::Amd64 => IMAGE_FILE_MACHINE_AMD64,
+            LinkerTargetArch::I386 => IMAGE_FILE_MACHINE_I386,
         }
     }
 }

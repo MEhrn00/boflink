@@ -4,28 +4,17 @@ use std::{
     hash::{DefaultHasher, Hasher},
 };
 
-use object::pe::{
-    IMAGE_SCN_ALIGN_1BYTES, IMAGE_SCN_ALIGN_2BYTES, IMAGE_SCN_ALIGN_4BYTES, IMAGE_SCN_ALIGN_8BYTES,
-    IMAGE_SCN_ALIGN_16BYTES, IMAGE_SCN_ALIGN_32BYTES, IMAGE_SCN_ALIGN_64BYTES,
-    IMAGE_SCN_ALIGN_128BYTES, IMAGE_SCN_ALIGN_256BYTES, IMAGE_SCN_ALIGN_512BYTES,
-    IMAGE_SCN_ALIGN_1024BYTES, IMAGE_SCN_ALIGN_2048BYTES, IMAGE_SCN_ALIGN_4096BYTES,
-    IMAGE_SCN_ALIGN_8192BYTES, IMAGE_SCN_CNT_CODE, IMAGE_SCN_CNT_INITIALIZED_DATA,
-    IMAGE_SCN_CNT_UNINITIALIZED_DATA, IMAGE_SCN_GPREL, IMAGE_SCN_LNK_COMDAT, IMAGE_SCN_LNK_INFO,
-    IMAGE_SCN_LNK_NRELOC_OVFL, IMAGE_SCN_LNK_OTHER, IMAGE_SCN_LNK_REMOVE,
-    IMAGE_SCN_MEM_DISCARDABLE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_LOCKED,
-    IMAGE_SCN_MEM_NOT_CACHED, IMAGE_SCN_MEM_NOT_PAGED, IMAGE_SCN_MEM_PRELOAD,
-    IMAGE_SCN_MEM_PURGEABLE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_SHARED, IMAGE_SCN_MEM_WRITE,
-    IMAGE_SCN_TYPE_NO_PAD,
-};
+use object::pe;
 
 use crate::graph::edge::{
     AssociativeEdge, DefinitionEdge, EdgeList, IncomingEdges, OutgoingEdges, RelocationEdge,
 };
 
-use super::{CoffNode, SymbolNodeStorageClass};
+use super::CoffNode;
 
-/// Shift value for section alignment flags
-const SECTION_ALIGN_SHIFT: u32 = 20;
+/// Shift value for extracting the alignment value from section characteristic
+/// flags
+const IMAGE_SCN_ALIGN_SHIFT: u32 = 20;
 
 /// The types of sections
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -92,166 +81,105 @@ pub enum SectionType {
 }
 
 impl SectionType {
-    fn from_name_and_flags(
-        name: SectionName<'_>,
-        characteristics: SectionNodeCharacteristics,
-    ) -> SectionType {
+    fn from_name_and_flags(name: SectionName<'_>, scn_flags: ImageScn) -> SectionType {
         if !name.as_str().starts_with('.') {
             return Self::Other;
         }
 
         let group_name = name.group_name();
+        let oflags = scn_flags.output_flags();
+
+        let code = ImageScn::CNT_CODE;
+        let data = ImageScn::CNT_INITIALIZED_DATA;
+        let bss = ImageScn::CNT_UNINITIALIZED_DATA;
+        let r = ImageScn::MEM_READ;
+        let w = ImageScn::MEM_WRITE;
+        let x = ImageScn::MEM_EXECUTE;
+        let discard = ImageScn::MEM_DISCARDABLE;
+
+        let flags = |v: ImageScn| -> bool { oflags.contains(v) };
+
+        if scn_flags.contains(ImageScn::LNK_INFO) {
+            // Linker Options (.drectve)
+            if group_name == ".drectve" {
+                return SectionType::LinkerOptions;
+            }
+
+            if group_name == ".cormeta" {
+                return SectionType::ClrMetadata;
+            }
+
+            return SectionType::Other;
+        }
+
+        if scn_flags.contains(ImageScn::GPREL) {
+            if flags(bss | r | w) && group_name == ".sbss" {
+                return SectionType::GPRelUninitialized;
+            }
+            if flags(data | r | w) && group_name == ".sdata" {
+                return SectionType::GPRelInitialized;
+            }
+            if flags(data | r) && group_name == ".srdata" {
+                return SectionType::GPRelReadOnly;
+            }
+            return SectionType::Other;
+        }
 
         // Code (.text)
-        if characteristics.contains(
-            SectionNodeCharacteristics::CntCode
-                | SectionNodeCharacteristics::MemExecute
-                | SectionNodeCharacteristics::MemRead,
-        ) && group_name == ".text"
-        {
+        if flags(code | r | x) && group_name == ".text" {
             return SectionType::Code;
         }
 
         // Initialized data (.data)
-        if characteristics.contains(
-            SectionNodeCharacteristics::CntInitializedData
-                | SectionNodeCharacteristics::MemRead
-                | SectionNodeCharacteristics::MemWrite,
-        ) && group_name == ".data"
-        {
+        if flags(data | r | w) && group_name == ".data" {
             return SectionType::InitializedData;
         }
 
         // Uninitialized data (.bss)
-        if characteristics.contains(
-            SectionNodeCharacteristics::CntUninitializedData
-                | SectionNodeCharacteristics::MemRead
-                | SectionNodeCharacteristics::MemWrite,
-        ) && group_name == ".bss"
-        {
+        if flags(bss | r | w) && group_name == ".bss" {
             return SectionType::UninitializedData;
         }
 
         // Read only (.rdata)
-        if characteristics.contains(
-            SectionNodeCharacteristics::CntInitializedData | SectionNodeCharacteristics::MemRead,
-        ) && group_name == ".rdata"
-        {
+        if flags(data | r) && group_name == ".rdata" {
             return SectionType::ReadOnlyData;
         }
 
         // Exception (.pdata)
-        if characteristics.contains(
-            SectionNodeCharacteristics::CntInitializedData | SectionNodeCharacteristics::MemRead,
-        ) && group_name == ".pdata"
-        {
+        if flags(data | r) && group_name == ".pdata" {
             return SectionType::Exception;
         }
 
         // Unwind (.xdata)
-        if characteristics.contains(
-            SectionNodeCharacteristics::CntInitializedData | SectionNodeCharacteristics::MemRead,
-        ) && group_name == ".xdata"
-        {
+        if flags(data | r) && group_name == ".xdata" {
             return SectionType::ExceptionUnwind;
         }
 
-        // Linker Options (.drectve)
-        if characteristics.contains(SectionNodeCharacteristics::LnkInfo) && group_name == ".drectve"
-        {
-            return SectionType::LinkerOptions;
-        }
-
         // Debug Symbols (.debug$S)
-        if characteristics.contains(
-            SectionNodeCharacteristics::CntInitializedData
-                | SectionNodeCharacteristics::MemRead
-                | SectionNodeCharacteristics::MemDiscardable,
-        ) && group_name == ".debug$S"
-        {
+        if flags(discard | data | r) && group_name == ".debug$S" {
             return SectionType::DebugSymbols;
         }
 
         // Import tables (.idata)
-        if characteristics.contains(
-            SectionNodeCharacteristics::CntInitializedData
-                | SectionNodeCharacteristics::MemRead
-                | SectionNodeCharacteristics::MemWrite,
-        ) && group_name == ".idata"
-        {
+        if flags(data | r | w) && group_name == ".idata" {
             return SectionType::ImportTables;
         }
 
         // TLS (.tls)
-        if characteristics.contains(
-            SectionNodeCharacteristics::CntInitializedData
-                | SectionNodeCharacteristics::MemRead
-                | SectionNodeCharacteristics::MemWrite,
-        ) && group_name == ".tls"
-        {
+        if flags(data | r | w) && group_name == ".tls" {
             return SectionType::Tls;
         }
 
-        // The above section types should be in a rough order of the most common
-        // types in COFFs.
-        // The order of the section types below here should not matter for optimization.
-
-        if characteristics.contains(SectionNodeCharacteristics::LnkInfo) && group_name == ".cormeta"
-        {
-            return SectionType::ClrMetadata;
-        }
-
-        if characteristics.contains(
-            SectionNodeCharacteristics::CntInitializedData
-                | SectionNodeCharacteristics::MemRead
-                | SectionNodeCharacteristics::MemDiscardable,
-        ) && group_name == ".debug$P"
-        {
+        if flags(discard | data | r) && group_name == ".debug$P" {
             return SectionType::PrecompiledDebugTypes;
         }
 
-        if characteristics.contains(
-            SectionNodeCharacteristics::CntInitializedData
-                | SectionNodeCharacteristics::MemRead
-                | SectionNodeCharacteristics::MemDiscardable,
-        ) && group_name == ".debug$T"
-        {
+        if flags(discard | data | r) && group_name == ".debug$T" {
             return SectionType::PrecompiledDebugTypes;
         }
 
-        if characteristics.contains(
-            SectionNodeCharacteristics::CntInitializedData | SectionNodeCharacteristics::MemRead,
-        ) && group_name == ".rsrc"
-        {
+        if flags(data | r) && group_name == ".rsrc" {
             return SectionType::ResourceDirectory;
-        }
-
-        if characteristics.contains(SectionNodeCharacteristics::GPRel) {
-            if characteristics.contains(
-                SectionNodeCharacteristics::CntUninitializedData
-                    | SectionNodeCharacteristics::MemRead
-                    | SectionNodeCharacteristics::MemWrite,
-            ) && group_name == ".sbss"
-            {
-                return SectionType::GPRelUninitialized;
-            }
-
-            if characteristics.contains(
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead
-                    | SectionNodeCharacteristics::MemWrite,
-            ) && group_name == ".sdata"
-            {
-                return SectionType::GPRelInitialized;
-            }
-
-            if characteristics.contains(
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead,
-            ) && group_name == ".srdata"
-            {
-                return SectionType::GPRelReadOnly;
-            }
         }
 
         Self::Other
@@ -282,7 +210,7 @@ pub struct SectionNode<'arena, 'data> {
     name: SectionName<'arena>,
 
     /// The characteristics of the section.
-    characteristics: SectionNodeCharacteristics,
+    characteristics: ImageScn,
 
     /// The section data.
     data: Cell<SectionNodeData<'arena>>,
@@ -300,7 +228,7 @@ pub struct SectionNode<'arena, 'data> {
 impl<'arena, 'data> SectionNode<'arena, 'data> {
     pub fn new(
         name: impl Into<SectionName<'arena>>,
-        characteristics: SectionNodeCharacteristics,
+        characteristics: ImageScn,
         data: SectionNodeData<'arena>,
         checksum: u32,
         coff: &'arena CoffNode<'data>,
@@ -333,10 +261,7 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
     /// If this is a code section, attempts to find the associated .pdata section
     /// with the exception information.
     pub fn find_associated_pdata_section(&self) -> Option<&'arena SectionNode<'arena, 'data>> {
-        if !self
-            .characteristics()
-            .contains(SectionNodeCharacteristics::CntCode)
-        {
+        if !self.characteristics.contains(ImageScn::CNT_CODE) {
             return None;
         }
 
@@ -353,7 +278,7 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
         // which references this code section.
         for possible_joined_symbol in self.definitions().iter().filter_map(|edge| {
             let defined_symbol = edge.source();
-            (defined_symbol.storage_class() == SymbolNodeStorageClass::Label
+            (defined_symbol.storage_class() == pe::IMAGE_SYM_CLASS_LABEL
                 || defined_symbol.is_section_symbol())
             .then_some(defined_symbol)
         }) {
@@ -470,8 +395,7 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
 
     /// Returns `true` if this is a COMDAT section.
     pub fn is_comdat(&self) -> bool {
-        self.characteristics()
-            .contains(SectionNodeCharacteristics::LnkComdat)
+        self.characteristics.contains(ImageScn::LNK_COMDAT)
     }
 
     /// Returns the name of the section.
@@ -480,8 +404,13 @@ impl<'arena, 'data> SectionNode<'arena, 'data> {
     }
 
     /// Returns the characteristics flags associated with this section.
-    pub fn characteristics(&self) -> SectionNodeCharacteristics {
+    pub fn characteristics(&self) -> ImageScn {
         self.characteristics
+    }
+
+    /// Returns the section alignment from the section flags
+    pub fn alignment(&self) -> P2Align {
+        self.characteristics.alignment()
     }
 
     /// Returns the data associated with this section.
@@ -583,71 +512,130 @@ impl std::fmt::Display for SectionName<'_> {
     }
 }
 
-/// Section node characteristic flags
-#[derive(Debug, Copy, Clone)]
-pub struct SectionNodeCharacteristics(u32);
+/// Section node characteristic bit flags
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct ImageScn(u32);
 
 bitflags::bitflags! {
-    impl SectionNodeCharacteristics: u32 {
-        const TypeNoPad = IMAGE_SCN_TYPE_NO_PAD;
-        const CntCode = IMAGE_SCN_CNT_CODE;
-        const CntInitializedData = IMAGE_SCN_CNT_INITIALIZED_DATA;
-        const CntUninitializedData = IMAGE_SCN_CNT_UNINITIALIZED_DATA;
-        const LnkOther = IMAGE_SCN_LNK_OTHER;
-        const LnkInfo = IMAGE_SCN_LNK_INFO;
-        const LnkRemove = IMAGE_SCN_LNK_REMOVE;
-        const LnkComdat = IMAGE_SCN_LNK_COMDAT;
-        const GPRel = IMAGE_SCN_GPREL;
-        const MemPurgeable = IMAGE_SCN_MEM_PURGEABLE;
-        const MemLocked = IMAGE_SCN_MEM_LOCKED;
-        const MemPreload = IMAGE_SCN_MEM_PRELOAD;
-        const Align1Bytes = IMAGE_SCN_ALIGN_1BYTES;
-        const Align2Bytes = IMAGE_SCN_ALIGN_2BYTES;
-        const Align4Bytes = IMAGE_SCN_ALIGN_4BYTES;
-        const Align8Bytes = IMAGE_SCN_ALIGN_8BYTES;
-        const Align16Bytes = IMAGE_SCN_ALIGN_16BYTES;
-        const Align32Bytes = IMAGE_SCN_ALIGN_32BYTES;
-        const Align64Bytes = IMAGE_SCN_ALIGN_64BYTES;
-        const Align128Bytes = IMAGE_SCN_ALIGN_128BYTES;
-        const Align256Bytes = IMAGE_SCN_ALIGN_256BYTES;
-        const Align512Bytes = IMAGE_SCN_ALIGN_512BYTES;
-        const Align1024Bytes = IMAGE_SCN_ALIGN_1024BYTES;
-        const Align2048Bytes = IMAGE_SCN_ALIGN_2048BYTES;
-        const Align4096Bytes = IMAGE_SCN_ALIGN_4096BYTES;
-        const Align8192Bytes = IMAGE_SCN_ALIGN_8192BYTES;
-        const LnkNRelocOvfl = IMAGE_SCN_LNK_NRELOC_OVFL;
-        const MemDiscardable = IMAGE_SCN_MEM_DISCARDABLE;
-        const MemNotCached = IMAGE_SCN_MEM_NOT_CACHED;
-        const MemNotPaged = IMAGE_SCN_MEM_NOT_PAGED;
-        const MemShared = IMAGE_SCN_MEM_SHARED;
-        const MemExecute = IMAGE_SCN_MEM_EXECUTE;
-        const MemRead = IMAGE_SCN_MEM_READ;
-        const MemWrite = IMAGE_SCN_MEM_WRITE;
+    impl ImageScn: u32 {
+        const TYPE_NO_PAD = pe::IMAGE_SCN_TYPE_NO_PAD;
+        const CNT_CODE = pe::IMAGE_SCN_CNT_CODE;
+        const CNT_INITIALIZED_DATA = pe::IMAGE_SCN_CNT_INITIALIZED_DATA;
+        const CNT_UNINITIALIZED_DATA = pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA;
+        const LNK_OTHER = pe::IMAGE_SCN_LNK_OTHER;
+        const LNK_INFO = pe::IMAGE_SCN_LNK_INFO;
+        const LNK_REMOVE = pe::IMAGE_SCN_LNK_REMOVE;
+        const LNK_COMDAT = pe::IMAGE_SCN_LNK_COMDAT;
+        const GPREL = pe::IMAGE_SCN_GPREL;
+        const MEM_PURGEABLE = pe::IMAGE_SCN_MEM_PURGEABLE;
+        const MEM_LOCKED = pe::IMAGE_SCN_MEM_LOCKED;
+        const MEM_PRELOAD = pe::IMAGE_SCN_MEM_PRELOAD;
+        const LNK_NRELOC_OVFL = pe::IMAGE_SCN_LNK_NRELOC_OVFL;
+        const MEM_DISCARDABLE = pe::IMAGE_SCN_MEM_DISCARDABLE;
+        const MEM_NOT_CACHED = pe::IMAGE_SCN_MEM_NOT_CACHED;
+        const MEM_NOT_PAGED = pe::IMAGE_SCN_MEM_NOT_PAGED;
+        const MEM_SHARED = pe::IMAGE_SCN_MEM_SHARED;
+        const MEM_EXECUTE = pe::IMAGE_SCN_MEM_EXECUTE;
+        const MEM_READ = pe::IMAGE_SCN_MEM_READ;
+        const MEM_WRITE = pe::IMAGE_SCN_MEM_WRITE;
         const _ = !0;
     }
 }
 
-impl SectionNodeCharacteristics {
-    /// Returns the alignment value if it exists
-    pub fn alignment(&self) -> Option<usize> {
-        (self.0 & (0xfu32 << 20) != 0).then(|| 2usize.pow(((self.0 >> 20) & 0xf) - 1))
-    }
-
-    /// Returns a new [`SectionNodeCharacteristics`] without the alignment
-    /// bits set
-    pub fn zero_align(&self) -> SectionNodeCharacteristics {
-        Self(self.0 & !(0xfu32 << SECTION_ALIGN_SHIFT))
-    }
-
-    /// Set the characteristic alignment flag to the specified value.
-    ///
-    /// The value must be a multiple of two or this has no effect.
-    pub fn set_alignment(&mut self, val: u32) {
-        if val == 1 || (val != 0 && (val & (val - 1)) == 0) {
-            self.insert(SectionNodeCharacteristics::from_bits_truncate(
-                (val.ilog2() + 1) << SECTION_ALIGN_SHIFT,
-            ));
+impl ImageScn {
+    /// Returns the alignment portion of the section flags.
+    pub fn alignment(&self) -> P2Align {
+        if self.contains(Self::TYPE_NO_PAD) {
+            P2Align::zeroed()
+        } else {
+            let v = (self.0 & pe::IMAGE_SCN_ALIGN_MASK) >> IMAGE_SCN_ALIGN_SHIFT;
+            if v > 0 {
+                P2Align((v - 1) as u8)
+            } else {
+                P2Align(0)
+            }
         }
+    }
+
+    /// Returns a new set of flags without any alignment value.
+    pub fn without_align(self) -> Self {
+        Self(self.0 & !pe::IMAGE_SCN_ALIGN_MASK)
+    }
+
+    /// Returns a new set of flags with the specified alignment.
+    pub fn with_align(self, align: P2Align) -> Self {
+        let align_flags = ((align.0 as u32) + 1) << IMAGE_SCN_ALIGN_SHIFT;
+        Self(self.without_align().0 | align_flags)
+    }
+
+    /// Returns a new set of flags with only the `IMAGE_SCN_CNT_*` flags set.
+    pub fn contents_flags(self) -> Self {
+        Self(self.0 & 0xe0)
+    }
+
+    /// Returns a new set of flags with only the `IMAGE_SCN_MEM_*` flags set.
+    pub fn memory_flags(self) -> Self {
+        Self(self.0 & 0xfe000000)
+    }
+
+    /// Returns the output section flags for this set of section flags.
+    ///
+    /// This is `self.memory_flags() | self.contents_flags()`
+    pub fn output_flags(self) -> Self {
+        self.memory_flags() | self.contents_flags()
+    }
+}
+
+/// A section alignment value represented in log2 form.
+///
+/// The value stored is `log2(a)` where `a` is the real alignment value. This
+/// representation of section alignment makes it easier to convert between the
+/// real alignment value and the alignment value inside the characteristic flags
+/// of a section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct P2Align(u8);
+
+impl P2Align {
+    /// Creates a new [`P2Align`] value with the specified alignment.
+    ///
+    /// Alignment values of 0 are treated as 1.
+    ///
+    /// # Panics
+    /// This will panic if the alignment value is not a power of 2 between 0
+    /// and 8192 inclusive.
+    pub fn new(align: u32) -> Self {
+        assert!(align <= 8182, "P2Align value must be >= 0 and <= 8192");
+        if align == 0 {
+            Self(0)
+        } else {
+            assert!(
+                align.is_power_of_two(),
+                "P2Align value must be a power of 2"
+            );
+            Self(align.ilog2() as u8)
+        }
+    }
+
+    /// Creates a new [`P2Align`] value that holds an alignment of 1
+    pub const fn zeroed() -> Self {
+        Self(0)
+    }
+
+    /// Returns the alignment value
+    pub fn value(&self) -> u32 {
+        1 << self.0
+    }
+}
+
+impl std::fmt::Display for P2Align {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value().fmt(f)
+    }
+}
+
+impl std::fmt::LowerHex for P2Align {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value().fmt(f)
     }
 }
 

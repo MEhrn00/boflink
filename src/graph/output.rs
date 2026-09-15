@@ -15,14 +15,14 @@ use object::{
     write::coff::{Relocation, Writer},
 };
 
-use crate::linker::LinkerTargetArch;
+use crate::{
+    graph::node::{ImageScn, P2Align},
+    linker::LinkerTargetArch,
+};
 
 use super::{
     LinkGraphArena,
-    node::{
-        LibraryNode, SectionName, SectionNode, SectionNodeCharacteristics, SectionNodeData,
-        SymbolNodeType,
-    },
+    node::{LibraryNode, SectionName, SectionNode, SectionNodeData, SymbolNodeType},
 };
 
 /// An output section for the [`OutputGraph`].
@@ -31,7 +31,7 @@ pub struct OutputSection<'arena, 'data> {
     pub name: SectionName<'arena>,
 
     /// The section characteristics
-    pub characteristics: SectionNodeCharacteristics,
+    pub characteristics: ImageScn,
 
     /// The name of the output section in the COFF
     output_name: OnceCell<object::write::coff::Name>,
@@ -55,16 +55,12 @@ pub struct OutputSection<'arena, 'data> {
 impl<'arena, 'data> OutputSection<'arena, 'data> {
     pub fn new(
         name: impl Into<SectionName<'arena>>,
-        characteristics: SectionNodeCharacteristics,
+        characteristics: ImageScn,
         nodes: Vec<&'arena SectionNode<'arena, 'data>>,
     ) -> OutputSection<'arena, 'data> {
-        let mut characteristics = characteristics.zero_align();
-        characteristics.remove(
-            SectionNodeCharacteristics::LnkComdat | SectionNodeCharacteristics::LnkNRelocOvfl,
-        );
         Self {
             name: name.into(),
-            characteristics,
+            characteristics: characteristics.output_flags(),
             output_name: OnceCell::new(),
             size_of_raw_data: 0,
             pointer_to_raw_data: 0,
@@ -124,7 +120,7 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
         coff_writer.reserve_section_headers(self.output_sections.len().try_into().unwrap());
 
         for output_section in self.output_sections.iter_mut() {
-            let mut section_alignment = 0u32;
+            let mut align = P2Align::zeroed();
 
             output_section
                 .output_name
@@ -133,12 +129,11 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
 
             // Assign virtual addresses to each section
             for node in &output_section.nodes {
-                if let Some(align) = node.characteristics().alignment() {
-                    let align = align as u32;
-                    output_section.size_of_raw_data =
-                        output_section.size_of_raw_data.next_multiple_of(align);
-                    section_alignment = section_alignment.max(align);
-                }
+                let node_align = node.alignment();
+                output_section.size_of_raw_data = output_section
+                    .size_of_raw_data
+                    .next_multiple_of(node_align.value());
+                align = align.max(node_align);
 
                 debug!(
                     "{}: mapping section '{}' to '{}' at address {:#x} with size {:#x}",
@@ -154,16 +149,14 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
             }
 
             // Set the alignment needed for the output section
-            output_section
-                .characteristics
-                .set_alignment(section_alignment);
+            output_section.characteristics = output_section.characteristics.with_align(align);
         }
 
         // Reserve section data
         for section in self.output_sections.iter_mut() {
             if !section
                 .characteristics
-                .contains(SectionNodeCharacteristics::CntUninitializedData)
+                .contains(ImageScn::CNT_UNINITIALIZED_DATA)
                 && section.size_of_raw_data > 0
             {
                 section.pointer_to_raw_data =
@@ -414,14 +407,11 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
             if section.size_of_raw_data > 0
                 && !section
                     .characteristics
-                    .contains(SectionNodeCharacteristics::CntUninitializedData)
+                    .contains(ImageScn::CNT_UNINITIALIZED_DATA)
             {
                 coff_writer.write_section_align();
 
-                let alignment_byte = if section
-                    .characteristics
-                    .contains(SectionNodeCharacteristics::CntCode)
-                {
+                let alignment_byte = if section.characteristics.contains(ImageScn::CNT_CODE) {
                     0x90u8
                 } else {
                     0x00u8
@@ -543,7 +533,7 @@ impl<'arena, 'data> OutputGraph<'arena, 'data> {
                                 SymbolNodeType::Value(typ) => typ,
                                 _ => unreachable!(),
                             },
-                            storage_class: symbol.storage_class().into(),
+                            storage_class: symbol.storage_class(),
                             number_of_aux_symbols: 0,
                         });
                     }

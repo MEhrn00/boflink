@@ -6,16 +6,22 @@ use std::{
 use anyhow::bail;
 use indexmap::IndexMap;
 use log::{debug, warn};
-use object::pe::{IMAGE_REL_AMD64_REL32, IMAGE_REL_I386_DIR32};
+use object::{
+    ComdatKind,
+    pe::{self, IMAGE_REL_AMD64_REL32, IMAGE_REL_I386_DIR32},
+};
 
-use crate::{graph::node::SymbolName, linker::LinkerTargetArch};
+use crate::{
+    graph::node::{ImageScn, P2Align, SymbolName},
+    linker::LinkerTargetArch,
+};
 
 use super::{
-    edge::{ComdatSelection, DefinitionEdgeWeight, Edge, RelocationEdgeWeight},
+    edge::{DefinitionEdgeWeight, Edge, RelocationEdgeWeight},
     link::{LinkGraph, LinkGraphArena},
     node::{
-        CoffNode, LibraryNode, ReachableDfs, SectionName, SectionNode, SectionNodeCharacteristics,
-        SectionNodeData, SectionType, SymbolNode, SymbolNodeStorageClass, SymbolNodeType,
+        CoffNode, LibraryNode, ReachableDfs, SectionName, SectionNode, SectionNodeData,
+        SectionType, SymbolNode, SymbolNodeType,
     },
     output::{OutputGraph, OutputSection},
 };
@@ -79,7 +85,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
                 section_node.discard();
             } else if section_node
                 .characteristics()
-                .contains(SectionNodeCharacteristics::LnkRemove)
+                .contains(ImageScn::LNK_REMOVE)
             {
                 debug!(
                     "{}: discarding 'IMAGE_SCN_LNK_REMOVE' section {}",
@@ -104,6 +110,12 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
             } else {
                 SectionCategory::Standard(section_type)
             };
+
+            debug!(
+                "category for section '{}' is {:?}",
+                section_node.name(),
+                category
+            );
 
             let section_entry = partitioned.entry(category).or_default();
             section_entry.push(section_node);
@@ -255,18 +267,13 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
         // allocated at the beginning to minimize padding.
         common_symbols.sort_by_key(|(_, value)| std::cmp::Reverse(*value));
 
-        let align = common_section
-            .characteristics()
-            .alignment()
-            .unwrap_or_else(|| {
-                unreachable!("COMMON section characteristics should have the alignment flag set")
-            }) as u32;
+        let align = common_section.alignment();
 
         // Assign addresses to each symbol.
         let mut symbol_addr: u32 = 0;
 
         for (symbol, symbol_size) in &common_symbols {
-            symbol_addr = symbol_addr.next_multiple_of(align);
+            symbol_addr = symbol_addr.next_multiple_of(align.value());
 
             // Get the first definition edge from the symbol's edge list.
             // This will be re-used as the real definition edge with the symbol
@@ -350,10 +357,8 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
                 let thunk_section = self.arena.alloc_with(|| {
                     SectionNode::new(
                         &*section_name,
-                        SectionNodeCharacteristics::CntCode
-                            | SectionNodeCharacteristics::MemExecute
-                            | SectionNodeCharacteristics::MemRead
-                            | SectionNodeCharacteristics::Align8Bytes,
+                        (ImageScn::CNT_CODE | ImageScn::MEM_EXECUTE | ImageScn::MEM_READ)
+                            .with_align(P2Align::new(8)),
                         SectionNodeData::Initialized(&CODE_THUNK_DATA),
                         0,
                         self.root_coff,
@@ -363,7 +368,11 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
                 // Add a definition edge from the symbol to the new thunk
                 // section
                 let definition_edge = self.arena.alloc_with(|| {
-                    Edge::new(symbol, thunk_section, DefinitionEdgeWeight::new(0, None))
+                    Edge::new(
+                        symbol,
+                        thunk_section,
+                        DefinitionEdgeWeight::new(0, ComdatKind::Unknown),
+                    )
                 });
 
                 symbol.definitions().push_back(definition_edge);
@@ -378,7 +387,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
                                 .alloc_str(&format!("__imp_{}", import_name.as_str())),
                             self.machine == LinkerTargetArch::I386,
                         ),
-                        SymbolNodeStorageClass::External,
+                        pe::IMAGE_SYM_CLASS_EXTERNAL,
                         false,
                         SymbolNodeType::Value(0),
                     )
@@ -427,17 +436,19 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
             }
 
             let Some((leader, selection)) = section.definitions().iter().find_map(|definition| {
-                definition
-                    .weight()
-                    .selection
-                    .map(|selection| (definition.source(), selection))
+                let selection = definition.weight().selection;
+                if selection != ComdatKind::Unknown {
+                    Some((definition.source(), selection))
+                } else {
+                    None
+                }
             }) else {
                 continue;
             };
 
-            if selection == ComdatSelection::Any
-                || selection == ComdatSelection::SameSize
-                || selection == ComdatSelection::ExactMatch
+            if selection == ComdatKind::Any
+                || selection == ComdatKind::SameSize
+                || selection == ComdatKind::ExactMatch
             {
                 // Keep the first seen definition and discard the other sections
                 let mut definition_iter = leader.definitions().iter();
@@ -451,7 +462,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
                     );
                     discarded_section.discard();
                 }
-            } else if selection == ComdatSelection::Largest {
+            } else if selection == ComdatKind::Largest {
                 // Find the largest size and discard the rest.
                 let mut largest_section: Option<&'arena SectionNode<'arena, 'data>> = None;
 
@@ -514,9 +525,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
 
         let mut code_output_section = OutputSection::new(
             SectionName::from(".text"),
-            SectionNodeCharacteristics::CntCode
-                | SectionNodeCharacteristics::MemExecute
-                | SectionNodeCharacteristics::MemRead,
+            ImageScn::CNT_CODE | ImageScn::MEM_EXECUTE | ImageScn::MEM_READ,
             Vec::new(),
         );
 
@@ -546,9 +555,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
 
             output_sections.push(OutputSection::new(
                 name,
-                SectionNodeCharacteristics::CntCode
-                    | SectionNodeCharacteristics::MemExecute
-                    | SectionNodeCharacteristics::MemRead,
+                ImageScn::CNT_CODE | ImageScn::MEM_EXECUTE | ImageScn::MEM_READ,
                 remaining,
             ));
         }
@@ -560,9 +567,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
 
         let mut data_output_section = OutputSection::new(
             SectionName::from(".data"),
-            SectionNodeCharacteristics::CntInitializedData
-                | SectionNodeCharacteristics::MemRead
-                | SectionNodeCharacteristics::MemWrite,
+            ImageScn::CNT_INITIALIZED_DATA | ImageScn::MEM_READ | ImageScn::MEM_WRITE,
             Vec::new(),
         );
 
@@ -601,9 +606,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
 
             output_sections.push(OutputSection::new(
                 name,
-                SectionNodeCharacteristics::CntInitializedData
-                    | SectionNodeCharacteristics::MemRead
-                    | SectionNodeCharacteristics::MemWrite,
+                ImageScn::CNT_INITIALIZED_DATA | ImageScn::MEM_READ | ImageScn::MEM_WRITE,
                 remaining,
             ));
         }
@@ -615,9 +618,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
 
         let mut uninitialized_data_output_section = OutputSection::new(
             SectionName::from(".bss"),
-            SectionNodeCharacteristics::CntUninitializedData
-                | SectionNodeCharacteristics::MemRead
-                | SectionNodeCharacteristics::MemWrite,
+            ImageScn::CNT_UNINITIALIZED_DATA | ImageScn::MEM_READ | ImageScn::MEM_WRITE,
             Vec::new(),
         );
 
@@ -647,9 +648,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
 
             output_sections.push(OutputSection::new(
                 name,
-                SectionNodeCharacteristics::CntUninitializedData
-                    | SectionNodeCharacteristics::MemRead
-                    | SectionNodeCharacteristics::MemWrite,
+                ImageScn::CNT_UNINITIALIZED_DATA | ImageScn::MEM_READ | ImageScn::MEM_WRITE,
                 remaining,
             ));
         }
@@ -701,9 +700,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
 
         let mut code_output_section = OutputSection::new(
             SectionName::from(".text"),
-            SectionNodeCharacteristics::CntCode
-                | SectionNodeCharacteristics::MemExecute
-                | SectionNodeCharacteristics::MemRead,
+            ImageScn::CNT_CODE | ImageScn::MEM_EXECUTE | ImageScn::MEM_READ,
             Vec::new(),
         );
 
@@ -731,9 +728,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
 
         let mut data_output_section = OutputSection::new(
             SectionName::from(".data"),
-            SectionNodeCharacteristics::CntInitializedData
-                | SectionNodeCharacteristics::MemRead
-                | SectionNodeCharacteristics::MemWrite,
+            ImageScn::CNT_INITIALIZED_DATA | ImageScn::MEM_READ | ImageScn::MEM_WRITE,
             Vec::new(),
         );
 
@@ -761,9 +756,7 @@ impl<'arena, 'data> BuiltLinkGraph<'arena, 'data> {
 
         let mut uninitialized_data_output_section = OutputSection::new(
             SectionName::from(".bss"),
-            SectionNodeCharacteristics::CntUninitializedData
-                | SectionNodeCharacteristics::MemRead
-                | SectionNodeCharacteristics::MemWrite,
+            ImageScn::CNT_UNINITIALIZED_DATA | ImageScn::MEM_READ | ImageScn::MEM_WRITE,
             Vec::new(),
         );
 
