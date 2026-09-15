@@ -34,6 +34,9 @@ suitable for loading at runtime with a COFF loader.
 **`--error-limit=<number>`**
 : Number of errors to print before exiting [default: 20]
 
+**`--[no-]force-bof-suffix`**
+: Force generation of output file with .bof suffix instead of .exe or .dll (default)
+
 **`--[no-]gc-sections`**
 : Garbage collect unused sections
 

@@ -38,6 +38,8 @@ fn render_help(include_ignored: bool) -> String {
   -e <symbol>, --entry=<symbol>
                              Name of the entrypoint symbol [default: go]
   --error-limit=<number>     Number of errors to print before exiting [default: 20]
+  --force-bof-suffix         Force generation of output file with .bof suffix instead of .exe or .dll (default)
+    --no-force-bof-suffix
   --gc-sections              Garbage collect unused sections
     --no-gc-sections
   --ignore-unresolved-symbol=<symbol>
@@ -311,6 +313,7 @@ pub struct CliOptions {
     pub dump_link_graph: Option<PathBuf>,
     pub dynamicbase: bool,
     pub entry: String,
+    pub force_bof_suffix: bool,
     pub merge_groups: bool,
     pub flto: bool,
     pub gc_sections: bool,
@@ -346,6 +349,7 @@ impl std::default::Default for CliOptions {
             dump_link_graph: None,
             dynamicbase: false,
             entry: "go".into(),
+            force_bof_suffix: true,
             merge_groups: true,
             flto: false,
             gc_sections: false,
@@ -433,6 +437,8 @@ impl CliOptions {
             self.flto = false;
         } else if let Some(v) = long_bool("gc-sections") {
             self.gc_sections = v;
+        } else if let Some(v) = long_bool("force-bof-suffix") {
+            self.force_bof_suffix = v;
         } else if long_opt("high-entropy-va") {
             self.high_entropy_va = true;
         } else if let Some(v) = anyval("ignore-unresolved-symbol", "") {

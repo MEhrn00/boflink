@@ -176,6 +176,14 @@ fn run_linker(mut cli: Cli) -> anyhow::Result<()> {
         graph.link()?
     };
 
+    let output = &mut ctx.options.output;
+    if ctx.options.force_bof_suffix
+        && output
+            .extension()
+            .is_none_or(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("dll"))
+    {
+        output.set_extension("bof");
+    }
     std::fs::write(&ctx.options.output, built).context("cannot write output file")?;
     Ok(())
 }
