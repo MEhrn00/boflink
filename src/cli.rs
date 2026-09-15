@@ -5,12 +5,17 @@ use std::{
     process::Command,
 };
 
+use anstream::ColorChoice;
 use boflink_stdext::path::PathExt;
 use indexmap::IndexSet;
 use object::pe::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386};
 use os_str_bytes::OsStrBytesExt;
 
-use crate::{bail, linker::LinkerTargetArch};
+use crate::{
+    bail,
+    linker::LinkerTargetArch,
+    logging::{self, logger},
+};
 use anyhow::Context;
 
 pub const CARGO_PKG_NAME: &str = env!("CARGO_PKG_NAME");
@@ -303,12 +308,10 @@ pub struct InputArgContext {
 #[derive(Debug)]
 pub struct CliOptions {
     pub auto_image_base: bool,
-    pub color_diagnostics: boflink_log::ColorChoice,
     pub custom_api: Option<OsString>,
     pub dump_link_graph: Option<PathBuf>,
     pub dynamicbase: bool,
     pub entry: String,
-    pub error_limit: usize,
     pub merge_groups: bool,
     pub flto: bool,
     pub gc_sections: bool,
@@ -330,7 +333,7 @@ pub struct CliOptions {
     pub require_defined: Vec<String>,
     pub sysroot: Option<PathBuf>,
     pub warn_unresolved_symbols: bool,
-    pub verbose: usize,
+    pub verbose: bool,
     pub help: bool,
     pub help_ignored: bool,
     pub version: bool,
@@ -340,12 +343,10 @@ impl std::default::Default for CliOptions {
     fn default() -> Self {
         Self {
             auto_image_base: false,
-            color_diagnostics: boflink_log::ColorChoice::Auto,
             custom_api: None,
             dump_link_graph: None,
             dynamicbase: false,
             entry: "go".into(),
-            error_limit: 20,
             merge_groups: true,
             flto: false,
             gc_sections: false,
@@ -367,7 +368,7 @@ impl std::default::Default for CliOptions {
             require_defined: Vec::new(),
             sysroot: None,
             warn_unresolved_symbols: false,
-            verbose: 0,
+            verbose: false,
             help: false,
             help_ignored: false,
             version: false,
@@ -398,16 +399,18 @@ impl CliOptions {
             self.auto_image_base = false;
         } else if let Some(v) = anyval("color", "") {
             let v = v?;
-            self.color_diagnostics = boflink_log::parse_color_choice(&v, true)
+            let colors = parse_color_choice(&v, true)
                 .with_context(|| format!("unknown '--color-diagnostics' value: {}", v.display()))?;
+            logger().set_colors(colors);
             warn(format_args!(
                 "'--color' is deprecated and will be removed in a future release. Use '--color-diagnostics' instead"
             ));
         } else if long_opt("color-diagnostics") {
-            self.color_diagnostics = boflink_log::ColorChoice::Auto;
+            logger().set_colors(ColorChoice::Auto);
         } else if let Some(v) = arg.strip_prefix("--color-diagnostics=") {
-            self.color_diagnostics = boflink_log::parse_color_choice(v, true)
-                .with_context(|| format!("unknown '--color-diagnostics' value: {}", v.display()))?;
+            logger().set_colors(parse_color_choice(v, true).with_context(|| {
+                format!("unknown '--color-diagnostics' value: {}", v.display())
+            })?);
         } else if let Some(v) = anyval("custom-api", "api") {
             self.custom_api = Some(v?);
         } else if let Some(v) = anyval("dump-link-graph", "") {
@@ -419,11 +422,12 @@ impl CliOptions {
         } else if let Some(v) = anyval("e", "entry") {
             self.entry = v?.to_string_lossy().to_string();
         } else if let Some(v) = anyval("error-limit", "") {
-            self.error_limit = v?
-                .to_string_lossy()
-                .parse()
-                .ok()
-                .context("--error-limit value must be a number")?;
+            logger().set_error_limit(
+                v?.to_string_lossy()
+                    .parse()
+                    .ok()
+                    .context("--error-limit value must be a number")?,
+            );
         } else if arg == "-flto" {
             self.flto = true;
         } else if arg == "-fno-lto" {
@@ -523,13 +527,20 @@ impl CliOptions {
         } else if let Some(v) = long_bool("warn-unresolved-symbols") {
             self.warn_unresolved_symbols = v;
         } else if short_opt('v') {
-            self.verbose = self.verbose.saturating_add(1);
+            self.verbose = true;
+            logging::set_max_level(logging::max_level().increment_severity());
         } else if let Some(vs) = arg.strip_prefix("-v")
             && vs.to_string_lossy().chars().all(|v| v == 'v')
         {
-            self.verbose = self.verbose.saturating_add(vs.len()).saturating_add(1);
+            self.verbose = true;
+            let mut level = logging::max_level();
+            for _ in 0..vs.len() + 1 {
+                level = level.increment_severity();
+            }
+            logging::set_max_level(level);
         } else if long_opt("verbose") {
-            self.verbose = self.verbose.saturating_add(1);
+            self.verbose = true;
+            logging::set_max_level(logging::max_level().increment_severity());
         } else if let Some(flag) = arg.strip_prefix("--help=")
             && flag.eq_ignore_ascii_case("ignored")
         {
@@ -544,6 +555,33 @@ impl CliOptions {
         }
 
         Ok(true)
+    }
+}
+
+/// Parses a string value into a [`ColorChoice`].
+fn parse_color_choice(value: impl AsRef<OsStr>, ignore_case: bool) -> Option<ColorChoice> {
+    let optmap = [
+        ("auto", ColorChoice::Auto),
+        ("always", ColorChoice::Always),
+        ("never", ColorChoice::Never),
+    ];
+
+    let value = value.as_ref();
+
+    if ignore_case
+        && let Some(val) = optmap
+            .iter()
+            .find_map(|(name, val)| value.eq_ignore_ascii_case(name).then_some(*val))
+    {
+        Some(val)
+    } else if !ignore_case
+        && let Some(val) = optmap
+            .iter()
+            .find_map(|(name, val)| (*name == value).then_some(*val))
+    {
+        Some(val)
+    } else {
+        None
     }
 }
 

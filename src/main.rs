@@ -6,6 +6,7 @@ use std::{
     process::ExitCode,
 };
 
+use anstream::ColorChoice;
 use anyhow::{Context, Result, anyhow, bail};
 use boflink_stdext::{path::PathExt, time::DurationExt};
 use bstr::ByteSlice;
@@ -17,7 +18,7 @@ use typed_arena::Arena;
 use crate::{
     archive::{LinkArchive, LinkArchiveMemberVariant},
     bofapi::ApiSymbols,
-    cli::{CARGO_PKG_NAME, Cli, CliOptions, InputArg, InputArgVariant},
+    cli::{CARGO_PKG_NAME, Cli, InputArg, InputArgVariant},
     directives::{LinkerDirective, parse_linker_directives},
     graph::LinkGraph,
     linker::{CoffPath, LinkContext, LinkerTargetArch, check_errored},
@@ -30,12 +31,17 @@ mod coff;
 mod directives;
 mod graph;
 mod linker;
+mod logging;
 
 #[cfg(windows)]
 mod undname;
 
 /// cli entrypoint
 fn main() -> ExitCode {
+    logging::init().unwrap();
+    let logger = logging::logger();
+    logger.set_colors(ColorChoice::Auto);
+    logger.set_error_limit(20);
     if let Err(e) = try_main() {
         error!("{e:#}");
         ExitCode::FAILURE
@@ -49,9 +55,8 @@ fn try_main() -> Result<()> {
     let cmdline = Cli::expand_response_files(std::env::args_os());
     let mut args = Cli::new();
     let res = args.try_update_from(cmdline.iter().skip(1));
-    setup_global_logging(&args.options);
 
-    if args.options.verbose >= 1 {
+    if args.options.verbose {
         info!("{}", args.render_version());
         log_cmdline(&cmdline);
     }
@@ -98,7 +103,7 @@ fn run_linker(mut cli: Cli) -> anyhow::Result<()> {
     // Process the input files
     for input_arg in input_args {
         if let Err(e) = read_input_arg(&mut ctx, input_arg) {
-            error!(logger: ctx.logger(), "{e:#}");
+            error!("{e:#}");
         }
     }
 
@@ -106,7 +111,7 @@ fn run_linker(mut cli: Cli) -> anyhow::Result<()> {
     ensure_entrypoint(&mut ctx);
 
     // Check for errors reading inputs
-    check_errored(&mut ctx);
+    check_errored();
     if ctx.input_coffs.is_empty() {
         bail!("no input files");
     }
@@ -132,7 +137,7 @@ fn run_linker(mut cli: Cli) -> anyhow::Result<()> {
     dump_link_graph(&ctx, &graph);
 
     // Check for errors
-    check_errored(&mut ctx);
+    check_errored();
 
     // Finish building the link graph
     let ignored_symbols =
@@ -397,7 +402,7 @@ fn add_coff_inputs<'a>(ctx: &mut LinkContext<'a>, graph: &mut LinkGraph<'a, 'a>)
     let coffs = std::mem::take(&mut ctx.input_coffs);
     for (path, coff) in coffs {
         if let Err(e) = add_coff_file(ctx, graph, path, coff) {
-            error!(logger: ctx.logger(), "{e:#}");
+            error!("{e:#}");
         }
     }
 }
@@ -451,7 +456,7 @@ fn resolve_symbols<'a>(ctx: &mut LinkContext<'a>, graph: &mut LinkGraph<'a, 'a>)
                     ctx.unresolved_symbols.insert(symbol_name);
                 }
                 Err(e) => {
-                    error!(logger: ctx.logger(), "{e:#}");
+                    error!("{e:#}");
                 }
                 _ => (),
             }
@@ -477,7 +482,7 @@ fn resolve_symbol<'a>(
         match resolve_symbol_from(ctx, graph, symbol_name, i) {
             Ok(true) => return Ok(true),
             Err(e) => {
-                error!(logger: ctx.logger(), "{e:#}");
+                error!("{e:#}");
             }
             _ => (),
         };
@@ -531,18 +536,6 @@ fn dump_link_graph(ctx: &LinkContext, graph: &LinkGraph) {
             warn!("cannot open {}: {e}", path.display());
         }
     }
-}
-
-fn setup_global_logging(options: &CliOptions) {
-    let mut max_level = log::Level::Info;
-    if options.verbose >= 2 {
-        max_level = log::Level::Trace;
-    } else if options.verbose >= 1 {
-        max_level = log::Level::Debug;
-    }
-
-    boflink_log::init_logger(CARGO_PKG_NAME, options.color_diagnostics, max_level)
-        .expect("logging should only be initialized once");
 }
 
 fn log_cmdline(args: &[OsString]) {

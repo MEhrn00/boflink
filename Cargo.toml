@@ -2,7 +2,6 @@
 members = ["crates/*", "xtask"]
 
 [workspace.dependencies]
-log = { version = "0.4.26", features = ["std"] }
 windows = "0.62.2"
 
 [package]
@@ -22,17 +21,19 @@ publish = false
 
 
 [dependencies]
+anstream = { version = "1.0.0", features = ["auto"] }
+anstyle = "1.0.14"
+anstyle-query = "1.1.5"
 anyhow = "1.0.92"
 argfile = "1.0.0"
 bitflags = "2.9.0"
-boflink_log = { path = "crates/boflink_log" }
 boflink_stdext = { path = "crates/boflink_stdext" }
 bstr = "1.12.1"
 bumpalo = "3.17.0"
 cpp_demangle = "0.5.0"
 crc32fast = "1.5.0"
 indexmap = "2.7.1"
-log.workspace = true
+log = { version = "0.4.26", features = ["std"] }
 num_enum = "0.7.3"
 os_str_bytes = "7.1.1"
 thiserror = "2.0.11"
@@ -45,8 +46,6 @@ features = ["archive", "coff", "write", "read"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
-  "Win32_Storage_FileSystem",
-  "Win32_System_Console",
   "Win32_System_Diagnostics_Debug",
 ] }
 

@@ -1,7 +1,6 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use bumpalo::Bump;
@@ -13,7 +12,9 @@ use object::{
 };
 use typed_arena::Arena;
 
-use crate::{archive::LinkArchive, bofapi::ApiSymbols, cli::CliOptions, graph::SpecLinkGraph};
+use crate::{
+    archive::LinkArchive, bofapi::ApiSymbols, cli::CliOptions, graph::SpecLinkGraph, logging,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
 #[repr(u16)]
@@ -59,40 +60,8 @@ impl std::fmt::Display for CoffPath<'_> {
     }
 }
 
-#[derive(Default)]
-pub struct ErrHandler {
-    limit: usize,
-    error_count: AtomicUsize,
-}
-
-impl log::Log for ErrHandler {
-    fn enabled(&self, metadata: &log::Metadata) -> bool {
-        log::logger().enabled(metadata)
-    }
-
-    fn log(&self, record: &log::Record) {
-        let logger = log::logger();
-        if record.level() != log::Level::Error {
-            // Fast path
-            logger.log(record);
-            return;
-        }
-        if self.error_count.fetch_add(1, Ordering::SeqCst) >= self.limit {
-            log::error!(logger: logger, "too many errors emitted. Exiting.");
-            std::process::exit(1);
-        }
-        logger.log(record);
-    }
-
-    fn flush(&self) {
-        log::logger().flush();
-    }
-}
-
 /// Main linker state
 pub struct LinkContext<'a> {
-    error_handler: ErrHandler,
-
     /// Arena for holding string data
     pub bump: &'a Bump,
 
@@ -130,10 +99,6 @@ impl<'a> LinkContext<'a> {
         Self {
             bump,
             inputs_arena,
-            error_handler: ErrHandler {
-                limit: options.error_limit,
-                error_count: AtomicUsize::new(0),
-            },
             options,
             opened_library_names: HashSet::new(),
             input_coffs: IndexMap::new(),
@@ -143,14 +108,10 @@ impl<'a> LinkContext<'a> {
             unresolved_symbols: IndexSet::new(),
         }
     }
-
-    pub fn logger(&self) -> &ErrHandler {
-        &self.error_handler
-    }
 }
 
-pub fn check_errored(ctx: &mut LinkContext) {
-    if *ctx.error_handler.error_count.get_mut() > 0 {
+pub fn check_errored() {
+    if logging::logger().has_error() {
         std::process::exit(1)
     }
 }
