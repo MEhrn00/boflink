@@ -9,7 +9,6 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use boflink_stdext::{path::PathExt, time::DurationExt};
 use bstr::ByteSlice;
-use bumpalo::Bump;
 use log::{error, info, warn};
 use object::{Object, ObjectSymbol, coff::CoffFile};
 use typed_arena::Arena;
@@ -20,7 +19,7 @@ use crate::{
     cli::{CARGO_PKG_NAME, Cli, ColorChoice, InputArg, InputArgVariant},
     directives::{LinkerDirective, parse_linker_directives},
     graph::LinkGraph,
-    linker::{CoffPath, LinkContext, LinkerTargetArch, check_errored},
+    linker::{CoffPath, FileBuffer, LinkContext, LinkerArena, LinkerTargetArch, check_errored},
 };
 
 mod archive;
@@ -94,9 +93,8 @@ fn try_main() -> Result<()> {
 fn run_linker(mut cli: Cli) -> anyhow::Result<()> {
     let input_args = std::mem::take(&mut cli.inputs);
 
-    let bump = Bump::new();
-    let inputs_arena = Arena::with_capacity(input_args.len());
-    let mut ctx = LinkContext::new(&bump, &inputs_arena, cli.options);
+    let arena = LinkerArena::default();
+    let mut ctx = LinkContext::new(&arena, cli.options);
     include_libenv_search_paths(&mut ctx);
 
     // Process the input files
@@ -203,26 +201,24 @@ fn include_libenv_search_paths(args: &mut LinkContext) {
 fn read_input_arg<'a>(ctx: &mut LinkContext<'a>, input_arg: InputArg) -> anyhow::Result<()> {
     match input_arg.variant {
         InputArgVariant::File(file_path) => {
-            let buffer = std::fs::read(&file_path)
-                .with_context(|| format!("cannot open {}", file_path.display()))?;
-            let (file_path, buffer) = ctx.inputs_arena.alloc((file_path, buffer));
+            let buffer = open_path(&ctx.arena.files, file_path)?;
 
-            if object_is_archive(buffer.as_slice()) {
-                let archive = LinkArchive::parse(buffer.as_slice())
-                    .with_context(|| format!("cannot parse {}", file_path.display()))?;
+            if object_is_archive(buffer.data.as_slice()) {
+                let archive = LinkArchive::parse(buffer.data.as_slice())
+                    .with_context(|| format!("cannot parse {}", buffer.path.display()))?;
 
                 if input_arg.context.in_whole_archive {
-                    read_archive_members(ctx, file_path.as_path(), archive)
-                        .with_context(|| format!("{}", file_path.display()))?;
-                } else if !ctx.lazy_archives.contains_key(file_path.as_path()) {
-                    ctx.lazy_archives.insert(file_path.as_path(), archive);
+                    read_archive_members(ctx, buffer.path.as_path(), archive)
+                        .with_context(|| format!("{}", buffer.path.display()))?;
+                } else if !ctx.lazy_archives.contains_key(buffer.path.as_path()) {
+                    ctx.lazy_archives.insert(buffer.path.as_path(), archive);
                 }
             } else {
-                let coff: CoffFile = CoffFile::parse(buffer.as_slice())
-                    .with_context(|| format!("cannot parse {}", file_path.display()))?;
+                let coff: CoffFile = CoffFile::parse(buffer.data.as_slice())
+                    .with_context(|| format!("cannot parse {}", buffer.path.display()))?;
 
                 if let indexmap::map::Entry::Vacant(coff_entry) = ctx.input_coffs.entry(CoffPath {
-                    file_path: file_path.as_path(),
+                    file_path: buffer.path.as_path(),
                     member_path: None,
                 }) {
                     ctx.spec_graph.add_coff(&coff);
@@ -233,27 +229,23 @@ fn read_input_arg<'a>(ctx: &mut LinkContext<'a>, input_arg: InputArg) -> anyhow:
         InputArgVariant::Library(library_name) => {
             let library_name = library_name.to_string_lossy().to_string();
             if !ctx.opened_library_names.contains(&library_name) {
-                let (library_path, library_buffer) =
-                    find_library(&ctx.options.library_path, &library_name)
+                let buffer =
+                    find_library(&ctx.arena.files, &ctx.options.library_path, &library_name)
                         .with_context(|| format!("unable to find library -l{library_name}"))?;
 
                 ctx.opened_library_names.insert(library_name);
 
                 if input_arg.context.in_whole_archive {
-                    let (library_path, library_buffer) =
-                        ctx.inputs_arena.alloc((library_path, library_buffer));
-                    let archive = LinkArchive::parse(library_buffer.as_slice())
-                        .with_context(|| format!("cannot parse {}", library_path.display()))?;
+                    let archive = LinkArchive::parse(buffer.data.as_slice())
+                        .with_context(|| format!("cannot parse {}", buffer.path.display()))?;
 
-                    read_archive_members(ctx, library_path.as_path(), archive)
-                        .with_context(|| format!("{}", library_path.display()))?;
-                } else if !ctx.lazy_archives.contains_key(library_path.as_path()) {
-                    let (library_path, library_buffer) =
-                        ctx.inputs_arena.alloc((library_path, library_buffer));
-                    let archive = LinkArchive::parse(library_buffer.as_slice())
-                        .with_context(|| format!("cannot parse {}", library_path.display()))?;
+                    read_archive_members(ctx, buffer.path.as_path(), archive)
+                        .with_context(|| format!("{}", buffer.path.display()))?;
+                } else if !ctx.lazy_archives.contains_key(buffer.path.as_path()) {
+                    let archive = LinkArchive::parse(buffer.data.as_slice())
+                        .with_context(|| format!("cannot parse {}", buffer.path.display()))?;
 
-                    ctx.lazy_archives.insert(library_path.as_path(), archive);
+                    ctx.lazy_archives.insert(buffer.path.as_path(), archive);
                 }
             }
         }
@@ -326,18 +318,27 @@ fn ensure_entrypoint<'a>(ctx: &mut LinkContext<'a>) {
     }
 }
 
-fn find_library(search_paths: &[PathBuf], name: &str) -> Option<(PathBuf, Vec<u8>)> {
-    let try_open_path = |path: &Path| -> Option<Vec<u8>> {
-        std::fs::read(path)
+fn open_path(arena: &Arena<FileBuffer>, path: PathBuf) -> anyhow::Result<&FileBuffer> {
+    let buffer = std::fs::read(&path).with_context(|| format!("cannot open {}", path.display()))?;
+    Ok(arena.alloc(FileBuffer { path, data: buffer }))
+}
+
+fn find_library<'a>(
+    arena: &'a Arena<FileBuffer>,
+    search_paths: &[PathBuf],
+    name: &str,
+) -> Option<&'a FileBuffer> {
+    let try_open_path = |path: PathBuf| -> Option<&'a FileBuffer> {
+        std::fs::read(&path)
             .inspect_err(|e| log::debug!("attempt to open {} failed: {e}", path.display()))
+            .map(|data| &*arena.alloc(FileBuffer { path, data }))
             .ok()
     };
 
     if let Some(filename) = name.strip_prefix(':') {
-        search_paths.iter().find_map(|search_path| {
-            let full_path = search_path.join(filename);
-            try_open_path(&full_path).map(|buffer| (full_path, buffer))
-        })
+        search_paths
+            .iter()
+            .find_map(|search_path| try_open_path(search_path.join(filename)))
     } else {
         let patterns = [
             ("lib", name, ".dll.a"),
@@ -351,8 +352,7 @@ fn find_library(search_paths: &[PathBuf], name: &str) -> Option<(PathBuf, Vec<u8
         search_paths.iter().find_map(|search_path| {
             patterns.into_iter().find_map(|(prefix, name, ext)| {
                 let filename = format!("{prefix}{name}{ext}");
-                let full_path = search_path.join(filename);
-                try_open_path(&full_path).map(|buffer| (full_path, buffer))
+                try_open_path(search_path.join(filename))
             })
         })
     }
@@ -375,28 +375,37 @@ fn read_api_symbols<'a>(
     target_arch: LinkerTargetArch,
 ) -> anyhow::Result<()> {
     ctx.api_symbols = if let Some(custom_api) = open_custom_api(ctx) {
-        let (api_path, api_buffer) = ctx.inputs_arena.alloc(custom_api?);
-        let api_archive = LinkArchive::parse(api_buffer.as_slice())
-            .with_context(|| format!("cannot parse {}", api_path.display()))?;
-        ApiSymbols::new(api_path.as_path(), api_archive)
-            .with_context(|| format!("{}", api_path.display()))?
+        let custom_api = custom_api?;
+        let api_archive = LinkArchive::parse(custom_api.data.as_slice())
+            .with_context(|| format!("cannot parse {}", custom_api.path.display()))?;
+        ApiSymbols::new(custom_api.path.as_path(), api_archive)
+            .with_context(|| format!("{}", custom_api.path.display()))?
     } else {
-        ApiSymbols::beacon(ctx.bump, target_arch)
+        ApiSymbols::beacon(&ctx.arena.bump, target_arch)
     };
     Ok(())
 }
 
-fn open_custom_api<'a>(ctx: &mut LinkContext<'a>) -> Option<anyhow::Result<(PathBuf, Vec<u8>)>> {
+fn open_custom_api<'a>(ctx: &mut LinkContext<'a>) -> Option<anyhow::Result<&'a FileBuffer>> {
     ctx.options.custom_api.as_ref().map(|custom_api| {
         std::fs::read(custom_api)
-            .map(|buffer| (Path::new(custom_api).normalize_lexically_cpp(), buffer))
+            .map(|data| {
+                &*ctx.arena.files.alloc(FileBuffer {
+                    path: Path::new(custom_api).normalize_lexically_cpp(),
+                    data,
+                })
+            })
             .or_else(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     let custom_api = custom_api.to_string_lossy();
-                    let found = find_library(&ctx.options.library_path, custom_api.as_ref())
-                        .with_context(|| {
-                            format!("unable to find --custom-api: {}", custom_api.as_ref())
-                        })?;
+                    let found = find_library(
+                        &ctx.arena.files,
+                        &ctx.options.library_path,
+                        custom_api.as_ref(),
+                    )
+                    .with_context(|| {
+                        format!("unable to find --custom-api: {}", custom_api.as_ref())
+                    })?;
                     ctx.opened_library_names.insert(custom_api.to_string());
                     return Ok(found);
                 }
@@ -420,7 +429,7 @@ fn add_coff_file<'a>(
     path: CoffPath<'a>,
     coff: CoffFile<'a>,
 ) -> anyhow::Result<()> {
-    let drecvtes = parse_linker_directives(ctx.bump, &coff)
+    let drecvtes = parse_linker_directives(&ctx.arena.bump, &coff)
         .with_context(|| format!("cannot parse {}", path))?;
     for directive in drecvtes {
         let LinkerDirective::Defaultlib(defaultlib) = directive else {
@@ -430,16 +439,15 @@ fn add_coff_file<'a>(
         if ctx.opened_library_names.contains(defaultlib.as_ref()) {
             continue;
         }
-        let (library_path, buffer) = find_library(&ctx.options.library_path, &defaultlib)
+        let buffer = find_library(&ctx.arena.files, &ctx.options.library_path, &defaultlib)
             .with_context(|| format!("{path}: unable to find library {defaultlib}"))?;
         ctx.opened_library_names.insert(defaultlib.to_string());
-        if ctx.lazy_archives.contains_key(library_path.as_path()) {
+        if ctx.lazy_archives.contains_key(buffer.path.as_path()) {
             continue;
         }
-        let (library_path, buffer) = ctx.inputs_arena.alloc((library_path, buffer));
-        let archive = LinkArchive::parse(buffer.as_slice())
-            .with_context(|| format!("{path}: cannot parse {}", library_path.display()))?;
-        ctx.lazy_archives.insert(library_path.as_path(), archive);
+        let archive = LinkArchive::parse(buffer.data.as_slice())
+            .with_context(|| format!("{path}: cannot parse {}", buffer.path.display()))?;
+        ctx.lazy_archives.insert(buffer.path.as_path(), archive);
     }
 
     graph.add_coff(path.file_path, path.member_path, &coff)

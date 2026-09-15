@@ -68,13 +68,24 @@ impl std::fmt::Display for CoffPath<'_> {
     }
 }
 
+pub struct FileBuffer {
+    pub path: PathBuf,
+    pub data: Vec<u8>,
+}
+
+#[derive(Default)]
+pub struct LinkerArena {
+    /// Bump allocator for holding dropless data
+    pub bump: Bump,
+
+    /// Arena containing opened files from disk
+    pub files: Arena<FileBuffer>,
+}
+
 /// Main linker state
 pub struct LinkContext<'a> {
-    /// Arena for holding string data
-    pub bump: &'a Bump,
-
-    /// Arena for holding opened input files
-    pub inputs_arena: &'a Arena<(PathBuf, Vec<u8>)>,
+    /// Arenas for holding string data
+    pub arena: &'a LinkerArena,
 
     /// Command line options
     pub options: CliOptions,
@@ -99,14 +110,9 @@ pub struct LinkContext<'a> {
 }
 
 impl<'a> LinkContext<'a> {
-    pub fn new(
-        bump: &'a Bump,
-        inputs_arena: &'a Arena<(PathBuf, Vec<u8>)>,
-        options: CliOptions,
-    ) -> Self {
+    pub fn new(arena: &'a LinkerArena, options: CliOptions) -> Self {
         Self {
-            bump,
-            inputs_arena,
+            arena,
             options,
             opened_library_names: HashSet::new(),
             input_coffs: IndexMap::new(),
