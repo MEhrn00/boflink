@@ -5,7 +5,6 @@ use std::{
     process::Command,
 };
 
-use anstream::ColorChoice;
 use boflink_stdext::path::PathExt;
 use indexmap::IndexSet;
 use object::pe::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386};
@@ -556,6 +555,13 @@ impl CliOptions {
 
         Ok(true)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ColorChoice {
+    Auto,
+    Always,
+    Never,
 }
 
 /// Parses a string value into a [`ColorChoice`].

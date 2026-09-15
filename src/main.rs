@@ -6,7 +6,6 @@ use std::{
     process::ExitCode,
 };
 
-use anstream::ColorChoice;
 use anyhow::{Context, Result, anyhow, bail};
 use boflink_stdext::{path::PathExt, time::DurationExt};
 use bstr::ByteSlice;
@@ -18,7 +17,7 @@ use typed_arena::Arena;
 use crate::{
     archive::{LinkArchive, LinkArchiveMemberVariant},
     bofapi::ApiSymbols,
-    cli::{CARGO_PKG_NAME, Cli, InputArg, InputArgVariant},
+    cli::{CARGO_PKG_NAME, Cli, ColorChoice, InputArg, InputArgVariant},
     directives::{LinkerDirective, parse_linker_directives},
     graph::LinkGraph,
     linker::{CoffPath, LinkContext, LinkerTargetArch, check_errored},

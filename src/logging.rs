@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use anstream::ColorChoice;
+use crate::cli::ColorChoice;
 use anstyle::Reset;
 
 static LOGGER: Logger = Logger::new();
@@ -82,10 +82,7 @@ impl Logger {
     }
 
     pub fn set_colors(&self, colors: ColorChoice) {
-        let enabled = if force_color()
-            || colors == ColorChoice::Always
-            || colors == ColorChoice::AlwaysAnsi
-        {
+        let enabled = if force_color() || colors == ColorChoice::Always {
             true
         } else if colors == ColorChoice::Never || anstyle_query::no_color() {
             false

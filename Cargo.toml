@@ -21,7 +21,6 @@ publish = false
 
 
 [dependencies]
-anstream = { version = "1.0.0", features = ["auto"] }
 anstyle = "1.0.14"
 anstyle-query = "1.1.5"
 anyhow = "1.0.92"
